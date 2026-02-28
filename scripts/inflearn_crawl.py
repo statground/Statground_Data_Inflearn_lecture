@@ -1,9 +1,7 @@
 # Inflearn sitemap crawler -> ClickHouse (Statground)
-# - Crawls ALL sitemap-courseDetail-*.xml (until 404) and processes course URLs in batches
-# - Stores queryKey payload snapshots into statground_lecture.inflearn_course_snapshot_raw
-# - Uses a DB checkpoint to continue next run without re-crawling everything
+# Fix: use Python datetime objects for DateTime64(3, 'Asia/Seoul') columns (clickhouse-connect requirement)
 #
-# Secrets required:
+# Required Secrets:
 #   CH_HOST, CH_PORT, CH_USER, CH_PASSWORD, CH_DATABASE
 #
 # Env:
@@ -11,6 +9,8 @@
 
 import os, re, json, time, random, urllib.parse
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import requests
 from lxml import etree
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -24,6 +24,7 @@ SESSION.headers.update({
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 })
 NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+KST = ZoneInfo("Asia/Seoul")
 
 def _get_env(name: str, default: str | None = None) -> str:
     v = os.environ.get(name, default)
@@ -33,14 +34,13 @@ def _get_env(name: str, default: str | None = None) -> str:
 
 def _parse_int_env(name: str, default: int) -> int:
     raw = os.environ.get(name, str(default))
-    if raw is None:
-        return default
     raw = str(raw).strip()
-    # If someone accidentally put non-numeric like "***" or "40011/tcp", extract digits.
     m = re.search(r"\d+", raw)
     if not m:
-        # give a clearer error than ValueError
-        raise ValueError(f"{name} must be numeric. Got: {raw!r}. Set GitHub Secret {name} to digits only (e.g., 40011).")
+        raise ValueError(
+            f"{name} must be numeric. Got: {raw!r}. "
+            f"Set GitHub Secret {name} to digits only (e.g., 40011)."
+        )
     return int(m.group(0))
 
 CH_HOST = _get_env("CH_HOST")
@@ -52,13 +52,14 @@ CH_DATABASE = _get_env("CH_DATABASE", "statground_lecture")
 SITEMAP_BASE = _get_env("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps").rstrip("/")
 SITEMAP_PREFIX = _get_env("SITEMAP_PREFIX", "sitemap-courseDetail-")
 
-BATCH_SIZE = _parse_int_env("BATCH_SIZE", 800)  # 0 = try unlimited (not recommended for Actions)
+BATCH_SIZE = _parse_int_env("BATCH_SIZE", 800)  # 0 = try unlimited (not recommended)
 SLEEP_MIN = float(_get_env("REQUEST_SLEEP_MIN", "0.6"))
 SLEEP_MAX = float(_get_env("REQUEST_SLEEP_MAX", "1.3"))
 
-def now_dt64_str() -> str:
-    t = datetime.now()
-    return t.strftime("%Y-%m-%d %H:%M:%S.") + f"{int(t.microsecond/1000):03d}"
+def now_dt64():
+    # DateTime64(3) -> millisecond precision
+    t = datetime.now(tz=KST)
+    return t.replace(microsecond=(t.microsecond // 1000) * 1000)
 
 def jitter_sleep():
     time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
@@ -107,7 +108,7 @@ def ensure_checkpoint_table(ch):
     CREATE TABLE IF NOT EXISTS {CH_DATABASE}.inflearn_crawl_checkpoint
     (
       source LowCardinality(String) COMMENT 'source name (inflearn_courseDetail)',
-      updated_at DateTime64(3, 'Asia/Seoul') COMMENT 'updated time',
+      updated_at DateTime64(3, 'Asia/Seoul') COMMENT 'updated time (Asia/Seoul)',
       sitemap_index UInt32 COMMENT 'last processed sitemap index',
       url_index UInt32 COMMENT 'offset within the sitemap url list'
     )
@@ -132,7 +133,7 @@ def get_checkpoint(ch) -> tuple[int, int]:
 def set_checkpoint(ch, sitemap_index: int, url_index: int):
     ch.insert(
         f"{CH_DATABASE}.inflearn_crawl_checkpoint",
-        [[ "inflearn_courseDetail", now_dt64_str(), sitemap_index, url_index ]],
+        [[ "inflearn_courseDetail", now_dt64(), sitemap_index, url_index ]],
         column_names=["source","updated_at","sitemap_index","url_index"]
     )
 
@@ -153,7 +154,7 @@ def main():
     ch = ch_client()
     ensure_checkpoint_table(ch)
 
-    fetched_at = now_dt64_str()
+    fetched_at = now_dt64()  # ✅ datetime
     start_sitemap, start_offset = get_checkpoint(ch)
     print(f"[checkpoint] start sitemap_index={start_sitemap}, url_index={start_offset}")
 
@@ -166,7 +167,7 @@ def main():
         r = http_get(sm_url)
         if r.status_code == 404:
             print(f"[done] sitemap {sitemap_index} -> 404. Completed all.")
-            # reset checkpoint to start for next full crawl cycle (optional)
+            # reset checkpoint (optional)
             set_checkpoint(ch, 0, 0)
             break
         if r.status_code != 200:
@@ -180,7 +181,6 @@ def main():
 
         print(f"[sitemap] {sitemap_index} urls={len(urls)} (starting at offset={offset})")
 
-        # process this sitemap from offset
         i = offset
         while i < len(urls):
             if BATCH_SIZE > 0 and processed >= BATCH_SIZE:
@@ -214,7 +214,6 @@ def main():
                     continue
 
                 payload = json.dumps(payload_obj, ensure_ascii=False)
-                # stable-ish 64-bit hash (not CH cityHash64, but ok for change detection)
                 payload_hash = (hash(payload) & 0xFFFFFFFFFFFFFFFF)
                 query_key_hash = (hash(qk) & 0xFFFFFFFFFFFFFFFF)
 
@@ -223,7 +222,7 @@ def main():
 
                 rows.append([
                     str(uuid7()),
-                    fetched_at,
+                    fetched_at,  # ✅ datetime for DateTime64
                     course_id,
                     locale,
                     url,
@@ -252,10 +251,9 @@ def main():
 
             jitter_sleep()
 
-        # finished this sitemap; move to next
         sitemap_index += 1
         offset = 0
-        set_checkpoint(ch, sitemap_index, 0)  # mark progress to next sitemap
+        set_checkpoint(ch, sitemap_index, 0)
         jitter_sleep()
 
 if __name__ == "__main__":

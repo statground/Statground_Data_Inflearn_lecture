@@ -34,7 +34,7 @@ jobs:
           SITEMAP_BASE: "https://cdn.inflearn.com/sitemaps"
           SITEMAP_PREFIX: "sitemap-courseDetail-"
 
-          # Batch processing (avoid timeouts / bans). Set to 0 to attempt "no limit"
+          # How many course pages to process per run (checkpoint enables continuation)
           BATCH_SIZE: "800"
           REQUEST_SLEEP_MIN: "0.6"
           REQUEST_SLEEP_MAX: "1.3"
