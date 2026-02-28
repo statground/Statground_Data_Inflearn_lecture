@@ -3,7 +3,7 @@ name: Inflearn Lecture Crawl
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 18 * * *"  # KST 03:10 (UTC 18:10)
+    - cron: "0 */6 * * *"
 
 jobs:
   crawl:
