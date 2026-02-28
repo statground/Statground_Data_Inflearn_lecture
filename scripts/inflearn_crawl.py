@@ -1,11 +1,5 @@
 # Inflearn sitemap crawler -> ClickHouse (Statground)
-# Fix: use Python datetime objects for DateTime64(3, 'Asia/Seoul') columns (clickhouse-connect requirement)
-#
-# Required Secrets:
-#   CH_HOST, CH_PORT, CH_USER, CH_PASSWORD, CH_DATABASE
-#
-# Env:
-#   SITEMAP_BASE, SITEMAP_PREFIX, BATCH_SIZE, REQUEST_SLEEP_MIN/MAX
+# Inserts into snapshot_raw + dim/facts + instructor tables
 
 import os, re, json, time, random, urllib.parse
 from datetime import datetime
@@ -37,11 +31,25 @@ def _parse_int_env(name: str, default: int) -> int:
     raw = str(raw).strip()
     m = re.search(r"\d+", raw)
     if not m:
-        raise ValueError(
-            f"{name} must be numeric. Got: {raw!r}. "
-            f"Set GitHub Secret {name} to digits only (e.g., 40011)."
-        )
+        raise ValueError(f"{name} must be numeric. Got: {raw!r}. Set GitHub Secret {name} to digits only (e.g., 40011).")
     return int(m.group(0))
+
+def now_dt64():
+    t = datetime.now(tz=KST)
+    return t.replace(microsecond=(t.microsecond // 1000) * 1000)
+
+def parse_dt64(s: str | None):
+    if not s:
+        return None
+    s = str(s).strip()
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+        return dt.replace(microsecond=0)
+    except Exception:
+        return None
+
+def jitter_sleep(min_s: float, max_s: float):
+    time.sleep(random.uniform(min_s, max_s))
 
 CH_HOST = _get_env("CH_HOST")
 CH_PORT = _parse_int_env("CH_PORT", 8123)
@@ -52,17 +60,9 @@ CH_DATABASE = _get_env("CH_DATABASE", "statground_lecture")
 SITEMAP_BASE = _get_env("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps").rstrip("/")
 SITEMAP_PREFIX = _get_env("SITEMAP_PREFIX", "sitemap-courseDetail-")
 
-BATCH_SIZE = _parse_int_env("BATCH_SIZE", 800)  # 0 = try unlimited (not recommended)
+BATCH_SIZE = _parse_int_env("BATCH_SIZE", 600)
 SLEEP_MIN = float(_get_env("REQUEST_SLEEP_MIN", "0.6"))
 SLEEP_MAX = float(_get_env("REQUEST_SLEEP_MAX", "1.3"))
-
-def now_dt64():
-    # DateTime64(3) -> millisecond precision
-    t = datetime.now(tz=KST)
-    return t.replace(microsecond=(t.microsecond // 1000) * 1000)
-
-def jitter_sleep():
-    time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=20))
 def http_get(url: str) -> requests.Response:
@@ -141,33 +141,60 @@ def should_insert_snapshot(ch, course_id: int, locale: str, query_key: str, payl
     sql = f"""
     SELECT argMax(payload_hash, fetched_at)
     FROM {CH_DATABASE}.inflearn_course_snapshot_raw
-    WHERE course_id = %(course_id)s
-      AND locale = %(locale)s
-      AND query_key = %(query_key)s
+    WHERE course_id = %(course_id)s AND locale = %(locale)s AND query_key = %(query_key)s
     """
     prev = ch.query(sql, parameters={"course_id": course_id, "locale": locale, "query_key": query_key}).result_rows
     if not prev or prev[0][0] is None:
         return True
     return int(prev[0][0]) != int(payload_hash)
 
+def should_insert_metric(ch, course_id: int, locale: str, metric_tuple: tuple) -> bool:
+    sql = f"""
+    SELECT
+      argMax(student_count, fetched_at),
+      argMax(like_count, fetched_at),
+      argMax(review_count, fetched_at),
+      argMax(average_star, fetched_at),
+      argMax(krw_regular_price, fetched_at),
+      argMax(krw_pay_price, fetched_at),
+      argMax(discount_rate, fetched_at),
+      argMax(discount_title, fetched_at),
+      argMax(discount_ended_at, fetched_at)
+    FROM {CH_DATABASE}.inflearn_course_metric_fact
+    WHERE course_id = %(course_id)s AND locale = %(locale)s
+    """
+    prev = ch.query(sql, parameters={"course_id": course_id, "locale": locale}).result_rows
+    if not prev:
+        return True
+    return tuple(prev[0]) != metric_tuple
+
+def find_api_data(queries: list[dict], needle: str):
+    for q in queries:
+        qk = json.dumps(q.get("queryKey"), ensure_ascii=False)
+        if needle in qk:
+            return (q.get("state") or {}).get("data")
+    return None
+
+def to_u8(x) -> int:
+    return 1 if x else 0
+
 def main():
     ch = ch_client()
     ensure_checkpoint_table(ch)
 
-    fetched_at = now_dt64()  # ✅ datetime
-    start_sitemap, start_offset = get_checkpoint(ch)
-    print(f"[checkpoint] start sitemap_index={start_sitemap}, url_index={start_offset}")
+    fetched_at = now_dt64()
+    sitemap_index, offset = get_checkpoint(ch)
+    print(f"[checkpoint] start sitemap_index={sitemap_index}, url_index={offset}")
 
     processed = 0
-    sitemap_index = start_sitemap
-    offset = start_offset
+
+    snap_rows, dim_rows, metric_rows, price_rows, curri_rows, inst_rows, map_rows = ([] for _ in range(7))
 
     while True:
         sm_url = f"{SITEMAP_BASE}/{SITEMAP_PREFIX}{sitemap_index}.xml"
         r = http_get(sm_url)
         if r.status_code == 404:
             print(f"[done] sitemap {sitemap_index} -> 404. Completed all.")
-            # reset checkpoint (optional)
             set_checkpoint(ch, 0, 0)
             break
         if r.status_code != 200:
@@ -175,7 +202,6 @@ def main():
 
         urls = parse_sitemap_locs(r.content)
         if not urls:
-            print(f"[stop] sitemap {sitemap_index} has 0 urls")
             set_checkpoint(ch, sitemap_index, 0)
             break
 
@@ -184,13 +210,11 @@ def main():
         i = offset
         while i < len(urls):
             if BATCH_SIZE > 0 and processed >= BATCH_SIZE:
-                print(f"[batch] reached BATCH_SIZE={BATCH_SIZE}, saving checkpoint sitemap={sitemap_index}, offset={i}")
                 set_checkpoint(ch, sitemap_index, i)
-                return
+                print(f"[batch] limit hit. saved checkpoint sitemap={sitemap_index} offset={i}")
+                break
 
-            url = urls[i]
-            i += 1
-
+            url = urls[i]; i += 1
             course_id, locale = parse_course_id_and_locale(url)
             if not course_id:
                 continue
@@ -198,7 +222,6 @@ def main():
             page = http_get(url)
             if page.status_code != 200:
                 continue
-
             nd = extract_next_data(page.text)
             if not nd:
                 continue
@@ -206,55 +229,168 @@ def main():
             page_props = (nd.get("props") or {}).get("pageProps") or {}
             queries = ((page_props.get("dehydratedState") or {}).get("queries") or [])
 
-            rows = []
+            # snapshot
             for q in queries:
                 qk = json.dumps(q.get("queryKey"), ensure_ascii=False)
                 payload_obj = (q.get("state") or {}).get("data")
                 if payload_obj is None:
                     continue
-
                 payload = json.dumps(payload_obj, ensure_ascii=False)
                 payload_hash = (hash(payload) & 0xFFFFFFFFFFFFFFFF)
                 query_key_hash = (hash(qk) & 0xFFFFFFFFFFFFFFFF)
-
                 if not should_insert_snapshot(ch, course_id, locale, qk, payload_hash):
                     continue
+                snap_rows.append([str(uuid7()), fetched_at, course_id, locale, url, qk, query_key_hash, "OK", None, payload, payload_hash])
 
-                rows.append([
-                    str(uuid7()),
-                    fetched_at,  # ✅ datetime for DateTime64
-                    course_id,
-                    locale,
-                    url,
-                    qk,
-                    query_key_hash,
-                    "OK",
-                    None,
-                    payload,
-                    payload_hash,
+            # structured
+            online_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/online/info")
+            meta_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/meta")
+            curriculum = find_api_data(queries, f"/client/api/v2/courses/{course_id}/curriculum")
+            discounts_best = find_api_data(queries, f"/client/api/v1/discounts/best?courseIds={course_id}")
+            contents = find_api_data(queries, f"/client/api/v1/course/{course_id}/contents?lang=") or find_api_data(queries, f"/client/api/v1/course/{course_id}/contents")
+
+            if isinstance(online_info, dict) and isinstance(meta_info, dict):
+                d = online_info.get("data") or {}
+                m = meta_info.get("data") or {}
+                category = d.get("category") or {}
+                main_c = category.get("main") or {}
+                sub_c = category.get("sub") or {}
+
+                level_code = ""
+                for lv in d.get("levels") or []:
+                    if lv.get("isActive"):
+                        level_code = lv.get("code") or lv.get("title") or ""
+                        break
+
+                unit = d.get("unitSummary") or {}
+                rev = d.get("review") or {}
+                published_at = parse_dt64(d.get("publishedAt")) or datetime(1970,1,1,tzinfo=KST)
+                last_updated_at = parse_dt64(d.get("lastUpdatedAt")) or datetime(1970,1,1,tzinfo=KST)
+
+                dim_rows.append([
+                    course_id, locale, fetched_at,
+                    str(d.get("slug") or ""), str(d.get("enSlug") or ""),
+                    str(d.get("status") or ""), str(d.get("title") or ""), str(d.get("description") or ""),
+                    str(d.get("thumbnailUrl") or ""),
+                    str(main_c.get("title") or ""), str(main_c.get("slug") or ""),
+                    str(sub_c.get("title") or ""), str(sub_c.get("slug") or ""),
+                    str(level_code),
+                    to_u8(d.get("isNew")), to_u8(d.get("isBest")),
+                    int(d.get("studentCount") or 0), int(d.get("likeCount") or 0),
+                    int(rev.get("count") or 0), float(rev.get("averageStar") or 0.0),
+                    int(unit.get("lectureUnitCount") or 0), int(unit.get("previewUnitCount") or 0),
+                    int(unit.get("runtime") or 0),
+                    to_u8(d.get("providesCertificate")), to_u8(d.get("providesInstructorAnswer")), to_u8(d.get("providesInquiry")),
+                    published_at, last_updated_at,
+                    str(m.get("keywords") or ""),
+                    m.get("categorySlugs") or [],
+                    m.get("skillSlugs") or [],
+                    m.get("commonTagsSlugs") or [],
                 ])
 
-            if rows:
-                ch.insert(
-                    f"{CH_DATABASE}.inflearn_course_snapshot_raw",
-                    rows,
-                    column_names=[
-                        "uuid","fetched_at","course_id","locale","source_url",
-                        "query_key","query_key_hash","status_code","error_code",
-                        "payload","payload_hash"
-                    ]
+                pay = d.get("paymentInfo") or {}
+                disc = (discounts_best.get("data") if isinstance(discounts_best, dict) else {}) or {}
+                discount = pay.get("discount") or {}
+                discount_rate = int(pay.get("discountRate") or disc.get("discountRate") or 0)
+                discount_title = str(discount.get("title") or disc.get("discountTitle") or "")
+                discount_ended_at = parse_dt64(discount.get("endedAt"))
+
+                metric_tuple = (
+                    int(d.get("studentCount") or 0),
+                    int(d.get("likeCount") or 0),
+                    int(rev.get("count") or 0),
+                    float(rev.get("averageStar") or 0.0),
+                    int(pay.get("krwRegularPrice") or 0),
+                    int(pay.get("krwPaymentPrice") or 0),
+                    discount_rate,
+                    discount_title,
+                    discount_ended_at,
                 )
+                if should_insert_metric(ch, course_id, locale, metric_tuple):
+                    metric_rows.append([fetched_at, course_id, locale,
+                                        metric_tuple[0], metric_tuple[1], metric_tuple[2], metric_tuple[3],
+                                        metric_tuple[4], metric_tuple[5],
+                                        metric_tuple[6], metric_tuple[7], metric_tuple[8],
+                                        0])
+
+                price_rows.append([fetched_at, course_id, locale,
+                                   float(pay.get("regularPrice") or 0.0), float(pay.get("payPrice") or 0.0),
+                                   discount_rate, discount_title, discount_ended_at,
+                                   int(pay.get("krwRegularPrice") or 0), int(pay.get("krwPaymentPrice") or 0)])
+
+            if isinstance(curriculum, dict):
+                cdata = curriculum.get("data") or {}
+                for sec in cdata.get("curriculum", []) or []:
+                    section_id = int(sec.get("id") or 0)
+                    section_title = str(sec.get("title") or "")
+                    for u in sec.get("units", []) or []:
+                        curri_rows.append([fetched_at, course_id, section_id, section_title,
+                                           int(u.get("id") or 0), str(u.get("title") or ""), str(u.get("type") or ""),
+                                           int(u.get("runtime") or 0),
+                                           to_u8(u.get("isPreview")), to_u8(u.get("hasVideo")), to_u8(u.get("hasAttachment")),
+                                           u.get("quizId"), u.get("readingTime"), to_u8(u.get("isChallengeOnly"))])
+
+            if isinstance(contents, dict):
+                c = contents.get("data") or {}
+                for mi in c.get("mainInstructors", []) or []:
+                    instructor_id = int(mi.get("id") or 0)
+                    if instructor_id <= 0:
+                        continue
+                    inst_rows.append([instructor_id, fetched_at,
+                                      str(mi.get("name") or ""), str(mi.get("slug") or ""), str(mi.get("thumbnail") or ""),
+                                      int(mi.get("courseCount") or 0), int(mi.get("studentCount") or 0),
+                                      int(mi.get("reviewCount") or 0), int(mi.get("totalStar") or 0), int(mi.get("answerCount") or 0),
+                                      str(mi.get("introduce") or "")])
+                    map_rows.append([fetched_at, course_id, instructor_id, "main"])
 
             processed += 1
             if processed % 50 == 0:
                 print(f"[progress] processed={processed} last_course_id={course_id} sitemap={sitemap_index} offset={i}")
+            jitter_sleep(SLEEP_MIN, SLEEP_MAX)
 
-            jitter_sleep()
+        if BATCH_SIZE > 0 and processed >= BATCH_SIZE:
+            break
 
         sitemap_index += 1
         offset = 0
         set_checkpoint(ch, sitemap_index, 0)
-        jitter_sleep()
+        jitter_sleep(SLEEP_MIN, SLEEP_MAX)
+
+    # insert
+    def insert_if_rows(table, rows, cols):
+        if not rows:
+            return 0
+        ch.insert(f"{CH_DATABASE}.{table}", rows, column_names=cols)
+        return len(rows)
+
+    inserted = {
+        "snapshot_raw": insert_if_rows("inflearn_course_snapshot_raw", snap_rows,
+            ["uuid","fetched_at","course_id","locale","source_url","query_key","query_key_hash","status_code","error_code","payload","payload_hash"]),
+        "course_dim": insert_if_rows("inflearn_course_dim", dim_rows,
+            ["course_id","locale","fetched_at","slug","en_slug","status","title","description","thumbnail_url",
+             "category_main_title","category_main_slug","category_sub_title","category_sub_slug","level_code","is_new","is_best",
+             "student_count","like_count","review_count","average_star","lecture_unit_count","preview_unit_count","runtime_sec",
+             "provides_certificate","provides_instructor_answer","provides_inquiry","published_at","last_updated_at",
+             "keywords","category_slugs","skill_slugs","common_tag_slugs"]),
+        "metric_fact": insert_if_rows("inflearn_course_metric_fact", metric_rows,
+            ["fetched_at","course_id","locale","student_count","like_count","review_count","average_star",
+             "krw_regular_price","krw_pay_price","discount_rate","discount_title","discount_ended_at","metric_hash"]),
+        "price_fact": insert_if_rows("inflearn_course_price_fact", price_rows,
+            ["fetched_at","course_id","locale","regular_price","pay_price","discount_rate","discount_title","discount_ended_at",
+             "krw_regular_price","krw_pay_price"]),
+        "curriculum_unit": insert_if_rows("inflearn_course_curriculum_unit", curri_rows,
+            ["fetched_at","course_id","section_id","section_title","unit_id","unit_title","unit_type","runtime_sec","is_preview",
+             "has_video","has_attachment","quiz_id","reading_time","is_challenge_only"]),
+        "instructor_dim": insert_if_rows("inflearn_instructor_dim", inst_rows,
+            ["instructor_id","fetched_at","name","slug","thumbnail_url","course_count","student_count","review_count",
+             "total_star","answer_count","introduce_html"]),
+        "course_instructor_map": insert_if_rows("inflearn_course_instructor_map", map_rows,
+            ["fetched_at","course_id","instructor_id","role"]),
+    }
+
+    print("[inserted]", inserted)
+    print("[done]")
 
 if __name__ == "__main__":
+    ensure = True
     main()
