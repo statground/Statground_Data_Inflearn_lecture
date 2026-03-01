@@ -125,6 +125,16 @@ def safe_query(client, sql: str, params: Optional[Dict[str, Any]] = None) -> Lis
         return []
 
 
+def table_exists(client, db: str, table: str) -> bool:
+    rows = safe_query(
+        client,
+        "SELECT 1 FROM system.tables WHERE database=%(db)s AND name=%(t)s LIMIT 1",
+        {"db": db, "t": table},
+    )
+    return len(rows) > 0
+
+
+
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 

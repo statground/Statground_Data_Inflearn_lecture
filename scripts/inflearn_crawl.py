@@ -334,8 +334,8 @@ def process_course_url(url: str, fetched_at):
             provides_instructor_answer = to_u8(m.get("providesInstructorAnswer"))
             provides_inquiry = to_u8(m.get("providesInquiry"))
 
-            published_at = parse_dt64(m.get("publishedAt"))
-            last_updated_at = parse_dt64(m.get("lastUpdatedAt"))
+            published_at = parse_dt64(m.get("publishedAt")) or fetched_at
+            last_updated_at = parse_dt64(m.get("lastUpdatedAt")) or fetched_at
 
             keywords = json.dumps(m.get("keywords") or [], ensure_ascii=False, separators=(",", ":"))
             category_slugs = json.dumps(m.get("categorySlugs") or [], ensure_ascii=False, separators=(",", ":"))

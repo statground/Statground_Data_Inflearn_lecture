@@ -69,8 +69,8 @@ def get_progress(client):
     db = inflearn_crawl.CH_DATABASE
     sql = f"""
     SELECT
-      toInt64OrZero(argMax(sitemap_index, updated_at)) AS total_done,
-      toInt64OrZero(argMax(url_index, updated_at)) AS last_batch_done
+      ifNull(toInt64(argMax(sitemap_index, updated_at)), 0) AS total_done,
+      ifNull(toInt64(argMax(url_index, updated_at)), 0) AS last_batch_done
     FROM {db}.inflearn_crawl_checkpoint
     WHERE source = 'inflearn_update_existing'
     """
