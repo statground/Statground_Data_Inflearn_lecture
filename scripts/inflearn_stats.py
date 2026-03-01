@@ -225,8 +225,33 @@ def main():
     report_latest = report_dir / "inflearn_stats_latest.md"
     report_stamp = report_dir / f"inflearn_stats_{ts}.md"
 
+    # ---
+    # 통계 0 방지 로직
+    # - 러너/서버 타임존 차이, 문자열 toDateTime 변환 차이로 인해
+    #   WHERE fetched_at >= since 가 미래로 해석되면 집계가 전부 0이 될 수 있음
+    # - 따라서 snapshot_raw의 max(fetched_at)을 기준으로 lookback 범위를 계산
+    # ---
     lookback_days = int(os.environ.get("STATS_LOOKBACK_DAYS", "365"))
-    since_dt = (now_kst() - timedelta(days=lookback_days)).strftime("%Y-%m-%d %H:%M:%S")
+    max_fetch = None
+    if table_exists(client, db, os.environ.get("INFLEARN_T_SNAPSHOT", "inflearn_course_snapshot_raw")):
+        try:
+            r = q(client, f"SELECT max(fetched_at) AS mx FROM {db}.{os.environ.get('INFLEARN_T_SNAPSHOT','inflearn_course_snapshot_raw')}")
+            max_fetch = r[0].get("mx") if r else None
+        except Exception:
+            max_fetch = None
+
+    if max_fetch is None:
+        # fallback: 현재시각 기준
+        since_dt_obj = now_kst() - timedelta(days=lookback_days)
+    else:
+        # max(fetched_at) 기준으로 lookback
+        # clickhouse_connect가 datetime으로 받아온 경우 tz 정보가 없을 수 있어 KST로 가정
+        if isinstance(max_fetch, datetime) and max_fetch.tzinfo is None:
+            max_fetch = max_fetch.replace(tzinfo=KST)
+        since_dt_obj = (max_fetch if isinstance(max_fetch, datetime) else now_kst()) - timedelta(days=lookback_days)
+
+    # clickhouse_connect 파라미터로 datetime을 넘겨 DateTime64 비교를 안전하게 함
+    since_dt = since_dt_obj
 
     # 테이블명(기본값)
     T_SNAPSHOT = os.environ.get("INFLEARN_T_SNAPSHOT", "inflearn_course_snapshot_raw")
@@ -257,7 +282,7 @@ def main():
 SELECT formatDateTime(toStartOfHour(fetched_at), '%Y-%m-%d %H') AS bucket,
        count() AS cnt
 FROM {db}.{T_SNAPSHOT}
-WHERE fetched_at >= toDateTime(%(since)s)
+WHERE fetched_at >= %(since)s
 GROUP BY bucket
 ORDER BY bucket
 """, {"since": since_dt})
@@ -266,7 +291,7 @@ ORDER BY bucket
 SELECT formatDateTime(toDate(fetched_at), '%Y-%m-%d') AS bucket,
        count() AS cnt
 FROM {db}.{T_SNAPSHOT}
-WHERE fetched_at >= toDateTime(%(since)s)
+WHERE fetched_at >= %(since)s
 GROUP BY bucket
 ORDER BY bucket
 """, {"since": since_dt})
@@ -275,7 +300,7 @@ ORDER BY bucket
 SELECT formatDateTime(toStartOfMonth(fetched_at), '%Y-%m') AS bucket,
        count() AS cnt
 FROM {db}.{T_SNAPSHOT}
-WHERE fetched_at >= toDateTime(%(since)s)
+WHERE fetched_at >= %(since)s
 GROUP BY bucket
 ORDER BY bucket
 """, {"since": since_dt})
@@ -284,7 +309,7 @@ ORDER BY bucket
 SELECT toString(toYear(fetched_at)) AS bucket,
        count() AS cnt
 FROM {db}.{T_SNAPSHOT}
-WHERE fetched_at >= toDateTime(%(since)s)
+WHERE fetched_at >= %(since)s
 GROUP BY bucket
 ORDER BY bucket
 """, {"since": since_dt})
@@ -310,7 +335,7 @@ SELECT formatDateTime(toDate(published_at), '%Y-%m-%d') AS bucket,
        count() AS cnt
 FROM {db}.{T_DIM}
 WHERE published_at IS NOT NULL
-  AND published_at >= toDateTime(%(since)s)
+  AND published_at >= %(since)s
 GROUP BY bucket
 ORDER BY bucket
 """, {"since": since_dt})
@@ -320,7 +345,7 @@ SELECT formatDateTime(toStartOfMonth(published_at), '%Y-%m') AS bucket,
        count() AS cnt
 FROM {db}.{T_DIM}
 WHERE published_at IS NOT NULL
-  AND published_at >= toDateTime(%(since)s)
+  AND published_at >= %(since)s
 GROUP BY bucket
 ORDER BY bucket
 """, {"since": since_dt})
@@ -330,7 +355,7 @@ SELECT toString(toYear(published_at)) AS bucket,
        count() AS cnt
 FROM {db}.{T_DIM}
 WHERE published_at IS NOT NULL
-  AND published_at >= toDateTime(%(since)s)
+  AND published_at >= %(since)s
 GROUP BY bucket
 ORDER BY bucket
 """, {"since": since_dt})

@@ -21,13 +21,15 @@ def _session():
     s = getattr(TLS, "session", None)
     if s is None:
         s = requests.Session()
+        # Thread-local Session에 공통 헤더를 매번 확실히 적용
+        s.headers.update({
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
         TLS.session = s
     return s
 
-SESSION.headers.update({
-    "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-})
+# NOTE: SESSION 전역 객체를 두지 않습니다. (멀티스레드에서 안전하지 않음)
 NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 KST = ZoneInfo("Asia/Seoul")
 
