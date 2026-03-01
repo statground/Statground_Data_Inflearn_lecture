@@ -369,7 +369,8 @@ def main():
     for p in chart_files:
         # GitHub는 Markdown 링크를 '현재 md 파일 위치' 기준으로 해석하므로,
         # 레포 루트 기준 경로를 그대로 넣으면 (reports/inflearn/...) 처럼 중복되어 깨질 수 있음.
-        rel = os.path.relpath(p, report_latest.parent).replace('\', '/')
+        rel = os.path.relpath(p, report_latest.parent)
+        rel = rel.replace(os.sep, '/')
         md.append(f"### {p.name}")
         md.append(f"![{p.name}]({rel})")
         md.append("")
