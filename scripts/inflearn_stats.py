@@ -1,399 +1,507 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Batch #3: generate statistics and commit artifacts to GitHub.
+Inflearn 통계 리포트 생성 스크립트
+- ClickHouse에서 집계
+- reports/inflearn/ 에 Markdown + charts/*.png 생성
+- 표가 너무 길어지는(시간 버킷) 결과는 표 출력 대신 차트 + 요약만 제공
+- DB 접속정보(호스트/포트/DB명 등)는 출력/리포트에 노출하지 않음
 
-Artifacts (committed):
-- reports/inflearn/inflearn_stats_latest.md
-- reports/inflearn/inflearn_stats_<YYYYMMDD_HH>.md
-- reports/inflearn/charts/*.png
-
-Notes:
-- Uses ClickHouse as source.
-- Produces collected-at (fetched_at) stats and published-at stats.
-- Produces total / yearly / monthly / daily / hourly + cumulative.
+요구사항 반영:
+- 긴 테이블 제거(차트로 대체)
+- 모든 설명/섹션 한국어
+- md 이미지 경로: md 기준 상대경로(charts/xxx.png)로 고정
 """
 
+from __future__ import annotations
+
+import math
 import os
 import re
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
 import clickhouse_connect
 
-# matplotlib is used only for generating png charts saved to repo.
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+KST = timezone(timedelta(hours=9))
 
-KST = ZoneInfo("Asia/Seoul")
 
-def _parse_port(raw: str, default: int) -> int:
-    raw = (raw or "").strip()
-    m = re.search(r"\d+", raw)
-    if not m:
+def now_kst() -> datetime:
+    return datetime.now(tz=KST)
+
+
+def fmt_num(x: Any) -> str:
+    try:
+        if x is None:
+            return "0"
+        if isinstance(x, bool):
+            return "1" if x else "0"
+        if isinstance(x, int):
+            return f"{x:,}"
+        if isinstance(x, float):
+            if math.isfinite(x):
+                if abs(x) >= 1000:
+                    return f"{x:,.0f}"
+                return f"{x:,.2f}"
+            return "0"
+        s = str(x)
+        if s.isdigit():
+            return f"{int(s):,}"
+        return s
+    except Exception:
+        return str(x)
+
+
+def parse_port(val: Optional[str], default: int = 8123) -> int:
+    if val is None:
+        return default
+    s = str(val).strip()
+    if s == "":
+        return default
+    m = None
+    for token in re.findall(r"\d+", s):
+        m = token
+        break
+    if m is None:
         return default
     try:
-        return int(m.group(0))
+        return int(m)
     except Exception:
         return default
+
+
+def env_first(*names: str) -> Optional[str]:
+    for n in names:
+        v = os.environ.get(n)
+        if v is not None and str(v).strip() != "":
+            return v
+    return None
+
+
+def set_korean_font():
+    # workflow에서 fonts-noto-cjk 설치
+    plt.rcParams["font.family"] = "Noto Sans CJK KR"
+    plt.rcParams["axes.unicode_minus"] = False
 
 
 def ch_client():
-    # Prefer CH_* (repo secrets), fallback to CLICKHOUSE_*
-    host = (os.environ.get("CH_HOST") or os.environ.get("CLICKHOUSE_HOST") or "").strip()
-    port_raw = os.environ.get("CH_PORT") or os.environ.get("CLICKHOUSE_PORT") or ""
-    port = _parse_port(str(port_raw), 8123)
-    user = (os.environ.get("CH_USER") or os.environ.get("CLICKHOUSE_USER") or "default").strip()
-    password = os.environ.get("CH_PASSWORD") or os.environ.get("CLICKHOUSE_PASSWORD") or ""
-    database = (os.environ.get("CH_DATABASE") or os.environ.get("CLICKHOUSE_DATABASE") or "default").strip()
+    host = env_first("CH_HOST", "CLICKHOUSE_HOST")
     if not host:
-        raise RuntimeError("CH_HOST (or CLICKHOUSE_HOST) is required")
-    return clickhouse_connect.get_client(
-        host=host, port=port, username=user, password=password, database=database
-    ), database
+        raise RuntimeError("CH_HOST(또는 CLICKHOUSE_HOST) 환경변수가 필요합니다.")
+    port = parse_port(env_first("CH_PORT", "CLICKHOUSE_PORT"), default=8123)
+    user = env_first("CH_USER", "CLICKHOUSE_USER") or "default"
+    password = env_first("CH_PASSWORD", "CLICKHOUSE_PASSWORD") or ""
+    database = env_first("CH_DATABASE", "CLICKHOUSE_DATABASE") or "default"
+
+    # 접속정보 출력 금지
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=port,
+        username=user,
+        password=password,
+        database=database,
+        secure=False,
+    )
+    return client, database
 
 
-def _get_int(name: str, default: int) -> int:
-    v = os.environ.get(name, "").strip()
+def q(client, sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    res = client.query(sql, parameters=params or {})
+    cols = res.column_names
+    out: List[Dict[str, Any]] = []
+    for row in res.result_rows:
+        out.append({cols[i]: row[i] for i in range(len(cols))})
+    return out
+
+
+def safe_query(client, sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     try:
-        return int(v) if v else default
+        return q(client, sql, params=params)
     except Exception:
-        return default
+        # 민감정보 노출 방지: 상세 에러/SQL 출력 금지
+        return []
 
 
+def table_exists(client, db: str, table: str) -> bool:
+    rows = safe_query(
+        client,
+        "SELECT 1 FROM system.tables WHERE database=%(db)s AND name=%(t)s LIMIT 1",
+        {"db": db, "t": table},
+    )
+    return len(rows) > 0
 
 
-def md_table(headers, rows, max_rows: int | None = None):
-    out = []
-    out.append("| " + " | ".join(headers) + " |")
-    out.append("|" + "|".join(["---"] * len(headers)) + "|")
-    for i, r in enumerate(rows):
-        if max_rows is not None and i >= max_rows:
-            out.append(f"| ... | ... |")
-            break
-        out.append("| " + " | ".join(str(x) for x in r) + " |")
-    return "\n".join(out)
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
 
-def q(ch, sql):
-    return ch.query(sql).result_rows
+def relpath_for_md(img_path: Path, md_path: Path) -> str:
+    # ✅ md 기준 상대경로(항상 charts/xxx.png 형태)
+    return img_path.relative_to(md_path.parent).as_posix()
 
 
-def save_line_chart(x, y, title: str, out_path: Path, xlabel: str = "", ylabel: str = ""):
-    plt.figure()
-    plt.plot(x, y)
+# -----------------------------
+# 차트
+# -----------------------------
+def plot_line(xs: Sequence[str], ys: Sequence[float], title: str, xlabel: str, ylabel: str, out_path: Path):
+    plt.figure(figsize=(10, 4))
+    plt.plot(list(range(len(xs))), ys)
+    if len(xs) <= 24:
+        plt.xticks(list(range(len(xs))), xs, rotation=45, ha="right")
+    else:
+        step = max(1, len(xs) // 12)
+        ticks = list(range(0, len(xs), step))
+        labels = [xs[i] for i in ticks]
+        plt.xticks(ticks, labels, rotation=45, ha="right")
     plt.title(title)
-    if xlabel:
-        plt.xlabel(xlabel)
-    if ylabel:
-        plt.ylabel(ylabel)
-    plt.xticks(rotation=45, ha="right")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
     plt.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path)
     plt.close()
 
 
-def save_hist(values, title: str, out_path: Path, bins: int = 50, xlabel: str = ""):
-    plt.figure()
+def plot_hist(values: Sequence[float], title: str, xlabel: str, ylabel: str, out_path: Path, bins: int = 50, logy: bool = False):
+    plt.figure(figsize=(10, 4))
     plt.hist(values, bins=bins)
+    if logy:
+        plt.yscale("log")
     plt.title(title)
-    if xlabel:
-        plt.xlabel(xlabel)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
     plt.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path)
     plt.close()
+
+
+# -----------------------------
+# 마크다운 섹션
+# -----------------------------
+def summarize_timeseries(rows: List[Dict[str, Any]], value_col: str) -> Dict[str, Any]:
+    if not rows:
+        return {"points": 0, "total": 0, "last": 0, "peak": 0}
+    vals: List[float] = []
+    for r in rows:
+        v = r.get(value_col)
+        try:
+            v = 0 if v is None else float(v)
+        except Exception:
+            v = 0
+        vals.append(v)
+    return {"points": len(vals), "total": sum(vals), "last": vals[-1], "peak": max(vals)}
+
+
+def md_section_timeseries(md: List[str], title: str, desc: str, chart_rel: str, rows: List[Dict[str, Any]], value_col: str):
+    s = summarize_timeseries(rows, value_col)
+    md.append(f"## {title}")
+    md.append("")
+    md.append(desc)
+    md.append("")
+    md.append(f"- 전체 합계: **{fmt_num(s['total'])}**")
+    md.append(f"- 마지막 구간 값: **{fmt_num(s['last'])}**")
+    md.append(f"- 최고 피크: **{fmt_num(s['peak'])}**")
+    md.append("")
+    md.append(f"![{title}]({chart_rel})")
+    md.append("")
+
+
+def md_section_distribution(md: List[str], title: str, desc: str, chart_rel: str, bullets: List[str]):
+    md.append(f"## {title}")
+    md.append("")
+    md.append(desc)
+    md.append("")
+    for b in bullets:
+        md.append(f"- {b}")
+    md.append("")
+    md.append(f"![{title}]({chart_rel})")
+    md.append("")
 
 
 def main():
-    ch, db = ch_client()
+    set_korean_font()
+    client, db = ch_client()
 
-    now = datetime.now(tz=KST)
-    lookback_days = _get_int("STATS_LOOKBACK_DAYS", 365)
-    since_dt = now - timedelta(days=lookback_days)
-    since = since_dt.strftime("%Y-%m-%d %H:%M:%S")
+    root = Path(".")
+    report_dir = root / "reports" / "inflearn"
+    charts_dir = report_dir / "charts"
+    ensure_dir(charts_dir)
 
-    # Repo paths
-    repo_root = Path(__file__).resolve().parents[1]
-    report_dir = repo_root / "reports" / "inflearn"
-    chart_dir = report_dir / "charts"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    chart_dir.mkdir(parents=True, exist_ok=True)
-
-    ts_tag = now.strftime("%Y%m%d_%H")
+    ts = now_kst().strftime("%Y%m%d_%H")
     report_latest = report_dir / "inflearn_stats_latest.md"
-    report_hourly = report_dir / f"inflearn_stats_{ts_tag}.md"
+    report_stamp = report_dir / f"inflearn_stats_{ts}.md"
 
-    # Latest dim per (course_id, locale)
-    latest_dim = f"""
-    SELECT
-      course_id, locale,
-      argMax(title, fetched_at) AS title,
-      max(fetched_at) AS last_fetched_at,
-      argMax(published_at, fetched_at) AS published_at,
-      argMax(student_count, fetched_at) AS student_count,
-      argMax(like_count, fetched_at) AS like_count,
-      argMax(review_count, fetched_at) AS review_count,
-      argMax(average_star, fetched_at) AS average_star
-    FROM {db}.inflearn_course_dim
-    GROUP BY course_id, locale
-    """
-
-    # Latest price per (course_id, locale)
-    latest_price = f"""
-    SELECT
-      course_id, locale,
-      argMax(krw_regular_price, fetched_at) AS krw_regular_price,
-      argMax(krw_pay_price, fetched_at) AS krw_pay_price,
-      argMax(discount_rate, fetched_at) AS discount_rate
-    FROM {db}.inflearn_course_price_fact
-    GROUP BY course_id, locale
-    """
-
-    md = []
-    md.append("# 인프런 강의 수집 통계")
-    md.append(f"- 생성 시각(KST): {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    md.append(f"- 조회 범위: 최근 {lookback_days}일 (시작일: {since})")
+    md: List[str] = []
+    md.append("# 인프런 강의 수집 통계 리포트")
+    md.append("")
+    md.append(f"- 생성 시각(KST): **{now_kst().strftime('%Y-%m-%d %H:%M:%S')}**")
+    md.append("- 테이블이 길어지는 구간(시간별/일별 등)은 **표를 생략**하고 차트+요약으로 대체합니다.")
     md.append("")
 
-    # Totals
-    total_courses = q(ch, f"SELECT uniqExact(cityHash64(toString(course_id), locale)) FROM ({latest_dim})")[0][0]
-    total_instructors = q(ch, f"SELECT uniqExact(instructor_id) FROM {db}.inflearn_instructor_dim")[0][0]
-    total_snapshots = q(ch, f"""
-        SELECT count()
-        FROM {db}.inflearn_course_snapshot_raw
-        WHERE fetched_at >= toDateTime64('{since}',3,'Asia/Seoul')
-    """)[0][0]
+    # 테이블명 (환경변수로 오버라이드 가능)
+    T_SNAPSHOT = os.environ.get("INFLEARN_T_SNAPSHOT", "inflearn_course_snapshot_raw")
+    T_DIM = os.environ.get("INFLEARN_T_DIM", "inflearn_course_dim")
+    T_METRIC = os.environ.get("INFLEARN_T_METRIC", "inflearn_course_metric_fact")
+    T_PRICE = os.environ.get("INFLEARN_T_PRICE", "inflearn_course_price_fact")
 
-    md.append("## Totals")
-    md.append(md_table(["metric", "value"], [
-        ["distinct course(locale) (latest dim)", total_courses],
-        ["distinct instructors", total_instructors],
-        [f"snapshots (last {lookback_days}d)", total_snapshots],
-    ]))
+    exist = {t: table_exists(client, db, t) for t in [T_SNAPSHOT, T_DIM, T_METRIC, T_PRICE]}
+
+    md.append("## 데이터 소스 상태")
+    md.append("")
+    for t, ok in exist.items():
+        md.append(f"- `{t}`: {'✅ 사용 가능' if ok else '⚠️ 미존재/권한 없음(해당 섹션은 생략)'}")
     md.append("")
 
-    # Locale breakdown (latest dim)
-    loc = q(ch, f"""
-      SELECT locale,
-        count() AS course_cnt,
-        sum(student_count) AS students_sum,
-        sum(like_count) AS likes_sum,
-        sum(review_count) AS reviews_sum,
-        round(avg(average_star), 4) AS avg_star
-      FROM ({latest_dim})
-      GROUP BY locale
-      ORDER BY course_cnt DESC
-    """)
-    md.append("## Locale breakdown (latest)")
-    md.append(md_table(["locale","courses","students_sum","likes_sum","reviews_sum","avg_star"], loc))
+    lookback_days = int(os.environ.get("STATS_LOOKBACK_DAYS", "365"))
+    since_dt = (now_kst() - timedelta(days=lookback_days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 전체 요약
+    md.append("## 전체 요약")
+    md.append("")
+    if exist[T_DIM]:
+        rows = safe_query(client, f"SELECT uniqExact(course_id) AS cnt FROM {db}.{T_DIM}")
+        if rows:
+            md.append(f"- 누적 수집 강의(고유 course_id): **{fmt_num(rows[0].get('cnt'))}**")
+        loc = safe_query(client, f"SELECT locale, uniqExact(course_id) AS cnt FROM {db}.{T_DIM} GROUP BY locale ORDER BY cnt DESC LIMIT 8")
+        if loc:
+            md.append("- 언어별(상위): " + ", ".join([f"{r.get('locale')}:{fmt_num(r.get('cnt'))}" for r in loc]))
+    else:
+        md.append("- 누적 수집 강의(고유 course_id): (집계 불가)")
     md.append("")
 
-    # Price/Discount breakdown (latest price)
-    price = q(ch, f"""
-      SELECT
-        locale,
-        count() AS course_cnt,
-        round(avg(krw_regular_price), 0) AS avg_regular,
-        round(avg(krw_pay_price), 0) AS avg_pay,
-        round(avg(discount_rate), 4) AS avg_discount_rate,
-        sum(discount_rate > 0) AS discounted_cnt,
-        round(sum(discount_rate > 0) / count(), 4) AS discounted_ratio
-      FROM ({latest_price})
-      GROUP BY locale
-      ORDER BY course_cnt DESC
-    """)
-    md.append("## Price & Discount (latest)")
-    md.append(md_table(["locale","courses","avg_regular_krw","avg_pay_krw","avg_discount_rate","discounted_cnt","discounted_ratio"], price))
+    # 수집 시점 기준 시계열
+    if exist[T_SNAPSHOT]:
+        hourly = safe_query(
+            client,
+            f"""\
+SELECT formatDateTime(toStartOfHour(created_at), '%Y-%m-%d %H') AS bucket,
+       count() AS cnt
+FROM {db}.{T_SNAPSHOT}
+WHERE created_at >= toDateTime(%(since)s)
+GROUP BY bucket
+ORDER BY bucket""",
+            {"since": since_dt},
+        )
+        daily = safe_query(
+            client,
+            f"""\
+SELECT formatDateTime(toDate(created_at), '%Y-%m-%d') AS bucket,
+       count() AS cnt
+FROM {db}.{T_SNAPSHOT}
+WHERE created_at >= toDateTime(%(since)s)
+GROUP BY bucket
+ORDER BY bucket""",
+            {"since": since_dt},
+        )
+        monthly = safe_query(
+            client,
+            f"""\
+SELECT formatDateTime(toStartOfMonth(created_at), '%Y-%m') AS bucket,
+       count() AS cnt
+FROM {db}.{T_SNAPSHOT}
+WHERE created_at >= toDateTime(%(since)s)
+GROUP BY bucket
+ORDER BY bucket""",
+            {"since": since_dt},
+        )
+        yearly = safe_query(
+            client,
+            f"""\
+SELECT toString(toYear(created_at)) AS bucket,
+       count() AS cnt
+FROM {db}.{T_SNAPSHOT}
+WHERE created_at >= toDateTime(%(since)s)
+GROUP BY bucket
+ORDER BY bucket""",
+            {"since": since_dt},
+        )
+
+        def make_chart(rows: List[Dict[str, Any]], fname: str, title: str, xlabel: str) -> Path:
+            out = charts_dir / fname
+            xs = [r["bucket"] for r in rows]
+            ys = [float(r.get("cnt") or 0) for r in rows]
+            plot_line(xs, ys, title, xlabel, "스냅샷 수", out)
+            return out
+
+        p_hourly = make_chart(hourly, "collected_hourly_snapshots.png", "수집 시점 기준 - 시간별 스냅샷", "시간(YYYY-MM-DD HH)")
+        p_daily = make_chart(daily, "collected_daily_snapshots.png", "수집 시점 기준 - 일별 스냅샷", "일자")
+        p_monthly = make_chart(monthly, "collected_monthly_snapshots.png", "수집 시점 기준 - 월별 스냅샷", "월")
+        p_yearly = make_chart(yearly, "collected_yearly_snapshots.png", "수집 시점 기준 - 연별 스냅샷", "연도")
+
+        md_section_timeseries(md, "수집 시점 기준 - 시간별 스냅샷", "최근 기간(설정값 기준) 시간별 스냅샷 수 추이입니다.", relpath_for_md(p_hourly, report_latest), hourly, "cnt")
+        md_section_timeseries(md, "수집 시점 기준 - 일별 스냅샷", "최근 기간(설정값 기준) 일별 스냅샷 수 추이입니다.", relpath_for_md(p_daily, report_latest), daily, "cnt")
+        md_section_timeseries(md, "수집 시점 기준 - 월별 스냅샷", "최근 기간(설정값 기준) 월별 스냅샷 수 추이입니다.", relpath_for_md(p_monthly, report_latest), monthly, "cnt")
+        md_section_timeseries(md, "수집 시점 기준 - 연별 스냅샷", "최근 기간(설정값 기준) 연별 스냅샷 수 추이입니다.", relpath_for_md(p_yearly, report_latest), yearly, "cnt")
+
+    # 개설 시점 기준
+    if exist[T_DIM]:
+        pub_daily = safe_query(
+            client,
+            f"""\
+SELECT formatDateTime(toDate(published_at), '%Y-%m-%d') AS bucket,
+       count() AS cnt
+FROM {db}.{T_DIM}
+WHERE published_at IS NOT NULL
+  AND published_at >= toDateTime(%(since)s)
+GROUP BY bucket
+ORDER BY bucket""",
+            {"since": since_dt},
+        )
+        pub_monthly = safe_query(
+            client,
+            f"""\
+SELECT formatDateTime(toStartOfMonth(published_at), '%Y-%m') AS bucket,
+       count() AS cnt
+FROM {db}.{T_DIM}
+WHERE published_at IS NOT NULL
+  AND published_at >= toDateTime(%(since)s)
+GROUP BY bucket
+ORDER BY bucket""",
+            {"since": since_dt},
+        )
+        pub_yearly = safe_query(
+            client,
+            f"""\
+SELECT toString(toYear(published_at)) AS bucket,
+       count() AS cnt
+FROM {db}.{T_DIM}
+WHERE published_at IS NOT NULL
+  AND published_at >= toDateTime(%(since)s)
+GROUP BY bucket
+ORDER BY bucket""",
+            {"since": since_dt},
+        )
+
+        if pub_daily:
+            p = charts_dir / "published_daily_courses.png"
+            plot_line([r["bucket"] for r in pub_daily], [float(r.get("cnt") or 0) for r in pub_daily], "개설 시점 기준 - 일별 신규 강의", "일자", "강의 수", p)
+            md_section_timeseries(md, "개설 시점 기준 - 일별 신규 강의", "published_at 기준으로 집계한 일별 신규 강의 수 추이입니다.", relpath_for_md(p, report_latest), pub_daily, "cnt")
+
+        if pub_monthly:
+            p = charts_dir / "published_monthly_courses.png"
+            plot_line([r["bucket"] for r in pub_monthly], [float(r.get("cnt") or 0) for r in pub_monthly], "개설 시점 기준 - 월별 신규 강의", "월", "강의 수", p)
+            md_section_timeseries(md, "개설 시점 기준 - 월별 신규 강의", "published_at 기준으로 집계한 월별 신규 강의 수 추이입니다.", relpath_for_md(p, report_latest), pub_monthly, "cnt")
+
+        if pub_yearly:
+            p = charts_dir / "published_yearly_courses.png"
+            plot_line([r["bucket"] for r in pub_yearly], [float(r.get("cnt") or 0) for r in pub_yearly], "개설 시점 기준 - 연별 신규 강의", "연도", "강의 수", p)
+            md_section_timeseries(md, "개설 시점 기준 - 연별 신규 강의", "published_at 기준으로 집계한 연별 신규 강의 수 추이입니다.", relpath_for_md(p, report_latest), pub_yearly, "cnt")
+
+    # 지표/가격 분포
+    if exist[T_METRIC]:
+        metric = safe_query(
+            client,
+            f"""\
+SELECT
+  course_id,
+  locale,
+  argMax(student_count, updated_at) AS student_count,
+  argMax(like_count, updated_at) AS like_count,
+  argMax(review_count, updated_at) AS review_count,
+  argMax(average_star, updated_at) AS average_star
+FROM {db}.{T_METRIC}
+GROUP BY course_id, locale""",
+        )
+        if metric:
+            students = [float(r.get("student_count") or 0) for r in metric]
+            likes = [float(r.get("like_count") or 0) for r in metric]
+            reviews = [float(r.get("review_count") or 0) for r in metric]
+            stars = [float(r.get("average_star") or 0) for r in metric]
+
+            p = charts_dir / "dist_student_count.png"
+            plot_hist(students, "수강생 수 분포", "수강생 수", "강의 수", p, bins=60, logy=True)
+            md_section_distribution(md, "수강생 수 분포", "고유 강의별(최신값 기준) 수강생 수 분포입니다. (y축 로그)", relpath_for_md(p, report_latest), [
+                f"강의 수(표본): **{fmt_num(len(students))}**",
+                f"최대 수강생: **{fmt_num(max(students) if students else 0)}**",
+                f"평균 수강생: **{fmt_num(sum(students)/len(students) if students else 0)}**",
+            ])
+
+            p = charts_dir / "dist_like_count.png"
+            plot_hist(likes, "좋아요 수 분포", "좋아요 수", "강의 수", p, bins=60, logy=True)
+            md_section_distribution(md, "좋아요 수 분포", "고유 강의별(최신값 기준) 좋아요 수 분포입니다. (y축 로그)", relpath_for_md(p, report_latest), [
+                f"강의 수(표본): **{fmt_num(len(likes))}**",
+                f"최대 좋아요: **{fmt_num(max(likes) if likes else 0)}**",
+                f"평균 좋아요: **{fmt_num(sum(likes)/len(likes) if likes else 0)}**",
+            ])
+
+            p = charts_dir / "dist_review_count.png"
+            plot_hist(reviews, "리뷰 수 분포", "리뷰 수", "강의 수", p, bins=60, logy=True)
+            md_section_distribution(md, "리뷰 수 분포", "고유 강의별(최신값 기준) 리뷰 수 분포입니다. (y축 로그)", relpath_for_md(p, report_latest), [
+                f"강의 수(표본): **{fmt_num(len(reviews))}**",
+                f"최대 리뷰: **{fmt_num(max(reviews) if reviews else 0)}**",
+                f"평균 리뷰: **{fmt_num(sum(reviews)/len(reviews) if reviews else 0)}**",
+            ])
+
+            p = charts_dir / "dist_average_star.png"
+            plot_hist(stars, "평균 별점 분포", "평균 별점", "강의 수", p, bins=40, logy=False)
+            md_section_distribution(md, "평균 별점 분포", "고유 강의별(최신값 기준) 평균 별점 분포입니다.", relpath_for_md(p, report_latest), [
+                f"강의 수(표본): **{fmt_num(len(stars))}**",
+                f"평균 별점: **{fmt_num(sum(stars)/len(stars) if stars else 0)}**",
+            ])
+
+    if exist[T_PRICE]:
+        price = safe_query(
+            client,
+            f"""\
+SELECT
+  course_id,
+  locale,
+  argMax(price_regular_krw, updated_at) AS price_regular_krw,
+  argMax(price_pay_krw, updated_at) AS price_pay_krw,
+  argMax(discount_rate, updated_at) AS discount_rate,
+  argMax(is_discounted, updated_at) AS is_discounted
+FROM {db}.{T_PRICE}
+GROUP BY course_id, locale""",
+        )
+        if price:
+            reg = [float(r.get("price_regular_krw") or 0) for r in price]
+            pay = [float(r.get("price_pay_krw") or 0) for r in price]
+            disc = [float(r.get("discount_rate") or 0) for r in price]
+            discounted = sum([1 for r in price if int(r.get("is_discounted") or 0) == 1])
+
+            p = charts_dir / "dist_price_regular_krw.png"
+            plot_hist(reg, "정가(KRW) 분포", "정가(KRW)", "강의 수", p, bins=60, logy=True)
+            md_section_distribution(md, "정가(KRW) 분포", "고유 강의별(최신값 기준) 정가 분포입니다. (y축 로그)", relpath_for_md(p, report_latest), [
+                f"강의 수(표본): **{fmt_num(len(reg))}**",
+                f"최대 정가: **{fmt_num(max(reg) if reg else 0)}**",
+                f"평균 정가: **{fmt_num(sum(reg)/len(reg) if reg else 0)}**",
+            ])
+
+            p = charts_dir / "dist_price_pay_krw.png"
+            plot_hist(pay, "판매가(KRW) 분포", "판매가(KRW)", "강의 수", p, bins=60, logy=True)
+            md_section_distribution(md, "판매가(KRW) 분포", "고유 강의별(최신값 기준) 판매가 분포입니다. (y축 로그)", relpath_for_md(p, report_latest), [
+                f"강의 수(표본): **{fmt_num(len(pay))}**",
+                f"최대 판매가: **{fmt_num(max(pay) if pay else 0)}**",
+                f"평균 판매가: **{fmt_num(sum(pay)/len(pay) if pay else 0)}**",
+            ])
+
+            p = charts_dir / "dist_discount_rate.png"
+            plot_hist(disc, "할인율 분포", "할인율(%)", "강의 수", p, bins=40, logy=False)
+            md_section_distribution(md, "할인율 분포", "고유 강의별(최신값 기준) 할인율 분포입니다.", relpath_for_md(p, report_latest), [
+                f"할인 적용 강의 수: **{fmt_num(discounted)}** / 전체 **{fmt_num(len(price))}**",
+                f"평균 할인율: **{fmt_num(sum(disc)/len(disc) if disc else 0)}**",
+            ])
+
+    md.append("---")
+    md.append("### 메모")
+    md.append("- 본 리포트는 GitHub Actions에서 자동 생성됩니다.")
+    md.append("- 접속정보(호스트/포트/DB명 등)는 리포트/로그에 출력하지 않습니다.")
     md.append("")
 
-    # -----------------------
-    # Collected-at based stats (snapshot_raw)
-    # -----------------------
-    def time_bucket(bucket_expr: str, label: str, limit: int = 400):
-        rows = q(ch, f"""
-          SELECT
-            {bucket_expr} AS bucket,
-            uniqExact(cityHash64(toString(course_id), locale)) AS courses,
-            count() AS snapshots
-          FROM {db}.inflearn_course_snapshot_raw
-          WHERE fetched_at >= toDateTime64('{since}',3,'Asia/Seoul')
-          GROUP BY bucket
-          ORDER BY bucket ASC
-          LIMIT {limit}
-        """)
-        cum_courses = 0
-        cum_snaps = 0
-        out = []
-        for b, c, s in rows:
-            cum_courses += int(c)
-            cum_snaps += int(s)
-            out.append([b, c, s, cum_courses, cum_snaps])
-        return label, out
-
-    md.append("## 수집 시점 기준 통계 (snapshot_raw)")
-    collected_series = {}
-    for bucket_expr, label, limit in [
-        ("toStartOfHour(fetched_at)", "Hourly", 24 * 30),
-        ("toDate(fetched_at)", "Daily", 400),
-        ("toStartOfMonth(fetched_at)", "Monthly", 200),
-        ("toStartOfYear(fetched_at)", "Yearly", 50),
-    ]:
-        title, rows = time_bucket(bucket_expr, label, limit=limit)
-        collected_series[label] = rows
-        md.append(f"### {title}")
-        # Show latest first in MD
-        md.append(md_table(["bucket","courses","snapshots","cum_courses","cum_snapshots"], list(reversed(rows)), max_rows=120))
-        md.append("")
-
-    # Charts (collected-at): snapshots time-series
-    for label, rows in collected_series.items():
-        x = [str(r[0]) for r in rows]
-        y = [int(r[2]) for r in rows]
-        save_line_chart(x, y, f"Collected-at {label}: snapshots", chart_dir / f"collected_{label.lower()}_snapshots.png", xlabel="time", ylabel="snapshots")
-
-    # -----------------------
-    # Published-at based stats (course_dim latest)
-    # -----------------------
-    md.append("## 개설 시점 기준 통계 (course_dim 최신)")
-    published_series = {}
-    for bucket_expr, label, limit in [
-        ("toDate(published_at)", "Daily", 400),
-        ("toStartOfMonth(published_at)", "Monthly", 200),
-        ("toStartOfYear(published_at)", "Yearly", 80),
-    ]:
-        rows = q(ch, f"""
-          SELECT
-            {bucket_expr} AS bucket,
-            count() AS courses
-          FROM ({latest_dim})
-          WHERE published_at >= toDateTime64('{since}',3,'Asia/Seoul')
-          GROUP BY bucket
-          ORDER BY bucket ASC
-          LIMIT {limit}
-        """)
-        cum = 0
-        out = []
-        for b, c in rows:
-            cum += int(c)
-            out.append([b, c, cum])
-        published_series[label] = out
-        md.append(f"### {label}")
-        md.append(md_table(["bucket","courses","cum_courses"], list(reversed(out)), max_rows=120))
-        md.append("")
-
-    # Charts (published-at): courses time-series
-    for label, rows in published_series.items():
-        x = [str(r[0]) for r in rows]
-        y = [int(r[1]) for r in rows]
-        save_line_chart(x, y, f"Published-at {label}: new courses", chart_dir / f"published_{label.lower()}_courses.png", xlabel="time", ylabel="courses")
-
-    # -----------------------
-    # Distributions (latest)
-    # -----------------------
-    md.append("## Distributions (latest, top-level)")
-    dist_rows = q(ch, f"""
-      SELECT
-        student_count,
-        like_count,
-        review_count,
-        average_star
-      FROM ({latest_dim})
-      WHERE last_fetched_at >= toDateTime64('{since}',3,'Asia/Seoul')
-      LIMIT 200000
-    """)
-    students = [int(r[0]) for r in dist_rows if r[0] is not None]
-    likes = [int(r[1]) for r in dist_rows if r[1] is not None]
-    reviews = [int(r[2]) for r in dist_rows if r[2] is not None]
-    stars = [float(r[3]) for r in dist_rows if r[3] is not None]
-
-    md.append(md_table(["metric", "count", "p50", "p90", "p99", "max"], [
-        ["student_count", len(students),
-         q(ch, f"SELECT quantile(0.5)(student_count) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT quantile(0.9)(student_count) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT quantile(0.99)(student_count) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT max(student_count) FROM ({latest_dim})")[0][0]],
-        ["like_count", len(likes),
-         q(ch, f"SELECT quantile(0.5)(like_count) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT quantile(0.9)(like_count) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT quantile(0.99)(like_count) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT max(like_count) FROM ({latest_dim})")[0][0]],
-        ["review_count", len(reviews),
-         q(ch, f"SELECT quantile(0.5)(review_count) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT quantile(0.9)(review_count) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT quantile(0.99)(review_count) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT max(review_count) FROM ({latest_dim})")[0][0]],
-        ["average_star", len(stars),
-         q(ch, f"SELECT quantile(0.5)(average_star) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT quantile(0.9)(average_star) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT quantile(0.99)(average_star) FROM ({latest_dim})")[0][0],
-         q(ch, f"SELECT max(average_star) FROM ({latest_dim})")[0][0]],
-    ]))
-    md.append("")
-
-    # Histograms
-    if students:
-        save_hist(students, "student_count distribution", chart_dir / "dist_student_count.png", bins=60, xlabel="students")
-    if likes:
-        save_hist(likes, "like_count distribution", chart_dir / "dist_like_count.png", bins=60, xlabel="likes")
-    if reviews:
-        save_hist(reviews, "review_count distribution", chart_dir / "dist_review_count.png", bins=60, xlabel="reviews")
-    if stars:
-        save_hist(stars, "average_star distribution", chart_dir / "dist_average_star.png", bins=40, xlabel="star")
-
-    # Price distributions
-    price_rows = q(ch, f"""
-      SELECT
-        krw_regular_price,
-        krw_pay_price,
-        discount_rate
-      FROM ({latest_price})
-      LIMIT 200000
-    """)
-    reg = [float(r[0]) for r in price_rows if r[0] is not None]
-    pay = [float(r[1]) for r in price_rows if r[1] is not None]
-    disc = [float(r[2]) for r in price_rows if r[2] is not None]
-    if reg:
-        save_hist(reg, "regular price (KRW) distribution", chart_dir / "dist_price_regular_krw.png", bins=60, xlabel="KRW")
-    if pay:
-        save_hist(pay, "pay price (KRW) distribution", chart_dir / "dist_price_pay_krw.png", bins=60, xlabel="KRW")
-    if disc:
-        save_hist(disc, "discount_rate distribution", chart_dir / "dist_discount_rate.png", bins=50, xlabel="rate")
-
-    # Embed images in MD (markdown 파일 기준 상대경로)
-    md.append("## 차트")
-    chart_files = sorted([p for p in chart_dir.glob("*.png")])
-    for p in chart_files:
-        # GitHub는 Markdown 링크를 '현재 md 파일 위치' 기준으로 해석하므로,
-        # 레포 루트 기준 경로를 그대로 넣으면 (reports/inflearn/...) 처럼 중복되어 깨질 수 있음.
-        rel = os.path.relpath(p, report_latest.parent)
-        rel = rel.replace(os.sep, '/')
-        md.append(f"### {p.name}")
-        md.append(f"![{p.name}]({rel})")
-        md.append("")
-
-
-    report = "\n".join(md)
-
-    # Write artifacts
-    report_latest.write_text(report, encoding="utf-8")
-    report_hourly.write_text(report, encoding="utf-8")
-
-    # Console
-    print(report)
-
-    # Also write step summary
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary_path:
-        with open(summary_path, "a", encoding="utf-8") as f:
-            f.write(f"## Inflearn stats artifacts\n\n")
-            f.write(f"- `{report_latest.relative_to(repo_root)}`\n")
-            f.write(f"- `{report_hourly.relative_to(repo_root)}`\n")
-            f.write(f"- charts: `{chart_dir.relative_to(repo_root)}/`\n\n")
+    content = "\n".join(md) + "\n"
+    ensure_dir(report_dir)
+    report_latest.write_text(content, encoding="utf-8")
+    report_stamp.write_text(content, encoding="utf-8")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        print("통계 리포트 생성 중 오류가 발생했습니다. (세부 정보는 숨김 처리)", file=sys.stderr)
+        raise
