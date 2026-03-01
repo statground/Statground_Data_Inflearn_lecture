@@ -10,6 +10,7 @@ Note: OPTIMIZE FINAL is heavy. Keep OPTIMIZE_MONTHS small.
 """
 
 import os
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -31,6 +32,31 @@ CHECKPOINT_TABLES = [
   "inflearn_crawl_checkpoint",
 ]
 
+def _parse_port(raw: str, default: int) -> int:
+    raw = (raw or "").strip()
+    m = re.search(r"\d+", raw)
+    if not m:
+        return default
+    try:
+        return int(m.group(0))
+    except Exception:
+        return default
+
+
+def ch_client():
+    # Prefer CH_* (repo secrets), fallback to CLICKHOUSE_*
+    host = (os.environ.get("CH_HOST") or os.environ.get("CLICKHOUSE_HOST") or "").strip()
+    port_raw = os.environ.get("CH_PORT") or os.environ.get("CLICKHOUSE_PORT") or ""
+    port = _parse_port(str(port_raw), 8123)
+    user = (os.environ.get("CH_USER") or os.environ.get("CLICKHOUSE_USER") or "default").strip()
+    password = os.environ.get("CH_PASSWORD") or os.environ.get("CLICKHOUSE_PASSWORD") or ""
+    database = (os.environ.get("CH_DATABASE") or os.environ.get("CLICKHOUSE_DATABASE") or "default").strip()
+    if not host:
+        raise RuntimeError("CH_HOST (or CLICKHOUSE_HOST) is required")
+    return clickhouse_connect.get_client(
+        host=host, port=port, username=user, password=password, database=database
+    ), database
+
 def _get_int(name: str, default: int) -> int:
     v = os.environ.get(name, "").strip()
     try:
@@ -38,15 +64,6 @@ def _get_int(name: str, default: int) -> int:
     except Exception:
         return default
 
-def ch_client():
-    host = os.environ.get("CLICKHOUSE_HOST")
-    port = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
-    user = os.environ.get("CLICKHOUSE_USER", "default")
-    password = os.environ.get("CLICKHOUSE_PASSWORD", "")
-    database = os.environ.get("CLICKHOUSE_DATABASE", "statground_lecture")
-    if not host:
-        raise RuntimeError("CLICKHOUSE_HOST is required")
-    return clickhouse_connect.get_client(host=host, port=port, username=user, password=password, database=database), database
 
 def run():
     ch, db = ch_client()
@@ -69,14 +86,16 @@ def run():
             sql = f"OPTIMIZE TABLE {db}.{t} PARTITION {p} FINAL"
             try:
                 ch.command(sql)
-            except Exception as e:
+            except Exception:
+                pass
 
     # Non-partitioned tables
     for t in CHECKPOINT_TABLES:
         sql = f"OPTIMIZE TABLE {db}.{t} FINAL"
         try:
             ch.command(sql)
-        except Exception as e:
+        except Exception:
+                pass
 
 if __name__ == "__main__":
     run()

@@ -14,6 +14,7 @@ Notes:
 """
 
 import os
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -28,6 +29,31 @@ import matplotlib.pyplot as plt
 
 KST = ZoneInfo("Asia/Seoul")
 
+def _parse_port(raw: str, default: int) -> int:
+    raw = (raw or "").strip()
+    m = re.search(r"\d+", raw)
+    if not m:
+        return default
+    try:
+        return int(m.group(0))
+    except Exception:
+        return default
+
+
+def ch_client():
+    # Prefer CH_* (repo secrets), fallback to CLICKHOUSE_*
+    host = (os.environ.get("CH_HOST") or os.environ.get("CLICKHOUSE_HOST") or "").strip()
+    port_raw = os.environ.get("CH_PORT") or os.environ.get("CLICKHOUSE_PORT") or ""
+    port = _parse_port(str(port_raw), 8123)
+    user = (os.environ.get("CH_USER") or os.environ.get("CLICKHOUSE_USER") or "default").strip()
+    password = os.environ.get("CH_PASSWORD") or os.environ.get("CLICKHOUSE_PASSWORD") or ""
+    database = (os.environ.get("CH_DATABASE") or os.environ.get("CLICKHOUSE_DATABASE") or "default").strip()
+    if not host:
+        raise RuntimeError("CH_HOST (or CLICKHOUSE_HOST) is required")
+    return clickhouse_connect.get_client(
+        host=host, port=port, username=user, password=password, database=database
+    ), database
+
 
 def _get_int(name: str, default: int) -> int:
     v = os.environ.get(name, "").strip()
@@ -37,15 +63,6 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
-def ch_client():
-    host = os.environ.get("CLICKHOUSE_HOST")
-    port = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
-    user = os.environ.get("CLICKHOUSE_USER", "default")
-    password = os.environ.get("CLICKHOUSE_PASSWORD", "")
-    database = os.environ.get("CLICKHOUSE_DATABASE", "statground_lecture")
-    if not host:
-        raise RuntimeError("CLICKHOUSE_HOST is required")
-    return clickhouse_connect.get_client(host=host, port=port, username=user, password=password, database=database), database
 
 
 def md_table(headers, rows, max_rows: int | None = None):
