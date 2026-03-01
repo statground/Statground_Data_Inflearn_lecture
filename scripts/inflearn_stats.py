@@ -154,9 +154,9 @@ def main():
     """
 
     md = []
-    md.append("# Inflearn Crawl Stats")
-    md.append(f"- generated_at (KST): {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    md.append(f"- lookback: {lookback_days} days (since {since})")
+    md.append("# 인프런 강의 수집 통계")
+    md.append(f"- 생성 시각(KST): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    md.append(f"- 조회 범위: 최근 {lookback_days}일 (시작일: {since})")
     md.append("")
 
     # Totals
@@ -234,7 +234,7 @@ def main():
             out.append([b, c, s, cum_courses, cum_snaps])
         return label, out
 
-    md.append("## Collected-at based stats (snapshot_raw)")
+    md.append("## 수집 시점 기준 통계 (snapshot_raw)")
     collected_series = {}
     for bucket_expr, label, limit in [
         ("toStartOfHour(fetched_at)", "Hourly", 24 * 30),
@@ -258,7 +258,7 @@ def main():
     # -----------------------
     # Published-at based stats (course_dim latest)
     # -----------------------
-    md.append("## Published-at based stats (course_dim latest)")
+    md.append("## 개설 시점 기준 통계 (course_dim 최신)")
     published_series = {}
     for bucket_expr, label, limit in [
         ("toDate(published_at)", "Daily", 400),
@@ -363,14 +363,17 @@ def main():
     if disc:
         save_hist(disc, "discount_rate distribution", chart_dir / "dist_discount_rate.png", bins=50, xlabel="rate")
 
-    # Embed images in MD (relative paths)
-    md.append("## Charts")
+    # Embed images in MD (markdown 파일 기준 상대경로)
+    md.append("## 차트")
     chart_files = sorted([p for p in chart_dir.glob("*.png")])
     for p in chart_files:
-        rel = p.relative_to(repo_root).as_posix()
+        # GitHub는 Markdown 링크를 '현재 md 파일 위치' 기준으로 해석하므로,
+        # 레포 루트 기준 경로를 그대로 넣으면 (reports/inflearn/...) 처럼 중복되어 깨질 수 있음.
+        rel = os.path.relpath(p, report_latest.parent).replace('\', '/')
         md.append(f"### {p.name}")
         md.append(f"![{p.name}]({rel})")
         md.append("")
+
 
     report = "\n".join(md)
 
