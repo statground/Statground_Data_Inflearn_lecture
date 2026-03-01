@@ -251,16 +251,6 @@ def main():
 
     exist = {t: table_exists(client, db, t) for t in [T_SNAPSHOT, T_DIM, T_METRIC, T_PRICE]}
 
-    md.append("## 데이터 소스 상태")
-    md.append("")
-    for t, ok in exist.items():
-        md.append(f"- `{t}`: {'✅ 사용 가능' if ok else '⚠️ 미존재/권한 없음(해당 섹션은 생략)'}")
-    md.append("")
-
-    lookback_days = int(os.environ.get("STATS_LOOKBACK_DAYS", "365"))
-    since_dt = (now_kst() - timedelta(days=lookback_days)).strftime("%Y-%m-%d %H:%M:%S")
-
-    # 전체 요약
     md.append("## 전체 요약")
     md.append("")
     if exist[T_DIM]:
@@ -279,10 +269,10 @@ def main():
         hourly = safe_query(
             client,
             f"""\
-SELECT formatDateTime(toStartOfHour(created_at), '%Y-%m-%d %H') AS bucket,
+SELECT formatDateTime(toStartOfHour(fetched_at), '%Y-%m-%d %H') AS bucket,
        count() AS cnt
 FROM {db}.{T_SNAPSHOT}
-WHERE created_at >= toDateTime(%(since)s)
+WHERE fetched_at >= toDateTime(%(since)s)
 GROUP BY bucket
 ORDER BY bucket""",
             {"since": since_dt},
@@ -290,10 +280,10 @@ ORDER BY bucket""",
         daily = safe_query(
             client,
             f"""\
-SELECT formatDateTime(toDate(created_at), '%Y-%m-%d') AS bucket,
+SELECT formatDateTime(toDate(fetched_at), '%Y-%m-%d') AS bucket,
        count() AS cnt
 FROM {db}.{T_SNAPSHOT}
-WHERE created_at >= toDateTime(%(since)s)
+WHERE fetched_at >= toDateTime(%(since)s)
 GROUP BY bucket
 ORDER BY bucket""",
             {"since": since_dt},
@@ -301,10 +291,10 @@ ORDER BY bucket""",
         monthly = safe_query(
             client,
             f"""\
-SELECT formatDateTime(toStartOfMonth(created_at), '%Y-%m') AS bucket,
+SELECT formatDateTime(toStartOfMonth(fetched_at), '%Y-%m') AS bucket,
        count() AS cnt
 FROM {db}.{T_SNAPSHOT}
-WHERE created_at >= toDateTime(%(since)s)
+WHERE fetched_at >= toDateTime(%(since)s)
 GROUP BY bucket
 ORDER BY bucket""",
             {"since": since_dt},
@@ -312,10 +302,10 @@ ORDER BY bucket""",
         yearly = safe_query(
             client,
             f"""\
-SELECT toString(toYear(created_at)) AS bucket,
+SELECT toString(toYear(fetched_at)) AS bucket,
        count() AS cnt
 FROM {db}.{T_SNAPSHOT}
-WHERE created_at >= toDateTime(%(since)s)
+WHERE fetched_at >= toDateTime(%(since)s)
 GROUP BY bucket
 ORDER BY bucket""",
             {"since": since_dt},

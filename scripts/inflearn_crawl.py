@@ -192,6 +192,27 @@ def find_api_data(queries: list[dict], needle: str):
             return (q.get("state") or {}).get("data")
     return None
 
+
+def clamp_u8_percent(x) -> int:
+    """Discount rate percent to UInt8 (0..100). Accepts float/int/str/None."""
+    if x is None:
+        return 0
+    try:
+        if isinstance(x, bool):
+            return 1 if x else 0
+        if isinstance(x, (int,)):
+            v = x
+        else:
+            v = float(str(x).strip() or 0)
+        v = int(round(v))
+    except Exception:
+        return 0
+    if v < 0:
+        v = 0
+    if v > 100:
+        v = 100
+    return v
+
 def to_u8(x) -> int:
     return 1 if x else 0
 
