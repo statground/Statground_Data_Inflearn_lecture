@@ -1,6 +1,6 @@
-# Inflearn Crawl Stats
-- generated_at (KST): 2026-03-02 03:03:22
-- lookback: 365 days (since 2025-03-02 03:03:22)
+# 인프런 강의 수집 통계
+- 생성 시각(KST): 2026-03-02 03:19:59
+- 조회 범위: 최근 365일 (시작일: 2025-03-02 03:19:59)
 
 ## Totals
 | metric | value |
@@ -21,7 +21,7 @@
 | ko | 1193 | 60611.0 | 57547.0 | 4.1811 | 165 | 0.1383 |
 | en | 1130 | 63873.0 | 60639.0 | 4.4018 | 164 | 0.1451 |
 
-## Collected-at based stats (snapshot_raw)
+## 수집 시점 기준 통계 (snapshot_raw)
 ### Hourly
 | bucket | courses | snapshots | cum_courses | cum_snapshots |
 |---|---|---|---|---|
@@ -55,7 +55,7 @@
 |---|---|---|---|---|
 | 2026-01-01 | 2460 | 64044 | 2460 | 64044 |
 
-## Published-at based stats (course_dim latest)
+## 개설 시점 기준 통계 (course_dim 최신)
 ### Daily
 | bucket | courses | cum_courses |
 |---|---|---|
@@ -211,45 +211,45 @@
 | review_count | 2429 | 10.0 | 101.0 | 445.0 | 2522 |
 | average_star | 2429 | 4.800000190734863 | 5.0 | 5.0 | 5.0 |
 
-## Charts
+## 차트
 ### collected_daily_snapshots.png
-![collected_daily_snapshots.png](reports/inflearn/charts/collected_daily_snapshots.png)
+![collected_daily_snapshots.png](charts/collected_daily_snapshots.png)
 
 ### collected_hourly_snapshots.png
-![collected_hourly_snapshots.png](reports/inflearn/charts/collected_hourly_snapshots.png)
+![collected_hourly_snapshots.png](charts/collected_hourly_snapshots.png)
 
 ### collected_monthly_snapshots.png
-![collected_monthly_snapshots.png](reports/inflearn/charts/collected_monthly_snapshots.png)
+![collected_monthly_snapshots.png](charts/collected_monthly_snapshots.png)
 
 ### collected_yearly_snapshots.png
-![collected_yearly_snapshots.png](reports/inflearn/charts/collected_yearly_snapshots.png)
+![collected_yearly_snapshots.png](charts/collected_yearly_snapshots.png)
 
 ### dist_average_star.png
-![dist_average_star.png](reports/inflearn/charts/dist_average_star.png)
+![dist_average_star.png](charts/dist_average_star.png)
 
 ### dist_discount_rate.png
-![dist_discount_rate.png](reports/inflearn/charts/dist_discount_rate.png)
+![dist_discount_rate.png](charts/dist_discount_rate.png)
 
 ### dist_like_count.png
-![dist_like_count.png](reports/inflearn/charts/dist_like_count.png)
+![dist_like_count.png](charts/dist_like_count.png)
 
 ### dist_price_pay_krw.png
-![dist_price_pay_krw.png](reports/inflearn/charts/dist_price_pay_krw.png)
+![dist_price_pay_krw.png](charts/dist_price_pay_krw.png)
 
 ### dist_price_regular_krw.png
-![dist_price_regular_krw.png](reports/inflearn/charts/dist_price_regular_krw.png)
+![dist_price_regular_krw.png](charts/dist_price_regular_krw.png)
 
 ### dist_review_count.png
-![dist_review_count.png](reports/inflearn/charts/dist_review_count.png)
+![dist_review_count.png](charts/dist_review_count.png)
 
 ### dist_student_count.png
-![dist_student_count.png](reports/inflearn/charts/dist_student_count.png)
+![dist_student_count.png](charts/dist_student_count.png)
 
 ### published_daily_courses.png
-![published_daily_courses.png](reports/inflearn/charts/published_daily_courses.png)
+![published_daily_courses.png](charts/published_daily_courses.png)
 
 ### published_monthly_courses.png
-![published_monthly_courses.png](reports/inflearn/charts/published_monthly_courses.png)
+![published_monthly_courses.png](charts/published_monthly_courses.png)
 
 ### published_yearly_courses.png
-![published_yearly_courses.png](reports/inflearn/charts/published_yearly_courses.png)
+![published_yearly_courses.png](charts/published_yearly_courses.png)
