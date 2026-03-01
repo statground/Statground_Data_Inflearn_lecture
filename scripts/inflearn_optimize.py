@@ -1,23 +1,85 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ClickHouse OPTIMIZE(FINAL) 실행 스크립트
+"""ClickHouse OPTIMIZE FINAL 실행 스크립트
 
-- ReplacingMergeTree 계열은 merge 시점에 중복이 제거되므로,
-  배치가 끝난 뒤 최근 파티션에 한해 OPTIMIZE ... FINAL 을 트리거합니다.
-- OPTIMIZE FINAL은 무거운 작업이므로, 최근 N개월(기본 2개월)만 수행합니다.
-- 로그에 DB 접속정보(호스트/포트/DB명 등)나 OPTIMIZE SQL을 출력하지 않습니다.
+목적:
+- ReplacingMergeTree 계열 테이블의 중복 정리를 merge로 유도하기 위해
+  배치 종료 후 OPTIMIZE TABLE ... FINAL을 수행한다.
+
+원칙:
+- 파티션(월) 있는 테이블은 최근 N개월만 OPTIMIZE
+- 파티션 없는(체크포인트 등) 테이블은 전체 FINAL
+- 로그에 DB 접속정보/SQL문을 노출하지 않는다.
+- 실패하더라도 전체 배치를 망치지 않도록 테이블별로 예외를 삼킨다.
 """
+
+from __future__ import annotations
 
 import os
 import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 import clickhouse_connect
 
-KST = ZoneInfo("Asia/Seoul")
+KST = timezone(timedelta(hours=9))
 
-TABLES_PARTITIONED = [
+
+def env_first(*names: str):
+    for n in names:
+        v = os.environ.get(n)
+        if v is not None and str(v).strip() != "":
+            return v
+    return None
+
+
+def parse_port(val, default=8123) -> int:
+    if val is None:
+        return default
+    s = str(val).strip()
+    if s == "":
+        return default
+    m = re.search(r"(\d+)", s)
+    if not m:
+        return default
+    try:
+        return int(m.group(1))
+    except Exception:
+        return default
+
+
+def ch_client():
+    host = env_first("CH_HOST", "CLICKHOUSE_HOST")
+    if not host:
+        raise RuntimeError("CH_HOST(또는 CLICKHOUSE_HOST) 환경변수가 필요합니다.")
+    port = parse_port(env_first("CH_PORT", "CLICKHOUSE_PORT"), default=8123)
+    user = env_first("CH_USER", "CLICKHOUSE_USER") or "default"
+    password = env_first("CH_PASSWORD", "CLICKHOUSE_PASSWORD") or ""
+    database = env_first("CH_DATABASE", "CLICKHOUSE_DATABASE") or "default"
+    client = clickhouse_connect.get_client(
+        host=host, port=port, username=user, password=password, database=database, secure=False
+    )
+    return client, database
+
+
+def month_yyyymm(dt: datetime) -> int:
+    return dt.year * 100 + dt.month
+
+
+def recent_partitions(n_months: int) -> list[int]:
+    base = datetime.now(tz=KST)
+    parts = []
+    y = base.year
+    m = base.month
+    for _ in range(max(1, n_months)):
+        parts.append(y * 100 + m)
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return parts
+
+
+PARTITIONED_TABLES = [
     "inflearn_course_snapshot_raw",
     "inflearn_course_dim",
     "inflearn_course_metric_fact",
@@ -27,78 +89,37 @@ TABLES_PARTITIONED = [
     "inflearn_course_instructor_map",
 ]
 
-TABLES_NON_PARTITIONED = [
+CHECKPOINT_TABLES = [
     "inflearn_crawl_checkpoint",
 ]
 
 
-def _parse_port(raw: str, default: int = 8123) -> int:
-    raw = (raw or "").strip()
-    if raw == "":
-        return default
-    m = re.search(r"\d+", raw)
-    if not m:
-        return default
+def optimize_table_partitioned(client, db: str, table: str, parts: list[int]):
+    for p in parts:
+        try:
+            client.command(f"OPTIMIZE TABLE {db}.{table} PARTITION {p} FINAL")
+        except Exception:
+            # 출력 최소화(접속정보/SQL 노출 금지)
+            pass
+
+
+def optimize_table_full(client, db: str, table: str):
     try:
-        return int(m.group(0))
+        client.command(f"OPTIMIZE TABLE {db}.{table} FINAL")
     except Exception:
-        return default
-
-
-def _get_int(name: str, default: int) -> int:
-    v = (os.environ.get(name) or "").strip()
-    try:
-        return int(v) if v else default
-    except Exception:
-        return default
-
-
-def ch_client():
-    host = (os.environ.get("CH_HOST") or os.environ.get("CLICKHOUSE_HOST") or "").strip()
-    port = _parse_port(os.environ.get("CH_PORT") or os.environ.get("CLICKHOUSE_PORT") or "", 8123)
-    user = (os.environ.get("CH_USER") or os.environ.get("CLICKHOUSE_USER") or "default").strip()
-    password = os.environ.get("CH_PASSWORD") or os.environ.get("CLICKHOUSE_PASSWORD") or ""
-    database = (os.environ.get("CH_DATABASE") or os.environ.get("CLICKHOUSE_DATABASE") or "default").strip()
-    if not host:
-        raise RuntimeError("CH_HOST(또는 CLICKHOUSE_HOST) 환경변수가 필요합니다.")
-    return clickhouse_connect.get_client(host=host, port=port, username=user, password=password, database=database), database
-
-
-def _recent_partitions_yyyymm(months: int) -> list[str]:
-    months = max(0, months)
-    now = datetime.now(tz=KST)
-    parts: list[str] = []
-    for i in range(months):
-        y = now.year
-        m = now.month - i
-        while m <= 0:
-            y -= 1
-            m += 12
-        parts.append(f"{y}{m:02d}")
-    return parts
+        pass
 
 
 def run():
-    ch, db = ch_client()
-    months = _get_int("OPTIMIZE_MONTHS", 2)
-    parts = _recent_partitions_yyyymm(months)
+    client, db = ch_client()
+    n_months = int(os.environ.get("OPTIMIZE_MONTHS", "2") or "2")
+    parts = recent_partitions(n_months)
 
-    # Partitioned tables
-    if months > 0 and parts:
-        for t in TABLES_PARTITIONED:
-            for p in parts:
-                try:
-                    ch.command(f"OPTIMIZE TABLE {db}.{t} PARTITION {p} FINAL")
-                except Exception:
-                    # 실패해도 다음으로 진행 (민감정보/SQL/에러 상세 출력 금지)
-                    pass
+    for t in PARTITIONED_TABLES:
+        optimize_table_partitioned(client, db, t, parts)
 
-    # Non-partitioned tables
-    for t in TABLES_NON_PARTITIONED:
-        try:
-            ch.command(f"OPTIMIZE TABLE {db}.{t} FINAL")
-        except Exception:
-            pass
+    for t in CHECKPOINT_TABLES:
+        optimize_table_full(client, db, t)
 
 
 if __name__ == "__main__":

@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Batch #2: update already-collected courses.
+# -*- coding: utf-8 -*-
+"""Batch #2: 이미 수집된 강의 정보 업데이트
 
-Strategy:
-- Pick courses whose latest snapshot is oldest (so we refresh stale courses first).
-- Re-crawl the course page URL and insert new snapshots/dims/facts as needed.
+- inflearn_course_snapshot_raw에서 최신 fetched_at이 오래된 강의부터 우선 갱신
+- 1회 배치당 UPDATE_BATCH_SIZE(기본 100)개만 처리
+- HTTP/파싱은 ThreadPoolExecutor로 병렬화(WORKERS)
+- ClickHouse insert는 메인 스레드에서 일괄 수행
+- 진행 상황은 inflearn_crawl_checkpoint에 source='inflearn_update_existing'로 기록
+  (sitemap_index=누적 처리 건수, url_index=최근 batch 처리 건수)
 
-This reuses helper functions/constants from scripts/inflearn_crawl.py to ensure schema compatibility.
+주의:
+- DB 접속정보(호스트/포트/DB명) 등은 로그에 출력하지 않음
 """
 
-import os, sys, pathlib, json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os, sys, pathlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -20,18 +25,26 @@ import inflearn_crawl  # noqa: E402
 
 KST = ZoneInfo("Asia/Seoul")
 
-WORKERS = _get_int("WORKERS", 8)
 
 def _get_int(name: str, default: int) -> int:
-    v = os.environ.get(name, "").strip()
+    v = (os.environ.get(name) or "").strip()
     try:
         return int(v) if v else default
     except Exception:
         return default
 
-def pick_urls(ch, limit: int):
-    # Choose oldest-updated courses first, using latest successful snapshot URL as the canonical URL.
+
+UPDATE_BATCH_SIZE = _get_int("UPDATE_BATCH_SIZE", 100)
+WORKERS = _get_int("WORKERS", 8)
+
+
+def ch():
+    return inflearn_crawl.ch_client()
+
+
+def pick_urls(client, limit: int):
     db = inflearn_crawl.CH_DATABASE
+    # 최신 스냅샷이 오래된 강의부터 limit개 선택
     sql = f"""
     WITH latest AS (
       SELECT
@@ -46,272 +59,112 @@ def pick_urls(ch, limit: int):
     SELECT course_id, locale, source_url, last_fetched_at
     FROM latest
     ORDER BY last_fetched_at ASC
-    LIMIT {limit}
+    LIMIT %(lim)s
     """
-    r = ch.query(sql)
-    return r.result_rows
+    res = client.query(sql, parameters={"lim": limit})
+    return res.result_rows
+
+
+def get_progress(client):
+    db = inflearn_crawl.CH_DATABASE
+    sql = f"""
+    SELECT
+      toInt64OrZero(argMax(sitemap_index, updated_at)) AS total_done,
+      toInt64OrZero(argMax(url_index, updated_at)) AS last_batch_done
+    FROM {db}.inflearn_crawl_checkpoint
+    WHERE source = 'inflearn_update_existing'
+    """
+    rows = client.query(sql).result_rows
+    if not rows:
+        return 0, 0
+    return int(rows[0][0] or 0), int(rows[0][1] or 0)
+
+
+def set_progress(client, total_done: int, last_batch_done: int):
+    db = inflearn_crawl.CH_DATABASE
+    client.insert(
+        f"{db}.inflearn_crawl_checkpoint",
+        [["inflearn_update_existing", inflearn_crawl.now_dt64(), int(total_done), int(last_batch_done)]],
+        column_names=["source", "updated_at", "sitemap_index", "url_index"],
+    )
+
+
+def insert_if_rows(client, table: str, rows, cols):
+    if not rows:
+        return 0
+    client.insert(f"{inflearn_crawl.CH_DATABASE}.{table}", rows, column_names=cols)
+    return len(rows)
+
 
 def main():
-    ch = inflearn_crawl.ch_client()
+    client = ch()
     fetched_at = inflearn_crawl.now_dt64()
 
-    limit = _get_int("UPDATE_BATCH_SIZE", 100)
-    rows = pick_urls(ch, limit)
-    print(f"[update] picked={len(rows)} (UPDATE_BATCH_SIZE={limit})")
+    total_done, _ = get_progress(client)
 
-    processed = 0
+    picked = pick_urls(client, UPDATE_BATCH_SIZE)
+    print(f"[update] picked={len(picked)} (UPDATE_BATCH_SIZE={UPDATE_BATCH_SIZE})")
+
+    if not picked:
+        set_progress(client, total_done, 0)
+        print("[update] nothing to do")
+        return
+
+    urls = []
+    for (course_id, locale, url, last_fetched_at) in picked:
+        if url:
+            urls.append(str(url))
+
+    # 병렬로 URL 수집/파싱
+    results = []
+    with ThreadPoolExecutor(max_workers=max(1, WORKERS)) as ex:
+        futs = [ex.submit(inflearn_crawl.process_course_url, u, fetched_at) for u in urls]
+        for fut in as_completed(futs):
+            results.append(fut.result())
+
+    # 결과 합치기
     snap_rows, dim_rows, metric_rows, price_rows, curri_rows, inst_rows, map_rows = ([] for _ in range(7))
-
-        # Build target list (course_id, locale, url)
-    targets = []
-    for course_id, locale, url, last_fetched_at in rows:
-        u = str(url or "").strip()
-        if not u:
-            continue
-        targets.append((int(course_id), str(locale), u))
-
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futures = {ex.submit(inflearn_crawl.http_get, u): (cid, loc, u) for (cid, loc, u) in targets}
-        for fut in as_completed(futures):
-            course_id, locale, url = futures[fut]
-            try:
-                page = fut.result()
-            except Exception:
-                continue
-            if page is None or getattr(page, "status_code", None) != 200:
-                continue
-            nd = inflearn_crawl.extract_next_data(page.text)
-            if not nd:
-                continue
-
-            page_props = (nd.get("props") or {}).get("pageProps") or {}
-            queries = ((page_props.get("dehydratedState") or {}).get("queries") or [])
-
-            # snapshot_raw
-            for q in queries:
-                qk = json.dumps(q.get("queryKey"), ensure_ascii=False)
-                payload_obj = (q.get("state") or {}).get("data")
-                if payload_obj is None:
-                    continue
-                payload = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":"))
-                payload_hash = inflearn_crawl.h64(payload)
-                qk_hash = inflearn_crawl.h64(qk)
-                if not inflearn_crawl.should_insert_snapshot(ch, int(course_id), str(locale), qk_hash, payload_hash):
-                    continue
-                snap_rows.append([
-                    str(inflearn_crawl.uuid7()),  # uuid
-                    fetched_at,
-                    int(course_id),
-                    str(locale),
-                    url,
-                    qk,
-                    qk_hash,
-                    "OK",
-                    None,
-                    payload,
-                    payload_hash
-                ])
-
-            online_info = inflearn_crawl.find_api_data(queries, f"/client/api/v1/course/{course_id}/online/info")
-            meta_info = inflearn_crawl.find_api_data(queries, f"/client/api/v1/course/{course_id}/meta")
-            curriculum = inflearn_crawl.find_api_data(queries, f"/client/api/v2/courses/{course_id}/curriculum")
-            discounts_best = inflearn_crawl.find_api_data(queries, f"/client/api/v1/discounts/best?courseIds={course_id}")
-            contents = (inflearn_crawl.find_api_data(queries, f"/client/api/v1/course/{course_id}/contents?lang=")
-                        or inflearn_crawl.find_api_data(queries, f"/client/api/v1/course/{course_id}/contents"))
-
-            if isinstance(online_info, dict) and isinstance(meta_info, dict):
-                d = online_info.get("data") or {}
-                m = meta_info.get("data") or {}
-                category = d.get("category") or {}
-                main_c = category.get("main") or {}
-                sub_c = category.get("sub") or {}
-
-                level_code = ""
-                for lv in d.get("levels") or []:
-                    if lv.get("isActive"):
-                        level_code = lv.get("code") or lv.get("title") or ""
-                        break
-
-                unit = d.get("unitSummary") or {}
-                rev = d.get("review") or {}
-                published_at = inflearn_crawl.parse_dt64(d.get("publishedAt")) or datetime(1970,1,1,tzinfo=KST)
-                last_updated_at = inflearn_crawl.parse_dt64(d.get("lastUpdatedAt")) or datetime(1970,1,1,tzinfo=KST)
-
-                dim_rows.append([
-                    int(course_id), str(locale), fetched_at,
-                    str(d.get("slug") or ""), str(d.get("enSlug") or ""),
-                    str(d.get("status") or ""),
-                    str(d.get("title") or ""), str(d.get("description") or ""),
-                    str(d.get("thumbnailUrl") or ""),
-                    str(main_c.get("title") or ""), str(main_c.get("slug") or ""),
-                    str(sub_c.get("title") or ""), str(sub_c.get("slug") or ""),
-                    str(level_code),
-                    inflearn_crawl.to_u8(d.get("isNew")), inflearn_crawl.to_u8(d.get("isBest")),
-                    int(d.get("studentCount") or 0), int(d.get("likeCount") or 0),
-                    int(rev.get("count") or 0), float(rev.get("averageStar") or 0.0),
-                    int(unit.get("lectureUnitCount") or 0), int(unit.get("previewUnitCount") or 0),
-                    int(unit.get("runtimeSec") or 0),
-                    inflearn_crawl.to_u8(m.get("providesCertificate")),
-                    inflearn_crawl.to_u8(m.get("providesInstructorAnswer")),
-                    inflearn_crawl.to_u8(m.get("providesInquiry")),
-                    published_at, last_updated_at,
-                    json.dumps(d.get("keywords") or [], ensure_ascii=False, separators=(",", ":")),
-                    json.dumps(d.get("categorySlugs") or [], ensure_ascii=False, separators=(",", ":")),
-                    json.dumps(d.get("skillSlugs") or [], ensure_ascii=False, separators=(",", ":")),
-                    json.dumps(d.get("commonTagSlugs") or [], ensure_ascii=False, separators=(",", ":")),
-                ])
-
-                # metric_fact (change-only insert)
-                krw_reg = int(d.get("regularPrice") or 0)
-                krw_pay = int(d.get("payPrice") or 0)
-                discount_rate = inflearn_crawl.clamp_u8_percent(d.get("discountRate"))
-                discount_title = str(d.get("discountTitle") or "")
-                discount_ended_at = inflearn_crawl.parse_dt64(d.get("discountEndedAt")) or datetime(1970,1,1,tzinfo=KST)
-
-                metric_tuple = (
-                    int(d.get("studentCount") or 0),
-                    int(d.get("likeCount") or 0),
-                    int(rev.get("count") or 0),
-                    float(rev.get("averageStar") or 0.0),
-                    krw_reg, krw_pay,
-                    discount_rate, discount_title,
-                    discount_ended_at
-                )
-                last_metric = inflearn_crawl.latest_metric_tuple(ch, int(course_id), str(locale))
-                if metric_tuple != last_metric:
-                    metric_hash = inflearn_crawl.h64(json.dumps(metric_tuple, default=str, ensure_ascii=False))
-                    metric_rows.append([
-                        fetched_at, int(course_id), str(locale),
-                        metric_tuple[0], metric_tuple[1], metric_tuple[2], metric_tuple[3],
-                        metric_tuple[4], metric_tuple[5], metric_tuple[6], metric_tuple[7], metric_tuple[8],
-                        metric_hash
-                    ])
-
-                # price_fact (change-only insert)
-                # meta payload usually includes detailed price; fallback to online_info fields
-                regular_price = int((m.get("price") or {}).get("regular") or krw_reg)
-                pay_price = int((m.get("price") or {}).get("pay") or krw_pay)
-
-                price_tuple = (
-                    regular_price, pay_price,
-                    discount_rate, discount_title, discount_ended_at,
-                    krw_reg, krw_pay
-                )
-                last_price = inflearn_crawl.latest_price_tuple(ch, int(course_id), str(locale))
-                if price_tuple != last_price:
-                    price_hash = inflearn_crawl.h64(json.dumps(price_tuple, default=str, ensure_ascii=False))
-                    price_rows.append([
-                        fetched_at, int(course_id), str(locale),
-                        regular_price, pay_price,
-                        discount_rate, discount_title, discount_ended_at,
-                        krw_reg, krw_pay,
-                        price_hash
-                    ])
-
-            # curriculum units
-            if isinstance(curriculum, dict):
-                data = curriculum.get("data") or {}
-                sections = data.get("sections") or []
-                for sec in sections:
-                    sec_id = int(sec.get("id") or 0)
-                    sec_title = str(sec.get("title") or "")
-                    for u in (sec.get("units") or []):
-                        unit_hash = inflearn_crawl.h64(json.dumps(u, ensure_ascii=False, separators=(",", ":")))
-                        curri_rows.append([
-                            fetched_at, int(course_id), str(locale),
-                            sec_id, sec_title,
-                            int(u.get("id") or 0),
-                            str(u.get("title") or ""),
-                            str(u.get("type") or ""),
-                            int(u.get("runtimeSec") or 0),
-                            inflearn_crawl.to_u8(u.get("isPreview")),
-                            inflearn_crawl.to_u8(u.get("hasVideo")),
-                            inflearn_crawl.to_u8(u.get("hasAttachment")),
-                            int(u.get("quizId") or 0),
-                            int(u.get("readingTime") or 0),
-                            inflearn_crawl.to_u8(u.get("isChallengeOnly")),
-                            unit_hash
-                        ])
-
-            # instructor_dim + course_instructor_map
-            if isinstance(contents, dict):
-                cdata = contents.get("data") or {}
-                instructors = cdata.get("instructors") or []
-                for inst in instructors:
-                    inst_id = int(inst.get("id") or 0)
-                    if inst_id <= 0:
-                        continue
-                    inst_hash = inflearn_crawl.h64(json.dumps(inst, ensure_ascii=False, separators=(",", ":")))
-                    inst_rows.append([
-                        inst_id, fetched_at,
-                        str(inst.get("name") or ""),
-                        str(inst.get("slug") or ""),
-                        str(inst.get("thumbnailUrl") or ""),
-                        int(inst.get("courseCount") or 0),
-                        int(inst.get("studentCount") or 0),
-                        int(inst.get("reviewCount") or 0),
-                        float(inst.get("totalStar") or 0.0),
-                        int(inst.get("answerCount") or 0),
-                        str(inst.get("introduceHtml") or ""),
-                    ])
-                    map_rows.append([fetched_at, int(course_id), inst_id, str(inst.get("role") or "")] )
-
-        
-            processed += 1
-            # 너무 공격적인 요청을 피하기 위해 약간의 지연
-            inflearn_crawl.jitter_sleep(inflearn_crawl.SLEEP_MIN, inflearn_crawl.SLEEP_MAX)
-
-    # flush inserts (same as inflearn_crawl.py)
-    def insert_if_rows(table, rows, cols):
-        if not rows:
-            return 0
-        ch.insert(f"{inflearn_crawl.CH_DATABASE}.{table}", rows, column_names=cols)
-        return len(rows)
+    for r in results:
+        snap_rows.extend(r.get("snapshot_raw") or [])
+        dim_rows.extend(r.get("course_dim") or [])
+        metric_rows.extend(r.get("metric_fact") or [])
+        price_rows.extend(r.get("price_fact") or [])
+        curri_rows.extend(r.get("curriculum_unit") or [])
+        inst_rows.extend(r.get("instructor_dim") or [])
+        map_rows.extend(r.get("course_instructor_map") or [])
 
     inserted = {
-        "snapshot_raw": insert_if_rows("inflearn_course_snapshot_raw", snap_rows,
+        "snapshot_raw": insert_if_rows(client, "inflearn_course_snapshot_raw", snap_rows,
             ["uuid","fetched_at","course_id","locale","source_url","query_key","query_key_hash","status_code","error_code","payload","payload_hash"]),
-        "course_dim": insert_if_rows("inflearn_course_dim", dim_rows,
+        "course_dim": insert_if_rows(client, "inflearn_course_dim", dim_rows,
             ["course_id","locale","fetched_at","slug","en_slug","status","title","description","thumbnail_url",
              "category_main_title","category_main_slug","category_sub_title","category_sub_slug",
              "level_code","is_new","is_best","student_count","like_count","review_count","average_star",
              "lecture_unit_count","preview_unit_count","runtime_sec",
              "provides_certificate","provides_instructor_answer","provides_inquiry",
              "published_at","last_updated_at","keywords","category_slugs","skill_slugs","common_tag_slugs"]),
-        "metric_fact": insert_if_rows("inflearn_course_metric_fact", metric_rows,
+        "metric_fact": insert_if_rows(client, "inflearn_course_metric_fact", metric_rows,
             ["fetched_at","course_id","locale","student_count","like_count","review_count","average_star",
              "krw_regular_price","krw_pay_price","discount_rate","discount_title","discount_ended_at","metric_hash"]),
-        "price_fact": insert_if_rows("inflearn_course_price_fact", price_rows,
+        "price_fact": insert_if_rows(client, "inflearn_course_price_fact", price_rows,
             ["fetched_at","course_id","locale","regular_price","pay_price","discount_rate","discount_title","discount_ended_at",
              "krw_regular_price","krw_pay_price","price_hash"]),
-        "curriculum_unit": insert_if_rows("inflearn_course_curriculum_unit", curri_rows,
+        "curriculum_unit": insert_if_rows(client, "inflearn_course_curriculum_unit", curri_rows,
             ["fetched_at","course_id","locale","section_id","section_title","unit_id","unit_title","unit_type",
              "runtime_sec","is_preview","has_video","has_attachment","quiz_id","reading_time","is_challenge_only","unit_hash"]),
-        "instructor_dim": insert_if_rows("inflearn_instructor_dim", inst_rows,
+        "instructor_dim": insert_if_rows(client, "inflearn_instructor_dim", inst_rows,
             ["instructor_id","fetched_at","name","slug","thumbnail_url","course_count","student_count","review_count","total_star","answer_count","introduce_html"]),
-        "course_instructor_map": insert_if_rows("inflearn_course_instructor_map", map_rows,
+        "course_instructor_map": insert_if_rows(client, "inflearn_course_instructor_map", map_rows,
             ["fetched_at","course_id","instructor_id","role"]),
     }
 
-    # 진행상황 기록 (누적 처리 건수)
-    try:
-        prev = ch.query(f"""
-            SELECT argMax(sitemap_index, updated_at)
-            FROM {inflearn_crawl.CH_DATABASE}.inflearn_crawl_checkpoint
-            WHERE source = 'inflearn_update_existing'
-        """).result_rows
-        prev_cnt = int(prev[0][0] or 0) if prev else 0
-        new_cnt = prev_cnt + int(processed)
-        ch.insert(
-            f"{inflearn_crawl.CH_DATABASE}.inflearn_crawl_checkpoint",
-            [["inflearn_update_existing", fetched_at, new_cnt, 0]],
-            column_names=["source","updated_at","sitemap_index","url_index"],
-        )
-    except Exception:
-        pass
+    # 진행상황 기록
+    total_done += len(urls)
+    set_progress(client, total_done, len(urls))
 
     print("[inserted]", inserted)
     print("[done]")
+
 
 if __name__ == "__main__":
     main()

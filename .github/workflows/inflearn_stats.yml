@@ -1,4 +1,4 @@
-name: inflearn_stats
+name: Inflearn - Stats Report Commit
 
 on:
   schedule:
@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  stats:
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -47,17 +47,6 @@ jobs:
           STATS_LOOKBACK_DAYS: "365"
         run: |
           python scripts/inflearn_stats.py
-
-      - name: Optimize tables (FINAL)
-        env:
-          CH_HOST: ${{ secrets.CH_HOST }}
-          CH_PORT: ${{ secrets.CH_PORT }}
-          CH_USER: ${{ secrets.CH_USER }}
-          CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
-          CH_DATABASE: ${{ secrets.CH_DATABASE }}
-          OPTIMIZE_MONTHS: "2"
-        run: |
-          python scripts/inflearn_optimize.py
 
       - name: Commit reports
         run: |
