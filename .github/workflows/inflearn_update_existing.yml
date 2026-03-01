@@ -1,0 +1,38 @@
+name: Inflearn - Update Existing Courses (Hourly)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 * * * *"  # hourly +10m (UTC)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Update existing
+        env:
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+          CLICKHOUSE_DATABASE: ${{ secrets.CLICKHOUSE_DATABASE }}
+          UPDATE_BATCH_SIZE: ${{ vars.UPDATE_BATCH_SIZE }}
+          SLEEP_MIN: ${{ vars.SLEEP_MIN }}
+          SLEEP_MAX: ${{ vars.SLEEP_MAX }}
+        run: python scripts/inflearn_update_existing.py
+      - name: Merge (OPTIMIZE FINAL)
+        if: always()
+        env:
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+          CLICKHOUSE_DATABASE: ${{ secrets.CLICKHOUSE_DATABASE }}
+          OPTIMIZE_MONTHS: ${{ vars.OPTIMIZE_MONTHS }}
+        run: python scripts/inflearn_optimize.py

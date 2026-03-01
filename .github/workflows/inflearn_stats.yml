@@ -1,0 +1,36 @@
+name: Inflearn - Stats (Hourly)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 * * * *"  # hourly +20m (UTC)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Stats
+        env:
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+          CLICKHOUSE_DATABASE: ${{ secrets.CLICKHOUSE_DATABASE }}
+          STATS_LOOKBACK_DAYS: ${{ vars.STATS_LOOKBACK_DAYS }}
+        run: python scripts/inflearn_stats.py
+      - name: Merge (OPTIMIZE FINAL)
+        if: always()
+        env:
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+          CLICKHOUSE_DATABASE: ${{ secrets.CLICKHOUSE_DATABASE }}
+          OPTIMIZE_MONTHS: ${{ vars.OPTIMIZE_MONTHS }}
+        run: python scripts/inflearn_optimize.py
