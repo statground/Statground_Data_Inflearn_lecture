@@ -69,18 +69,14 @@ def run():
             sql = f"OPTIMIZE TABLE {db}.{t} PARTITION {p} FINAL"
             try:
                 ch.command(sql)
-                print("[optimize]", sql)
             except Exception as e:
-                print("[optimize][warn]", sql, "->", e)
 
     # Non-partitioned tables
     for t in CHECKPOINT_TABLES:
         sql = f"OPTIMIZE TABLE {db}.{t} FINAL"
         try:
             ch.command(sql)
-            print("[optimize]", sql)
         except Exception as e:
-            print("[optimize][warn]", sql, "->", e)
 
 if __name__ == "__main__":
     run()

@@ -55,11 +55,30 @@ def h64(text: str) -> int:
     d = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
     return struct.unpack("<Q", d)[0]
 
-CH_HOST = _get_env("CH_HOST")
-CH_PORT = _parse_int_env("CH_PORT", 8123)
-CH_USER = _get_env("CH_USER", "default")
-CH_PASSWORD = _get_env("CH_PASSWORD", "")
-CH_DATABASE = _get_env("CH_DATABASE", "statground_lecture")
+def _get_env_any(names: list[str], default: str | None = None) -> str:
+    """Return first non-empty env among names.
+    Supports both CH_* and CLICKHOUSE_* naming.
+    """
+    for n in names:
+        v = os.environ.get(n)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    if default is None:
+        raise RuntimeError("Missing required ClickHouse connection environment variables.")
+    return str(default).strip()
+
+def _parse_port_any(names: list[str], default: int = 8123) -> int:
+    raw = _get_env_any(names, str(default))
+    m = re.search(r"\d+", str(raw))
+    if not m:
+        return default
+    return int(m.group(0))
+
+CH_HOST = _get_env_any(["CH_HOST", "CLICKHOUSE_HOST"])
+CH_PORT = _parse_port_any(["CH_PORT", "CLICKHOUSE_PORT"], 8123)
+CH_USER = _get_env_any(["CH_USER", "CLICKHOUSE_USER"], "default")
+CH_PASSWORD = _get_env_any(["CH_PASSWORD", "CLICKHOUSE_PASSWORD"], "")
+CH_DATABASE = _get_env_any(["CH_DATABASE", "CLICKHOUSE_DATABASE"], "statground_lecture")
 
 SITEMAP_BASE = _get_env("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps").rstrip("/")
 SITEMAP_PREFIX = _get_env("SITEMAP_PREFIX", "sitemap-courseDetail-")
