@@ -84,21 +84,23 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def set_korean_font():
-    # workflow에서 fonts-noto-cjk 설치해둔 상태를 기대
-    plt.rcParams["font.family"] = "Noto Sans CJK KR"
+def set_english_font():
+    # Use a default font to avoid Korean glyph dependence; chart text is in English.
+    plt.rcParams["font.family"] = "DejaVu Sans"
     plt.rcParams["axes.unicode_minus"] = False
 
 
-def plot_line(xs: List[str], ys: List[float], title: str, xlabel: str, ylabel: str, out: Path):
+def plot_bar(xs: List[str], ys: List[float], title: str, xlabel: str, ylabel: str, out: Path):
     plt.figure(figsize=(10, 4))
-    plt.plot(list(range(len(xs))), ys)
+    plt.bar(list(range(len(xs))), ys)
+
     if len(xs) <= 24:
         plt.xticks(list(range(len(xs))), xs, rotation=45, ha="right")
     else:
         step = max(1, len(xs) // 12)
         ticks = list(range(0, len(xs), step))
         plt.xticks(ticks, [xs[i] for i in ticks], rotation=45, ha="right")
+
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
@@ -108,7 +110,7 @@ def plot_line(xs: List[str], ys: List[float], title: str, xlabel: str, ylabel: s
 
 
 def main():
-    set_korean_font()
+    set_english_font()
     client, db = ch_client()
 
     report_dir = Path("reports") / "inflearn"
@@ -181,7 +183,7 @@ def main():
         ys = [float(r.get("cnt") or 0) for r in rows]
         out_png = charts_dir / png_name
         if xs:
-            plot_line(xs, ys, title, xlabel, "스냅샷 수", out_png)
+            plot_bar(xs, ys, title, xlabel, "Snapshots", out_png)
         total = sum(int(r.get("cnt") or 0) for r in rows)
         last = int(rows[-1].get("cnt") or 0) if rows else 0
         peak = max((int(r.get("cnt") or 0) for r in rows), default=0)
@@ -194,10 +196,10 @@ def main():
             md.append(f"![{title}](charts/{png_name})")
             md.append("")
 
-    add_ts_section("수집 시점 기준 - 시간별 스냅샷", hourly, "snapshots_hourly.png", "시간(YYYY-MM-DD HH)")
-    add_ts_section("수집 시점 기준 - 일별 스냅샷", daily, "snapshots_daily.png", "일자")
-    add_ts_section("수집 시점 기준 - 월별 스냅샷", monthly, "snapshots_monthly.png", "월")
-    add_ts_section("수집 시점 기준 - 연별 스냅샷", yearly, "snapshots_yearly.png", "연도")
+    add_ts_section("Snapshots by Fetch Hour", hourly, "snapshots_hourly.png", "Hour (YYYY-MM-DD HH)")
+    add_ts_section("Snapshots by Fetch Day", daily, "snapshots_daily.png", "Date")
+    add_ts_section("Snapshots by Fetch Month", monthly, "snapshots_monthly.png", "Month")
+    add_ts_section("Snapshots by Fetch Year", yearly, "snapshots_yearly.png", "Year")
 
     # 2) 개설 시점(published_at) 기준: 일/월/년 (course_dim)
     pub_daily = q(client, f"""
@@ -230,7 +232,7 @@ def main():
         ys = [float(r.get("cnt") or 0) for r in rows]
         out_png = charts_dir / png_name
         if xs:
-            plot_line(xs, ys, title, xlabel, "강의 수", out_png)
+            plot_bar(xs, ys, title, xlabel, "Courses", out_png)
         total = sum(int(r.get("cnt") or 0) for r in rows)
         md.append(f"## {title}")
         md.append("")
@@ -240,9 +242,9 @@ def main():
             md.append(f"![{title}](charts/{png_name})")
             md.append("")
 
-    add_pub("개설 시점 기준 - 일별 신규 강의", pub_daily, "published_daily.png", "일자")
-    add_pub("개설 시점 기준 - 월별 신규 강의", pub_monthly, "published_monthly.png", "월")
-    add_pub("개설 시점 기준 - 연별 신규 강의", pub_yearly, "published_yearly.png", "연도")
+    add_pub("New Courses by Publish Day", pub_daily, "published_daily.png", "Date")
+    add_pub("New Courses by Publish Month", pub_monthly, "published_monthly.png", "Month")
+    add_pub("New Courses by Publish Year", pub_yearly, "published_yearly.png", "Year")
 
     # 3) 핵심 지표 최신값 분포(요약만 + 차트는 필요 시 추가 가능)
     # (길게 늘어지는 표는 만들지 않음)
