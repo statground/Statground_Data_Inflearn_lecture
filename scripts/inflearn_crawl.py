@@ -201,6 +201,17 @@ def should_insert_snapshot(ch, course_id: int, locale: str, qk_hash: int, payloa
         return True
     return int(rows[0][0]) != int(payload_hash)
 
+
+def course_exists(ch, course_id: int, locale: str) -> bool:
+    """Return True if course_dim already has this course_id+locale."""
+    sql = f"""
+    SELECT 1
+    FROM {CH_DATABASE}.inflearn_course_dim
+    WHERE course_id = %(course_id)s AND locale = %(locale)s
+    LIMIT 1
+    """
+    rows = ch.query(sql, parameters={"course_id": course_id, "locale": locale}).result_rows
+    return bool(rows)
 def find_api_data(queries: list[dict], needle: str):
     for q in queries:
         qk = json.dumps(q.get("queryKey"), ensure_ascii=False)
@@ -390,7 +401,9 @@ def main():
     sitemap_index, offset = get_checkpoint(ch)
     print(f"[checkpoint] start sitemap_index={sitemap_index}, url_index={offset}")
 
-    processed = 0
+    processed = 0  # number of fetched/parsed courses in this run (batch limit)
+    scanned = 0    # number of URLs scanned
+    exists_cache: dict[tuple[int,str], bool] = {}
     snap_rows, dim_rows, metric_rows, price_rows, curri_rows, inst_rows, map_rows = ([] for _ in range(7))
 
     while True:
@@ -447,9 +460,20 @@ def main():
                 break
 
             url = urls[i]; i += 1
+            scanned += 1
             course_id, locale = parse_course_id_and_locale(url)
             if not course_id:
                 continue
+
+            # Skip HTTP fetch if we already have this course in course_dim (collect_new only cares about brand-new courses).
+            key = (course_id, locale)
+            exists = exists_cache.get(key)
+            if exists is None:
+                exists = course_exists(ch, course_id, locale)
+                exists_cache[key] = exists
+            if exists:
+                continue
+
 
             page = http_get(url)
             if page.status_code != 200:
@@ -615,7 +639,7 @@ def main():
 
             processed += 1
             if processed % 50 == 0:
-                print(f"[progress] processed={processed} last_course_id={course_id} sitemap={sitemap_index} offset={i}")
+                print(f"[progress] scanned={scanned} fetched={processed} last_course_id={course_id} sitemap={sitemap_index} offset={i}")
             jitter_sleep(SLEEP_MIN, SLEEP_MAX)
 
         if BATCH_SIZE > 0 and processed >= BATCH_SIZE:
