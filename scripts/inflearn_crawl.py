@@ -96,6 +96,7 @@ CH_PASSWORD = _get_env_any(["CH_PASSWORD", "CLICKHOUSE_PASSWORD"], "")
 CH_DATABASE = _get_env_any(["CH_DATABASE", "CLICKHOUSE_DATABASE"], "statground_lecture")
 
 SITEMAP_BASE = _get_env("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps").rstrip("/")
+SITEMAP_BASE_FALLBACK = _get_env("SITEMAP_BASE_FALLBACK", "https://www.inflearn.com/sitemaps").rstrip("/")
 SITEMAP_PREFIX = _get_env("SITEMAP_PREFIX", "sitemap-courseDetail-")
 
 BATCH_SIZE = _parse_int_env("BATCH_SIZE", 600)
@@ -210,6 +211,178 @@ def find_api_data(queries: list[dict], needle: str):
 def to_u8(x) -> int:
     return 1 if x else 0
 
+def process_course_url(url: str, fetched_at):
+    """단일 강의 URL을 처리하여 각 테이블 insert rows를 생성한다.
+    - update_existing 배치에서 병렬 호출용
+    - change-only 비교 없이 매번 metric/price row를 생성(테이블이 ReplacingMergeTree라 최신으로 수렴)
+    반환 dict keys:
+      course_dim, metric_fact, price_fact, curriculum_unit, instructor_dim, course_instructor_map
+    """
+    rows = {
+        "course_dim": [],
+        "metric_fact": [],
+        "price_fact": [],
+        "curriculum_unit": [],
+        "instructor_dim": [],
+        "course_instructor_map": [],
+    }
+
+    course_id, locale = parse_course_id_and_locale(url)
+    if not course_id:
+        return rows
+
+    page = http_get(url)
+    if page.status_code != 200:
+        return rows
+
+    nd = extract_next_data(page.text)
+    if not nd:
+        return rows
+
+    page_props = (nd.get("props") or {}).get("pageProps") or {}
+    queries = ((page_props.get("dehydratedState") or {}).get("queries") or [])
+
+    online_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/online/info")
+    meta_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/meta")
+    curriculum = find_api_data(queries, f"/client/api/v2/courses/{course_id}/curriculum")
+    discounts_best = find_api_data(queries, f"/client/api/v1/discounts/best?courseIds={course_id}")
+    contents = find_api_data(queries, f"/client/api/v1/course/{course_id}/contents?lang=") or find_api_data(queries, f"/client/api/v1/course/{course_id}/contents")
+
+    # course_dim + metric_fact + price_fact
+    if isinstance(online_info, dict) and isinstance(meta_info, dict):
+        d = (online_info.get("data") or {})
+        m = (meta_info.get("data") or {})
+        category = d.get("category") or {}
+        main_c = category.get("main") or {}
+        sub_c = category.get("sub") or {}
+
+        level_code = ""
+        for lv in d.get("levels") or []:
+            if lv.get("isActive"):
+                level_code = lv.get("code") or lv.get("title") or ""
+                break
+
+        unit = d.get("unitSummary") or {}
+        rev = d.get("review") or {}
+
+        # Nullable이 아닌 DateTime64 컬럼 보호: None이면 fetched_at 사용
+        published_at = parse_dt64(d.get("publishedAt")) or fetched_at
+        last_updated_at = parse_dt64(d.get("lastUpdatedAt")) or fetched_at
+
+        rows["course_dim"].append([
+            course_id, locale, fetched_at,
+            str(d.get("slug") or ""), str(d.get("enSlug") or ""),
+            str(d.get("status") or ""),
+            str(d.get("title") or ""), str(d.get("description") or ""),
+            str(d.get("thumbnailUrl") or ""),
+            str(main_c.get("title") or ""), str(main_c.get("slug") or ""),
+            str(sub_c.get("title") or ""), str(sub_c.get("slug") or ""),
+            str(level_code),
+            to_u8(d.get("isNew")), to_u8(d.get("isBest")),
+            int(d.get("studentCount") or 0), int(d.get("likeCount") or 0),
+            int(rev.get("count") or 0), float(rev.get("averageStar") or 0.0),
+            int(unit.get("lectureUnitCount") or 0), int(unit.get("previewUnitCount") or 0),
+            int(unit.get("runtime") or 0),
+            to_u8(d.get("providesCertificate")), to_u8(d.get("providesInstructorAnswer")), to_u8(d.get("providesInquiry")),
+            published_at, last_updated_at,
+            str(m.get("keywords") or ""),
+            m.get("categorySlugs") or [],
+            m.get("skillSlugs") or [],
+            m.get("commonTagsSlugs") or [],
+        ])
+
+        pay = d.get("paymentInfo") or {}
+        disc = (discounts_best.get("data") if isinstance(discounts_best, dict) else {}) or {}
+        discount = pay.get("discount") or {}
+        discount_rate = clamp_u8_percent(pay.get("discountRate") or disc.get("discountRate") or 0)
+        discount_title = str(discount.get("title") or disc.get("discountTitle") or "")
+        discount_ended_at = parse_dt64(discount.get("endedAt"))
+
+        # metric_fact (항상 생성)
+        metric_tuple = (
+            int(d.get("studentCount") or 0),
+            int(d.get("likeCount") or 0),
+            int(rev.get("count") or 0),
+            float(rev.get("averageStar") or 0.0),
+            int(pay.get("krwRegularPrice") or 0),
+            int(pay.get("krwPaymentPrice") or 0),
+            int(discount_rate),
+            discount_title,
+            discount_ended_at,
+        )
+        metric_hash = h64(json.dumps(metric_tuple, default=str, ensure_ascii=False, separators=(",", ":")))
+        rows["metric_fact"].append([fetched_at, course_id, locale,
+                                    metric_tuple[0], metric_tuple[1], metric_tuple[2], metric_tuple[3],
+                                    metric_tuple[4], metric_tuple[5],
+                                    metric_tuple[6], metric_tuple[7], metric_tuple[8],
+                                    metric_hash])
+
+        # price_fact (항상 생성)
+        price_tuple = (
+            float(pay.get("regularPrice") or 0.0),
+            float(pay.get("payPrice") or 0.0),
+            int(discount_rate),
+            discount_title,
+            discount_ended_at,
+            int(pay.get("krwRegularPrice") or 0),
+            int(pay.get("krwPaymentPrice") or 0),
+        )
+        price_hash = h64(json.dumps(price_tuple, default=str, ensure_ascii=False, separators=(",", ":")))
+        rows["price_fact"].append([fetched_at, course_id, locale,
+                                   price_tuple[0], price_tuple[1],
+                                   price_tuple[2], price_tuple[3], price_tuple[4],
+                                   price_tuple[5], price_tuple[6],
+                                   price_hash])
+
+    # curriculum_unit
+    if isinstance(curriculum, dict):
+        cdata = curriculum.get("data") or {}
+        for sec in cdata.get("curriculum", []) or []:
+            section_id = int(sec.get("id") or 0)
+            section_title = str(sec.get("title") or "")
+            for u in sec.get("units", []) or []:
+                unit_id = int(u.get("id") or 0)
+                unit_title = str(u.get("title") or "")
+                unit_type = str(u.get("type") or "")
+                runtime_sec = int(u.get("runtime") or 0)
+                is_preview = to_u8(u.get("isPreview"))
+                has_video = to_u8(u.get("hasVideo"))
+                has_attachment = to_u8(u.get("hasAttachment"))
+                quiz_id = u.get("quizId")
+                reading_time = u.get("readingTime")
+                is_challenge_only = to_u8(u.get("isChallengeOnly"))
+
+                unit_tuple = (section_id, section_title, unit_id, unit_title, unit_type, runtime_sec,
+                              is_preview, has_video, has_attachment, quiz_id, reading_time, is_challenge_only)
+                unit_hash = h64(json.dumps(unit_tuple, default=str, ensure_ascii=False, separators=(",", ":")))
+
+                rows["curriculum_unit"].append([fetched_at, course_id, locale,
+                                                section_id, section_title,
+                                                unit_id, unit_title, unit_type,
+                                                runtime_sec, is_preview, has_video, has_attachment,
+                                                quiz_id, reading_time, is_challenge_only,
+                                                unit_hash])
+
+    # instructor_dim & map
+    if isinstance(contents, dict):
+        c = contents.get("data") or {}
+        for mi in c.get("mainInstructors", []) or []:
+            instructor_id = int(mi.get("id") or 0)
+            if instructor_id <= 0:
+                continue
+            rows["instructor_dim"].append([instructor_id, fetched_at,
+                                           str(mi.get("name") or ""), str(mi.get("slug") or ""),
+                                           str(mi.get("thumbnail") or ""),
+                                           int(mi.get("courseCount") or 0),
+                                           int(mi.get("studentCount") or 0),
+                                           int(mi.get("reviewCount") or 0),
+                                           int(mi.get("totalStar") or 0),
+                                           int(mi.get("answerCount") or 0),
+                                           str(mi.get("introduce") or "")])
+            rows["course_instructor_map"].append([fetched_at, course_id, instructor_id, "main"])
+
+    return rows
+
 def main():
     ch = ch_client()
     fetched_at = now_dt64()
@@ -224,6 +397,8 @@ def main():
         # Try primary sitemap base first, then fallback (some environments may get 403 from CDN)
         sitemap_urls = []
         for base in (SITEMAP_BASE, SITEMAP_BASE_FALLBACK):
+            if not base:  # 안전장치
+                continue
             u = f"{base}/{SITEMAP_PREFIX}{sitemap_index}.xml"
             if u not in sitemap_urls:
                 sitemap_urls.append(u)
@@ -251,7 +426,7 @@ def main():
             print(f"[done] sitemap {sitemap_index} -> 404")
             set_checkpoint(ch, 0, 0)
             break
-        if r.status_code != 200:
+                if r.status_code != 200:
             if r.status_code == 403:
                 # Stop gracefully and keep the current checkpoint so the next run can retry.
                 print(f"[warn] sitemap blocked (403). keep checkpoint sitemap_index={sitemap_index}, url_index=0")

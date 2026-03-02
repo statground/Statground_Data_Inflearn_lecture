@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Inflearn 통계 리포트 생성 스크립트
-- ClickHouse에서 집계
-- reports/inflearn/ 에 Markdown + charts/*.png 생성
-- 표가 너무 길어지는(시간 버킷) 결과는 표 출력 대신 차트 + 요약만 제공
-- DB 접속정보(호스트/포트/DB명 등)는 출력/리포트에 노출하지 않음
-
-요구사항 반영:
-- 긴 테이블 제거(차트로 대체)
-- 모든 설명/섹션 한국어
-- md 이미지 경로: md 기준 상대경로(charts/xxx.png)로 고정
+Inflearn 통계 리포트 (GitHub Actions)
+- md 1개만 덮어쓰기: reports/inflearn/inflearn_stats_latest.md
+- 차트는 reports/inflearn/charts/에 생성
+- 기준 컬럼은 스키마 그대로 사용 (snapshot_raw: fetched_at 등)
+- 데이터 소스 상태(테이블 존재 여부 등) 출력하지 않음
+- DB 접속정보 유추 가능한 값(호스트/포트/DB명) 출력하지 않음
 """
 
 from __future__ import annotations
 
-import math
 import os
 import re
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List
 
 import clickhouse_connect
 
@@ -29,127 +23,74 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+
 KST = timezone(timedelta(hours=9))
 
 
-def now_kst() -> datetime:
-    return datetime.now(tz=KST)
-
-
-def fmt_num(x: Any) -> str:
-    try:
-        if x is None:
-            return "0"
-        if isinstance(x, bool):
-            return "1" if x else "0"
-        if isinstance(x, int):
-            return f"{x:,}"
-        if isinstance(x, float):
-            if math.isfinite(x):
-                if abs(x) >= 1000:
-                    return f"{x:,.0f}"
-                return f"{x:,.2f}"
-            return "0"
-        s = str(x)
-        if s.isdigit():
-            return f"{int(s):,}"
-        return s
-    except Exception:
-        return str(x)
-
-
-def parse_port(val: Optional[str], default: int = 8123) -> int:
-    if val is None:
+def parse_port(v: Any, default: int = 8123) -> int:
+    if v is None:
         return default
-    s = str(val).strip()
+    s = str(v).strip()
     if s == "":
         return default
-    m = None
-    for token in re.findall(r"\d+", s):
-        m = token
-        break
-    if m is None:
+    m = re.search(r"(\d+)", s)
+    if not m:
         return default
     try:
-        return int(m)
+        return int(m.group(1))
     except Exception:
         return default
 
 
-def env_first(*names: str) -> Optional[str]:
+def env_first(*names: str) -> str | None:
     for n in names:
         v = os.environ.get(n)
         if v is not None and str(v).strip() != "":
-            return v
+            return str(v).strip()
     return None
-
-
-def set_korean_font():
-    # workflow에서 fonts-noto-cjk 설치
-    plt.rcParams["font.family"] = "Noto Sans CJK KR"
-    plt.rcParams["axes.unicode_minus"] = False
 
 
 def ch_client():
     host = env_first("CH_HOST", "CLICKHOUSE_HOST")
     if not host:
         raise RuntimeError("CH_HOST(또는 CLICKHOUSE_HOST) 환경변수가 필요합니다.")
-    port = parse_port(env_first("CH_PORT", "CLICKHOUSE_PORT"), default=8123)
+    port = parse_port(env_first("CH_PORT", "CLICKHOUSE_PORT"), 8123)
     user = env_first("CH_USER", "CLICKHOUSE_USER") or "default"
     password = env_first("CH_PASSWORD", "CLICKHOUSE_PASSWORD") or ""
     database = env_first("CH_DATABASE", "CLICKHOUSE_DATABASE") or "default"
-
-    # 접속정보 출력 금지
     client = clickhouse_connect.get_client(
-        host=host,
-        port=port,
-        username=user,
-        password=password,
-        database=database,
-        secure=False,
+        host=host, port=port, username=user, password=password, database=database, secure=False
     )
     return client, database
 
 
-def q(client, sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+def q(client, sql: str, params: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     res = client.query(sql, parameters=params or {})
     cols = res.column_names
-    out: List[Dict[str, Any]] = []
+    out = []
     for row in res.result_rows:
         out.append({cols[i]: row[i] for i in range(len(cols))})
     return out
 
 
-def safe_query(client, sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+def fmt_int(x: Any) -> str:
     try:
-        return q(client, sql, params=params)
+        return f"{int(x or 0):,}"
     except Exception:
-        # 민감정보 노출 방지: 상세 에러/SQL 출력 금지
-        return []
-
-
-def table_exists(client, db: str, table: str) -> bool:
-    rows = safe_query(
-        client,
-        "SELECT 1 FROM system.tables WHERE database=%(db)s AND name=%(t)s LIMIT 1",
-        {"db": db, "t": table},
-    )
-    return len(rows) > 0
+        return "0"
 
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def relpath_for_md(img_path: Path, md_path: Path) -> str:
-    # ✅ md 기준 상대경로(항상 charts/xxx.png 형태)
-    return img_path.relative_to(md_path.parent).as_posix()
+def set_korean_font():
+    # workflow에서 fonts-noto-cjk 설치해둔 상태를 기대
+    plt.rcParams["font.family"] = "Noto Sans CJK KR"
+    plt.rcParams["axes.unicode_minus"] = False
 
 
-# -----------------------------
-# 차트
-# -----------------------------
-def plot_line(xs: Sequence[str], ys: Sequence[float], title: str, xlabel: str, ylabel: str, out_path: Path):
+def plot_line(xs: List[str], ys: List[float], title: str, xlabel: str, ylabel: str, out: Path):
     plt.figure(figsize=(10, 4))
     plt.plot(list(range(len(xs))), ys)
     if len(xs) <= 24:
@@ -157,96 +98,24 @@ def plot_line(xs: Sequence[str], ys: Sequence[float], title: str, xlabel: str, y
     else:
         step = max(1, len(xs) // 12)
         ticks = list(range(0, len(xs), step))
-        labels = [xs[i] for i in ticks]
-        plt.xticks(ticks, labels, rotation=45, ha="right")
+        plt.xticks(ticks, [xs[i] for i in ticks], rotation=45, ha="right")
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     plt.tight_layout()
-    plt.savefig(out_path)
+    plt.savefig(out)
     plt.close()
-
-
-def plot_hist(values: Sequence[float], title: str, xlabel: str, ylabel: str, out_path: Path, bins: int = 50, logy: bool = False):
-    plt.figure(figsize=(10, 4))
-    plt.hist(values, bins=bins)
-    if logy:
-        plt.yscale("log")
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-
-
-# -----------------------------
-# 마크다운 섹션
-# -----------------------------
-def summarize_timeseries(rows: List[Dict[str, Any]], value_col: str) -> Dict[str, Any]:
-    if not rows:
-        return {"points": 0, "total": 0, "last": 0, "peak": 0}
-    vals: List[float] = []
-    for r in rows:
-        v = r.get(value_col)
-        try:
-            v = 0 if v is None else float(v)
-        except Exception:
-            v = 0
-        vals.append(v)
-    return {"points": len(vals), "total": sum(vals), "last": vals[-1], "peak": max(vals)}
-
-
-def md_section_timeseries(md: List[str], title: str, desc: str, chart_rel: str, rows: List[Dict[str, Any]], value_col: str):
-    s = summarize_timeseries(rows, value_col)
-    md.append(f"## {title}")
-    md.append("")
-    md.append(desc)
-    md.append("")
-    md.append(f"- 전체 합계: **{fmt_num(s['total'])}**")
-    md.append(f"- 마지막 구간 값: **{fmt_num(s['last'])}**")
-    md.append(f"- 최고 피크: **{fmt_num(s['peak'])}**")
-    md.append("")
-    md.append(f"![{title}]({chart_rel})")
-    md.append("")
-
-
-def md_section_distribution(md: List[str], title: str, desc: str, chart_rel: str, bullets: List[str]):
-    md.append(f"## {title}")
-    md.append("")
-    md.append(desc)
-    md.append("")
-    for b in bullets:
-        md.append(f"- {b}")
-    md.append("")
-    md.append(f"![{title}]({chart_rel})")
-    md.append("")
 
 
 def main():
     set_korean_font()
     client, db = ch_client()
 
-    root = Path(".")
-    report_dir = root / "reports" / "inflearn"
+    report_dir = Path("reports") / "inflearn"
     charts_dir = report_dir / "charts"
     ensure_dir(charts_dir)
-report_latest = report_dir / "inflearn_stats_latest.md"
 
-# 과거에 생성된 타임스탬프 리포트 파일이 남아있다면 정리 (하나의 파일만 유지)
-try:
-    for p in report_dir.glob("inflearn_stats_*.md"):
-        if p.name != "inflearn_stats_latest.md":
-            p.unlink(missing_ok=True)
-except Exception:
-    pass
-
-    md: List[str] = []
-    md.append("# 인프런 강의 수집 통계 리포트")
-    md.append("")
-    md.append(f"- 생성 시각(KST): **{now_kst().strftime('%Y-%m-%d %H:%M:%S')}**")
-    md.append("- 테이블이 길어지는 구간(시간별/일별 등)은 **표를 생략**하고 차트+요약으로 대체합니다.")
-    md.append("")
+    report_md = report_dir / "inflearn_stats_latest.md"
 
     # 테이블명 (환경변수로 오버라이드 가능)
     T_SNAPSHOT = os.environ.get("INFLEARN_T_SNAPSHOT", "inflearn_course_snapshot_raw")
@@ -254,257 +123,145 @@ except Exception:
     T_METRIC = os.environ.get("INFLEARN_T_METRIC", "inflearn_course_metric_fact")
     T_PRICE = os.environ.get("INFLEARN_T_PRICE", "inflearn_course_price_fact")
 
-    exist = {t: table_exists(client, db, t) for t in [T_SNAPSHOT, T_DIM, T_METRIC, T_PRICE]}
+    lookback_days = int(os.environ.get("STATS_LOOKBACK_DAYS", "365"))
 
-        lookback_days = int(os.environ.get("STATS_LOOKBACK_DAYS", "365"))
-# lookback 기준 시점(since)을 "현재"가 아니라 "실제 데이터의 최신 시각" 기준으로 잡아 0으로 떨어지는 케이스를 방지
-max_snap = safe_query(client, f"SELECT max(created_at) AS mx FROM {db}.{T_SNAPSHOT}") if exist.get(T_SNAPSHOT) else []
-mx = max_snap[0].get("mx") if max_snap else None
-base_dt = mx if mx else now_kst()
-since_dt = base_dt - timedelta(days=lookback_days)
-
-
-    # 전체 요약
-    md.append("## 전체 요약")
-    md.append("")
-    if exist[T_DIM]:
-        rows = safe_query(client, f"SELECT uniqExact(course_id) AS cnt FROM {db}.{T_DIM}")
-        if rows:
-            md.append(f"- 누적 수집 강의(고유 course_id): **{fmt_num(rows[0].get('cnt'))}**")
-        loc = safe_query(client, f"SELECT locale, uniqExact(course_id) AS cnt FROM {db}.{T_DIM} GROUP BY locale ORDER BY cnt DESC LIMIT 8")
-        if loc:
-            md.append("- 언어별(상위): " + ", ".join([f"{r.get('locale')}:{fmt_num(r.get('cnt'))}" for r in loc]))
+    # ✅ since 계산을 "현재시간"이 아니라 "데이터의 최신값" 기준으로 잡아 0 튀는 문제를 줄임
+    mx = q(client, f"SELECT max(fetched_at) AS mx FROM {db}.{T_SNAPSHOT}")
+    mx_dt = mx[0]["mx"] if mx and mx[0].get("mx") else None
+    if mx_dt is None:
+        # 데이터가 정말 없는 경우는 그대로 빈 리포트
+        now = datetime.now(tz=KST)
+        since_dt = now - timedelta(days=lookback_days)
     else:
-        md.append("- 누적 수집 강의(고유 course_id): (집계 불가)")
+        since_dt = mx_dt - timedelta(days=lookback_days)
+
+    md: List[str] = []
+    md.append("# Inflearn 통계 리포트")
+    md.append("")
+    md.append(f"- 생성 시각(KST): **{datetime.now(tz=KST).strftime('%Y-%m-%d %H:%M:%S')}**")
+    md.append(f"- 최근 데이터 기준 Lookback: **{lookback_days}일**")
     md.append("")
 
-    # 수집 시점 기준 시계열
-    if exist[T_SNAPSHOT]:
-        hourly = safe_query(
-            client,
-            f"""\
-SELECT formatDateTime(toStartOfHour(created_at), '%Y-%m-%d %H') AS bucket,
-       count() AS cnt
-FROM {db}.{T_SNAPSHOT}
-WHERE created_at >= %(since)s
-GROUP BY bucket
-ORDER BY bucket""",
-            {"since": since_dt},
-        )
-        daily = safe_query(
-            client,
-            f"""\
-SELECT formatDateTime(toDate(created_at), '%Y-%m-%d') AS bucket,
-       count() AS cnt
-FROM {db}.{T_SNAPSHOT}
-WHERE created_at >= %(since)s
-GROUP BY bucket
-ORDER BY bucket""",
-            {"since": since_dt},
-        )
-        monthly = safe_query(
-            client,
-            f"""\
-SELECT formatDateTime(toStartOfMonth(created_at), '%Y-%m') AS bucket,
-       count() AS cnt
-FROM {db}.{T_SNAPSHOT}
-WHERE created_at >= %(since)s
-GROUP BY bucket
-ORDER BY bucket""",
-            {"since": since_dt},
-        )
-        yearly = safe_query(
-            client,
-            f"""\
-SELECT toString(toYear(created_at)) AS bucket,
-       count() AS cnt
-FROM {db}.{T_SNAPSHOT}
-WHERE created_at >= %(since)s
-GROUP BY bucket
-ORDER BY bucket""",
-            {"since": since_dt},
-        )
+    # 1) 수집 시점(fetched_at) 기준: 시간/일/월/년 차트 + 요약
+    hourly = q(client, f"""
+        SELECT formatDateTime(toStartOfHour(fetched_at), '%Y-%m-%d %H') AS bucket,
+               count() AS cnt
+        FROM {db}.{T_SNAPSHOT}
+        WHERE fetched_at >= %(since)s
+        GROUP BY bucket
+        ORDER BY bucket
+    """, {"since": since_dt})
+    daily = q(client, f"""
+        SELECT formatDateTime(toDate(fetched_at), '%Y-%m-%d') AS bucket,
+               count() AS cnt
+        FROM {db}.{T_SNAPSHOT}
+        WHERE fetched_at >= %(since)s
+        GROUP BY bucket
+        ORDER BY bucket
+    """, {"since": since_dt})
+    monthly = q(client, f"""
+        SELECT formatDateTime(toStartOfMonth(fetched_at), '%Y-%m') AS bucket,
+               count() AS cnt
+        FROM {db}.{T_SNAPSHOT}
+        WHERE fetched_at >= %(since)s
+        GROUP BY bucket
+        ORDER BY bucket
+    """, {"since": since_dt})
+    yearly = q(client, f"""
+        SELECT toString(toYear(fetched_at)) AS bucket,
+               count() AS cnt
+        FROM {db}.{T_SNAPSHOT}
+        WHERE fetched_at >= %(since)s
+        GROUP BY bucket
+        ORDER BY bucket
+    """, {"since": since_dt})
 
-        def make_chart(rows: List[Dict[str, Any]], fname: str, title: str, xlabel: str) -> Path:
-            out = charts_dir / fname
-            xs = [r["bucket"] for r in rows]
-            ys = [float(r.get("cnt") or 0) for r in rows]
-            plot_line(xs, ys, title, xlabel, "스냅샷 수", out)
-            return out
+    def add_ts_section(title: str, rows: List[Dict[str, Any]], png_name: str, xlabel: str):
+        xs = [r["bucket"] for r in rows]
+        ys = [float(r.get("cnt") or 0) for r in rows]
+        out_png = charts_dir / png_name
+        if xs:
+            plot_line(xs, ys, title, xlabel, "스냅샷 수", out_png)
+        total = sum(int(r.get("cnt") or 0) for r in rows)
+        last = int(rows[-1].get("cnt") or 0) if rows else 0
+        peak = max((int(r.get("cnt") or 0) for r in rows), default=0)
 
-        p_hourly = make_chart(hourly, "collected_hourly_snapshots.png", "수집 시점 기준 - 시간별 스냅샷", "시간(YYYY-MM-DD HH)")
-        p_daily = make_chart(daily, "collected_daily_snapshots.png", "수집 시점 기준 - 일별 스냅샷", "일자")
-        p_monthly = make_chart(monthly, "collected_monthly_snapshots.png", "수집 시점 기준 - 월별 스냅샷", "월")
-        p_yearly = make_chart(yearly, "collected_yearly_snapshots.png", "수집 시점 기준 - 연별 스냅샷", "연도")
+        md.append(f"## {title}")
+        md.append("")
+        md.append(f"- 합계: **{fmt_int(total)}**, 마지막: **{fmt_int(last)}**, 피크: **{fmt_int(peak)}**")
+        md.append("")
+        if xs:
+            md.append(f"![{title}](charts/{png_name})")
+            md.append("")
 
-        md_section_timeseries(md, "수집 시점 기준 - 시간별 스냅샷", "최근 기간(설정값 기준) 시간별 스냅샷 수 추이입니다.", relpath_for_md(p_hourly, report_latest), hourly, "cnt")
-        md_section_timeseries(md, "수집 시점 기준 - 일별 스냅샷", "최근 기간(설정값 기준) 일별 스냅샷 수 추이입니다.", relpath_for_md(p_daily, report_latest), daily, "cnt")
-        md_section_timeseries(md, "수집 시점 기준 - 월별 스냅샷", "최근 기간(설정값 기준) 월별 스냅샷 수 추이입니다.", relpath_for_md(p_monthly, report_latest), monthly, "cnt")
-        md_section_timeseries(md, "수집 시점 기준 - 연별 스냅샷", "최근 기간(설정값 기준) 연별 스냅샷 수 추이입니다.", relpath_for_md(p_yearly, report_latest), yearly, "cnt")
+    add_ts_section("수집 시점 기준 - 시간별 스냅샷", hourly, "snapshots_hourly.png", "시간(YYYY-MM-DD HH)")
+    add_ts_section("수집 시점 기준 - 일별 스냅샷", daily, "snapshots_daily.png", "일자")
+    add_ts_section("수집 시점 기준 - 월별 스냅샷", monthly, "snapshots_monthly.png", "월")
+    add_ts_section("수집 시점 기준 - 연별 스냅샷", yearly, "snapshots_yearly.png", "연도")
 
-    # 개설 시점 기준
-    if exist[T_DIM]:
-        pub_daily = safe_query(
-            client,
-            f"""\
-SELECT formatDateTime(toDate(published_at), '%Y-%m-%d') AS bucket,
-       count() AS cnt
-FROM {db}.{T_DIM}
-WHERE published_at IS NOT NULL
-  AND published_at >= %(since)s
-GROUP BY bucket
-ORDER BY bucket""",
-            {"since": since_dt},
-        )
-        pub_monthly = safe_query(
-            client,
-            f"""\
-SELECT formatDateTime(toStartOfMonth(published_at), '%Y-%m') AS bucket,
-       count() AS cnt
-FROM {db}.{T_DIM}
-WHERE published_at IS NOT NULL
-  AND published_at >= %(since)s
-GROUP BY bucket
-ORDER BY bucket""",
-            {"since": since_dt},
-        )
-        pub_yearly = safe_query(
-            client,
-            f"""\
-SELECT toString(toYear(published_at)) AS bucket,
-       count() AS cnt
-FROM {db}.{T_DIM}
-WHERE published_at IS NOT NULL
-  AND published_at >= %(since)s
-GROUP BY bucket
-ORDER BY bucket""",
-            {"since": since_dt},
-        )
+    # 2) 개설 시점(published_at) 기준: 일/월/년 (course_dim)
+    pub_daily = q(client, f"""
+        SELECT formatDateTime(toDate(published_at), '%Y-%m-%d') AS bucket,
+               count() AS cnt
+        FROM {db}.{T_DIM}
+        WHERE published_at >= %(since)s
+        GROUP BY bucket
+        ORDER BY bucket
+    """, {"since": since_dt})
+    pub_monthly = q(client, f"""
+        SELECT formatDateTime(toStartOfMonth(published_at), '%Y-%m') AS bucket,
+               count() AS cnt
+        FROM {db}.{T_DIM}
+        WHERE published_at >= %(since)s
+        GROUP BY bucket
+        ORDER BY bucket
+    """, {"since": since_dt})
+    pub_yearly = q(client, f"""
+        SELECT toString(toYear(published_at)) AS bucket,
+               count() AS cnt
+        FROM {db}.{T_DIM}
+        WHERE published_at >= %(since)s
+        GROUP BY bucket
+        ORDER BY bucket
+    """, {"since": since_dt})
 
-        if pub_daily:
-            p = charts_dir / "published_daily_courses.png"
-            plot_line([r["bucket"] for r in pub_daily], [float(r.get("cnt") or 0) for r in pub_daily], "개설 시점 기준 - 일별 신규 강의", "일자", "강의 수", p)
-            md_section_timeseries(md, "개설 시점 기준 - 일별 신규 강의", "published_at 기준으로 집계한 일별 신규 강의 수 추이입니다.", relpath_for_md(p, report_latest), pub_daily, "cnt")
+    def add_pub(title: str, rows: List[Dict[str, Any]], png_name: str, xlabel: str):
+        xs = [r["bucket"] for r in rows]
+        ys = [float(r.get("cnt") or 0) for r in rows]
+        out_png = charts_dir / png_name
+        if xs:
+            plot_line(xs, ys, title, xlabel, "강의 수", out_png)
+        total = sum(int(r.get("cnt") or 0) for r in rows)
+        md.append(f"## {title}")
+        md.append("")
+        md.append(f"- 합계: **{fmt_int(total)}**")
+        md.append("")
+        if xs:
+            md.append(f"![{title}](charts/{png_name})")
+            md.append("")
 
-        if pub_monthly:
-            p = charts_dir / "published_monthly_courses.png"
-            plot_line([r["bucket"] for r in pub_monthly], [float(r.get("cnt") or 0) for r in pub_monthly], "개설 시점 기준 - 월별 신규 강의", "월", "강의 수", p)
-            md_section_timeseries(md, "개설 시점 기준 - 월별 신규 강의", "published_at 기준으로 집계한 월별 신규 강의 수 추이입니다.", relpath_for_md(p, report_latest), pub_monthly, "cnt")
+    add_pub("개설 시점 기준 - 일별 신규 강의", pub_daily, "published_daily.png", "일자")
+    add_pub("개설 시점 기준 - 월별 신규 강의", pub_monthly, "published_monthly.png", "월")
+    add_pub("개설 시점 기준 - 연별 신규 강의", pub_yearly, "published_yearly.png", "연도")
 
-        if pub_yearly:
-            p = charts_dir / "published_yearly_courses.png"
-            plot_line([r["bucket"] for r in pub_yearly], [float(r.get("cnt") or 0) for r in pub_yearly], "개설 시점 기준 - 연별 신규 강의", "연도", "강의 수", p)
-            md_section_timeseries(md, "개설 시점 기준 - 연별 신규 강의", "published_at 기준으로 집계한 연별 신규 강의 수 추이입니다.", relpath_for_md(p, report_latest), pub_yearly, "cnt")
-
-    # 지표/가격 분포
-    if exist[T_METRIC]:
-        metric = safe_query(
-            client,
-            f"""\
-SELECT
-  course_id,
-  locale,
-  argMax(student_count, updated_at) AS student_count,
-  argMax(like_count, updated_at) AS like_count,
-  argMax(review_count, updated_at) AS review_count,
-  argMax(average_star, updated_at) AS average_star
-FROM {db}.{T_METRIC}
-GROUP BY course_id, locale""",
-        )
-        if metric:
-            students = [float(r.get("student_count") or 0) for r in metric]
-            likes = [float(r.get("like_count") or 0) for r in metric]
-            reviews = [float(r.get("review_count") or 0) for r in metric]
-            stars = [float(r.get("average_star") or 0) for r in metric]
-
-            p = charts_dir / "dist_student_count.png"
-            plot_hist(students, "수강생 수 분포", "수강생 수", "강의 수", p, bins=60, logy=True)
-            md_section_distribution(md, "수강생 수 분포", "고유 강의별(최신값 기준) 수강생 수 분포입니다. (y축 로그)", relpath_for_md(p, report_latest), [
-                f"강의 수(표본): **{fmt_num(len(students))}**",
-                f"최대 수강생: **{fmt_num(max(students) if students else 0)}**",
-                f"평균 수강생: **{fmt_num(sum(students)/len(students) if students else 0)}**",
-            ])
-
-            p = charts_dir / "dist_like_count.png"
-            plot_hist(likes, "좋아요 수 분포", "좋아요 수", "강의 수", p, bins=60, logy=True)
-            md_section_distribution(md, "좋아요 수 분포", "고유 강의별(최신값 기준) 좋아요 수 분포입니다. (y축 로그)", relpath_for_md(p, report_latest), [
-                f"강의 수(표본): **{fmt_num(len(likes))}**",
-                f"최대 좋아요: **{fmt_num(max(likes) if likes else 0)}**",
-                f"평균 좋아요: **{fmt_num(sum(likes)/len(likes) if likes else 0)}**",
-            ])
-
-            p = charts_dir / "dist_review_count.png"
-            plot_hist(reviews, "리뷰 수 분포", "리뷰 수", "강의 수", p, bins=60, logy=True)
-            md_section_distribution(md, "리뷰 수 분포", "고유 강의별(최신값 기준) 리뷰 수 분포입니다. (y축 로그)", relpath_for_md(p, report_latest), [
-                f"강의 수(표본): **{fmt_num(len(reviews))}**",
-                f"최대 리뷰: **{fmt_num(max(reviews) if reviews else 0)}**",
-                f"평균 리뷰: **{fmt_num(sum(reviews)/len(reviews) if reviews else 0)}**",
-            ])
-
-            p = charts_dir / "dist_average_star.png"
-            plot_hist(stars, "평균 별점 분포", "평균 별점", "강의 수", p, bins=40, logy=False)
-            md_section_distribution(md, "평균 별점 분포", "고유 강의별(최신값 기준) 평균 별점 분포입니다.", relpath_for_md(p, report_latest), [
-                f"강의 수(표본): **{fmt_num(len(stars))}**",
-                f"평균 별점: **{fmt_num(sum(stars)/len(stars) if stars else 0)}**",
-            ])
-
-    if exist[T_PRICE]:
-        price = safe_query(
-            client,
-            f"""\
-SELECT
-  course_id,
-  locale,
-  argMax(price_regular_krw, updated_at) AS price_regular_krw,
-  argMax(price_pay_krw, updated_at) AS price_pay_krw,
-  argMax(discount_rate, updated_at) AS discount_rate,
-  argMax(is_discounted, updated_at) AS is_discounted
-FROM {db}.{T_PRICE}
-GROUP BY course_id, locale""",
-        )
-        if price:
-            reg = [float(r.get("price_regular_krw") or 0) for r in price]
-            pay = [float(r.get("price_pay_krw") or 0) for r in price]
-            disc = [float(r.get("discount_rate") or 0) for r in price]
-            discounted = sum([1 for r in price if int(r.get("is_discounted") or 0) == 1])
-
-            p = charts_dir / "dist_price_regular_krw.png"
-            plot_hist(reg, "정가(KRW) 분포", "정가(KRW)", "강의 수", p, bins=60, logy=True)
-            md_section_distribution(md, "정가(KRW) 분포", "고유 강의별(최신값 기준) 정가 분포입니다. (y축 로그)", relpath_for_md(p, report_latest), [
-                f"강의 수(표본): **{fmt_num(len(reg))}**",
-                f"최대 정가: **{fmt_num(max(reg) if reg else 0)}**",
-                f"평균 정가: **{fmt_num(sum(reg)/len(reg) if reg else 0)}**",
-            ])
-
-            p = charts_dir / "dist_price_pay_krw.png"
-            plot_hist(pay, "판매가(KRW) 분포", "판매가(KRW)", "강의 수", p, bins=60, logy=True)
-            md_section_distribution(md, "판매가(KRW) 분포", "고유 강의별(최신값 기준) 판매가 분포입니다. (y축 로그)", relpath_for_md(p, report_latest), [
-                f"강의 수(표본): **{fmt_num(len(pay))}**",
-                f"최대 판매가: **{fmt_num(max(pay) if pay else 0)}**",
-                f"평균 판매가: **{fmt_num(sum(pay)/len(pay) if pay else 0)}**",
-            ])
-
-            p = charts_dir / "dist_discount_rate.png"
-            plot_hist(disc, "할인율 분포", "할인율(%)", "강의 수", p, bins=40, logy=False)
-            md_section_distribution(md, "할인율 분포", "고유 강의별(최신값 기준) 할인율 분포입니다.", relpath_for_md(p, report_latest), [
-                f"할인 적용 강의 수: **{fmt_num(discounted)}** / 전체 **{fmt_num(len(price))}**",
-                f"평균 할인율: **{fmt_num(sum(disc)/len(disc) if disc else 0)}**",
-            ])
-
-    md.append("---")
-    md.append("### 메모")
-    md.append("- 본 리포트는 GitHub Actions에서 자동 생성됩니다.")
-    md.append("- 접속정보(호스트/포트/DB명 등)는 리포트/로그에 출력하지 않습니다.")
+    # 3) 핵심 지표 최신값 분포(요약만 + 차트는 필요 시 추가 가능)
+    # (길게 늘어지는 표는 만들지 않음)
+    # 여기서는 최소 요약만 유지
+    try:
+        total_courses = q(client, f"SELECT uniqExact(course_id) AS c FROM {db}.{T_DIM}")[0]["c"]
+    except Exception:
+        total_courses = 0
+    md.append("## 요약")
+    md.append("")
+    md.append(f"- 누적 강의 수(고유 course_id): **{fmt_int(total_courses)}**")
     md.append("")
 
-    content = "\n".join(md) + "\n"
-    ensure_dir(report_dir)
-    report_latest.write_text(content, encoding="utf-8")
+    report_md.write_text("\n".join(md) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
-        print("통계 리포트 생성 중 오류가 발생했습니다. (세부 정보는 숨김 처리)", file=sys.stderr)
+        # 민감정보 노출 방지: 상세 오류 메시지 숨김
         raise
