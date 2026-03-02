@@ -17,6 +17,7 @@ UA = "Mozilla/5.0 (compatible; StatgroundCrawler/1.0; +https://www.statground.ne
 
 # Thread-safe HTTP session (one session per thread)
 import threading
+import gzip
 _TLS = threading.local()
 
 def get_session() -> "requests.Session":
@@ -111,9 +112,42 @@ def http_get(url: str) -> requests.Response:
     return r
 
 def parse_sitemap_locs(xml_bytes: bytes) -> list[str]:
-    root = etree.fromstring(xml_bytes)
+    """Parse sitemap XML bytes and return <loc> URLs.
+
+    Some environments/CDNs may return gzip-compressed XML, HTML, or other non-XML payloads.
+    This function attempts to normalize common cases; on invalid payload, raises ValueError.
+    """
+    if not xml_bytes:
+        raise ValueError("Empty sitemap payload")
+
+    b = xml_bytes
+
+    # Handle gzip-compressed content (magic header 1F 8B)
+    if len(b) >= 2 and b[0] == 0x1F and b[1] == 0x8B:
+        try:
+            b = gzip.decompress(b)
+        except Exception as e:
+            raise ValueError("Failed to decompress gzip sitemap payload") from e
+
+    # Strip BOM/whitespace
+    b = b.lstrip(b"\xef\xbb\xbf\n\r\t ")
+
+    # If payload does not look like XML, try to recover from leading junk (e.g., debug prefix)
+    if not b.startswith(b"<"):
+        lt = b.find(b"<")
+        if lt >= 0:
+            b = b[lt:]
+        else:
+            raise ValueError("Sitemap payload is not XML")
+
+    try:
+        root = etree.fromstring(b)
+    except Exception as e:
+        raise ValueError("Invalid sitemap XML") from e
+
     locs = root.xpath(".//sm:loc/text()", namespaces=NS)
-    return [x.strip() for x in locs if x and x.strip()]
+    out = [x.strip() for x in locs if x and x.strip()]
+    return out
 
 def extract_next_data(html: str) -> dict | None:
     m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
@@ -201,17 +235,6 @@ def should_insert_snapshot(ch, course_id: int, locale: str, qk_hash: int, payloa
         return True
     return int(rows[0][0]) != int(payload_hash)
 
-
-def course_exists(ch, course_id: int, locale: str) -> bool:
-    """Return True if course_dim already has this course_id+locale."""
-    sql = f"""
-    SELECT 1
-    FROM {CH_DATABASE}.inflearn_course_dim
-    WHERE course_id = %(course_id)s AND locale = %(locale)s
-    LIMIT 1
-    """
-    rows = ch.query(sql, parameters={"course_id": course_id, "locale": locale}).result_rows
-    return bool(rows)
 def find_api_data(queries: list[dict], needle: str):
     for q in queries:
         qk = json.dumps(q.get("queryKey"), ensure_ascii=False)
@@ -401,9 +424,7 @@ def main():
     sitemap_index, offset = get_checkpoint(ch)
     print(f"[checkpoint] start sitemap_index={sitemap_index}, url_index={offset}")
 
-    processed = 0  # number of fetched/parsed courses in this run (batch limit)
-    scanned = 0    # number of URLs scanned
-    exists_cache: dict[tuple[int,str], bool] = {}
+    processed = 0
     snap_rows, dim_rows, metric_rows, price_rows, curri_rows, inst_rows, map_rows = ([] for _ in range(7))
 
     while True:
@@ -447,7 +468,13 @@ def main():
                 return
             raise RuntimeError(f"Unexpected status {r.status_code} for {sm_url}")
 
-        urls = parse_sitemap_locs(r.content)
+        try:
+            urls = parse_sitemap_locs(r.content)
+        except ValueError:
+            # Treat as transient (WAF/HTML/etc). Keep checkpoint and retry next run.
+            print(f"[warn] invalid sitemap payload. keep checkpoint sitemap_index={sitemap_index}, url_index={offset}")
+            set_checkpoint(ch, sitemap_index, offset)
+            return
         if not urls:
             set_checkpoint(ch, sitemap_index, 0)
             break
@@ -460,20 +487,9 @@ def main():
                 break
 
             url = urls[i]; i += 1
-            scanned += 1
             course_id, locale = parse_course_id_and_locale(url)
             if not course_id:
                 continue
-
-            # Skip HTTP fetch if we already have this course in course_dim (collect_new only cares about brand-new courses).
-            key = (course_id, locale)
-            exists = exists_cache.get(key)
-            if exists is None:
-                exists = course_exists(ch, course_id, locale)
-                exists_cache[key] = exists
-            if exists:
-                continue
-
 
             page = http_get(url)
             if page.status_code != 200:
@@ -639,7 +655,7 @@ def main():
 
             processed += 1
             if processed % 50 == 0:
-                print(f"[progress] scanned={scanned} fetched={processed} last_course_id={course_id} sitemap={sitemap_index} offset={i}")
+                print(f"[progress] processed={processed} last_course_id={course_id} sitemap={sitemap_index} offset={i}")
             jitter_sleep(SLEEP_MIN, SLEEP_MAX)
 
         if BATCH_SIZE > 0 and processed >= BATCH_SIZE:
