@@ -144,7 +144,7 @@ def main():
 
     # 1) 수집 시점(fetched_at) 기준: 시간/일/월/년 차트 + 요약
     hourly = q(client, f"""
-        SELECT formatDateTime(toStartOfHour(fetched_at), '%Y-%m-%d %H') AS bucket,
+        SELECT formatDateTime(toStartOfHour(fetched_at), '%%Y-%%m-%%d %%H') AS bucket,
                count() AS cnt
         FROM {db}.{T_SNAPSHOT}
         WHERE fetched_at >= %(since)s
@@ -152,7 +152,7 @@ def main():
         ORDER BY bucket
     """, {"since": since_dt})
     daily = q(client, f"""
-        SELECT formatDateTime(toDate(fetched_at), '%Y-%m-%d') AS bucket,
+        SELECT formatDateTime(toDate(fetched_at), '%%Y-%%m-%%d') AS bucket,
                count() AS cnt
         FROM {db}.{T_SNAPSHOT}
         WHERE fetched_at >= %(since)s
@@ -160,7 +160,7 @@ def main():
         ORDER BY bucket
     """, {"since": since_dt})
     monthly = q(client, f"""
-        SELECT formatDateTime(toStartOfMonth(fetched_at), '%Y-%m') AS bucket,
+        SELECT formatDateTime(toStartOfMonth(fetched_at), '%%Y-%%m') AS bucket,
                count() AS cnt
         FROM {db}.{T_SNAPSHOT}
         WHERE fetched_at >= %(since)s
@@ -201,7 +201,7 @@ def main():
 
     # 2) 개설 시점(published_at) 기준: 일/월/년 (course_dim)
     pub_daily = q(client, f"""
-        SELECT formatDateTime(toDate(published_at), '%Y-%m-%d') AS bucket,
+        SELECT formatDateTime(toDate(published_at), '%%Y-%%m-%%d') AS bucket,
                count() AS cnt
         FROM {db}.{T_DIM}
         WHERE published_at >= %(since)s
@@ -209,7 +209,7 @@ def main():
         ORDER BY bucket
     """, {"since": since_dt})
     pub_monthly = q(client, f"""
-        SELECT formatDateTime(toStartOfMonth(published_at), '%Y-%m') AS bucket,
+        SELECT formatDateTime(toStartOfMonth(published_at), '%%Y-%%m') AS bucket,
                count() AS cnt
         FROM {db}.{T_DIM}
         WHERE published_at >= %(since)s
