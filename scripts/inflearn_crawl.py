@@ -251,7 +251,7 @@ def main():
             print(f"[done] sitemap {sitemap_index} -> 404")
             set_checkpoint(ch, 0, 0)
             break
-                if r.status_code != 200:
+        if r.status_code != 200:
             if r.status_code == 403:
                 # Stop gracefully and keep the current checkpoint so the next run can retry.
                 print(f"[warn] sitemap blocked (403). keep checkpoint sitemap_index={sitemap_index}, url_index=0")
