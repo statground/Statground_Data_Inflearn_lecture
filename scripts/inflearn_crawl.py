@@ -3,33 +3,37 @@
 # Uses stable 64-bit hashes (blake2b) and change-only inserts for metric/price.
 # DateTime64 inserted as datetime objects.
 
-import os, re, json, time, random, urllib.parse, hashlib, struct, threading, math
+import os, re, json, time, random, urllib.parse, hashlib, struct
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
 from lxml import etree
 from tenacity import retry, stop_after_attempt, wait_exponential
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import clickhouse_connect
 from uuid6 import uuid7
 
 UA = "Mozilla/5.0 (compatible; StatgroundCrawler/1.0; +https://www.statground.net)"
-TLS = threading.local()
 
-def _session():
-    s = getattr(TLS, "session", None)
+# Thread-safe HTTP session (one session per thread)
+import threading
+_TLS = threading.local()
+
+def get_session() -> "requests.Session":
+    s = getattr(_TLS, "session", None)
     if s is None:
         s = requests.Session()
-        # Thread-local Session에 공통 헤더를 매번 확실히 적용
         s.headers.update({
             "User-Agent": UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
         })
-        TLS.session = s
+        _TLS.session = s
     return s
-
-# NOTE: SESSION 전역 객체를 두지 않습니다. (멀티스레드에서 안전하지 않음)
 NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 KST = ZoneInfo("Asia/Seoul")
 
@@ -94,14 +98,13 @@ CH_DATABASE = _get_env_any(["CH_DATABASE", "CLICKHOUSE_DATABASE"], "statground_l
 SITEMAP_BASE = _get_env("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps").rstrip("/")
 SITEMAP_PREFIX = _get_env("SITEMAP_PREFIX", "sitemap-courseDetail-")
 
-BATCH_SIZE = _parse_int_env("BATCH_SIZE", 100)
-WORKERS = _parse_int_env("WORKERS", 8)
+BATCH_SIZE = _parse_int_env("BATCH_SIZE", 600)
 SLEEP_MIN = float(_get_env("REQUEST_SLEEP_MIN", "0.6"))
 SLEEP_MAX = float(_get_env("REQUEST_SLEEP_MAX", "1.3"))
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=20))
 def http_get(url: str) -> requests.Response:
-    r = _session().get(url, timeout=30)
+    r = get_session().get(url, timeout=30)
     if r.status_code in (429, 500, 502, 503, 504):
         raise RuntimeError(f"Retryable HTTP {r.status_code}")
     return r
@@ -202,278 +205,10 @@ def find_api_data(queries: list[dict], needle: str):
         qk = json.dumps(q.get("queryKey"), ensure_ascii=False)
         if needle in qk:
             return (q.get("state") or {}).get("data")
-    return 
-def clamp_u8_percent(x) -> int:
-    """ClickHouse UInt8용 할인율(%) 정규화. None/NaN/float/str 모두 안전 처리."""
-    try:
-        if x is None:
-            return 0
-        if isinstance(x, bool):
-            return 1 if x else 0
-        if isinstance(x, (int,)):
-            v = x
-        else:
-            s = str(x).strip()
-            if s == "":
-                return 0
-            v = float(s)
-        if not math.isfinite(v):
-            return 0
-        v = int(round(v))
-        if v < 0: v = 0
-        if v > 100: v = 100
-        return v
-    except Exception:
-        return 0
-
-None
+    return None
 
 def to_u8(x) -> int:
     return 1 if x else 0
-
-
-def process_course_url(url: str, fetched_at):
-    """단일 강의 URL을 수집/파싱하여 ClickHouse insert용 row 묶음을 생성한다.
-    - 병렬 실행을 위해 ClickHouse 쿼리는 하지 않는다(중복 체크 없음).
-    - 실패 시에도 snapshot_raw에 ERROR 상태로 기록할 수 있도록 최소 row를 반환한다.
-    """
-    snap_rows, dim_rows, metric_rows, price_rows, curri_rows, inst_rows, map_rows = ([] for _ in range(7))
-    course_id, locale = parse_course_id_and_locale(url)
-    if not course_id:
-        return {
-            "processed": 0,
-            "snapshot_raw": snap_rows,
-            "course_dim": dim_rows,
-            "metric_fact": metric_rows,
-            "price_fact": price_rows,
-            "curriculum_unit": curri_rows,
-            "instructor_dim": inst_rows,
-            "course_instructor_map": map_rows,
-        }
-
-    try:
-        page = http_get(url)
-        if page.status_code != 200:
-            # snapshot error only
-            snap_rows.append([str(uuid7()), fetched_at, course_id, locale, url, "[]", 0, "HTTP", str(page.status_code), "{}", 0])
-            return {
-                "processed": 1,
-                "snapshot_raw": snap_rows,
-                "course_dim": dim_rows,
-                "metric_fact": metric_rows,
-                "price_fact": price_rows,
-                "curriculum_unit": curri_rows,
-                "instructor_dim": inst_rows,
-                "course_instructor_map": map_rows,
-            }
-
-        nd = extract_next_data(page.text)
-        if not nd:
-            snap_rows.append([str(uuid7()), fetched_at, course_id, locale, url, "[]", 0, "PARSE", "NO_NEXT_DATA", "{}", 0])
-            return {
-                "processed": 1,
-                "snapshot_raw": snap_rows,
-                "course_dim": dim_rows,
-                "metric_fact": metric_rows,
-                "price_fact": price_rows,
-                "curriculum_unit": curri_rows,
-                "instructor_dim": inst_rows,
-                "course_instructor_map": map_rows,
-            }
-
-        page_props = (nd.get("props") or {}).get("pageProps") or {}
-        queries = ((page_props.get("dehydratedState") or {}).get("queries") or [])
-
-        # snapshot_raw: 모든 query state.data를 저장
-        for q in queries:
-            qk = json.dumps(q.get("queryKey"), ensure_ascii=False)
-            payload_obj = (q.get("state") or {}).get("data")
-            if payload_obj is None:
-                continue
-            payload = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":"))
-            payload_hash = h64(payload)
-            qk_hash = h64(qk)
-            snap_rows.append([str(uuid7()), fetched_at, course_id, locale, url, qk, qk_hash, "OK", None, payload, payload_hash])
-
-        online_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/online/info")
-        meta_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/meta")
-        contents = find_api_data(queries, f"/client/api/v1/course/{course_id}/contents")
-        price_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/price")
-
-        # course_dim
-        if isinstance(meta_info, dict):
-            m = meta_info.get("data") or {}
-            slug = str(m.get("slug") or "")
-            en_slug = str(m.get("enSlug") or "")
-            status = str(m.get("status") or "")
-            title = str(m.get("title") or "")
-            description = str(m.get("description") or "")
-            thumbnail_url = str(m.get("thumbnailUrl") or "")
-
-            cat = m.get("category") or {}
-            cat_main = cat.get("main") or {}
-            cat_sub = cat.get("sub") or {}
-            category_main_title = str(cat_main.get("title") or "")
-            category_main_slug = str(cat_main.get("slug") or "")
-            category_sub_title = str(cat_sub.get("title") or "")
-            category_sub_slug = str(cat_sub.get("slug") or "")
-
-            level_code = str(m.get("level") or "")
-            is_new = to_u8(m.get("isNew"))
-            is_best = to_u8(m.get("isBest"))
-            student_count = int(m.get("studentCount") or 0)
-            like_count = int(m.get("likeCount") or 0)
-            review_count = int(m.get("reviewCount") or 0)
-            average_star = float(m.get("averageStar") or 0.0)
-
-            lecture_unit_count = int(m.get("lectureUnitCount") or 0)
-            preview_unit_count = int(m.get("previewUnitCount") or 0)
-            runtime_sec = int(m.get("runtimeSec") or 0)
-
-            provides_certificate = to_u8(m.get("providesCertificate"))
-            provides_instructor_answer = to_u8(m.get("providesInstructorAnswer"))
-            provides_inquiry = to_u8(m.get("providesInquiry"))
-
-            published_at = parse_dt64(m.get("publishedAt")) or fetched_at
-            last_updated_at = parse_dt64(m.get("lastUpdatedAt")) or fetched_at
-
-            keywords = json.dumps(m.get("keywords") or [], ensure_ascii=False, separators=(",", ":"))
-            category_slugs = json.dumps(m.get("categorySlugs") or [], ensure_ascii=False, separators=(",", ":"))
-            skill_slugs = json.dumps(m.get("skillSlugs") or [], ensure_ascii=False, separators=(",", ":"))
-            common_tag_slugs = json.dumps(m.get("commonTagSlugs") or [], ensure_ascii=False, separators=(",", ":"))
-
-            dim_rows.append([
-                course_id, locale, fetched_at,
-                slug, en_slug, status, title, description, thumbnail_url,
-                category_main_title, category_main_slug,
-                category_sub_title, category_sub_slug,
-                level_code, is_new, is_best,
-                student_count, like_count, review_count, average_star,
-                lecture_unit_count, preview_unit_count, runtime_sec,
-                provides_certificate, provides_instructor_answer, provides_inquiry,
-                published_at, last_updated_at,
-                keywords, category_slugs, skill_slugs, common_tag_slugs
-            ])
-
-        # metric_fact / price_fact (change-only 목적 hash 유지)
-        krw_regular = 0
-        krw_pay = 0
-        regular_price = 0
-        pay_price = 0
-        discount_title = ""
-        discount_ended_at = None
-        discount_rate = 0
-
-        if isinstance(price_info, dict):
-            p = price_info.get("data") or {}
-            regular_price = int(p.get("regularPrice") or 0)
-            pay_price = int(p.get("payPrice") or 0)
-            krw_regular = int(p.get("krwRegularPrice") or 0)
-            krw_pay = int(p.get("krwPayPrice") or 0)
-            discount_title = str(p.get("discountTitle") or "")
-            discount_ended_at = parse_dt64(p.get("discountEndedAt"))
-            discount_rate = clamp_u8_percent(p.get("discountRate"))
-
-        if isinstance(online_info, dict):
-            o = online_info.get("data") or {}
-            student_count = int(o.get("studentCount") or 0)
-            like_count = int(o.get("likeCount") or 0)
-            review_count = int(o.get("reviewCount") or 0)
-            average_star = float(o.get("averageStar") or 0.0)
-
-            metric_tuple = (student_count, like_count, review_count, average_star,
-                            krw_regular, krw_pay, discount_rate, discount_title, str(discount_ended_at))
-            metric_hash = h64(json.dumps(metric_tuple, default=str, ensure_ascii=False, separators=(",", ":")))
-            metric_rows.append([
-                fetched_at, course_id, locale,
-                student_count, like_count, review_count, average_star,
-                krw_regular, krw_pay,
-                discount_rate, discount_title, discount_ended_at,
-                metric_hash
-            ])
-
-        price_tuple = (regular_price, pay_price, discount_rate, discount_title, str(discount_ended_at),
-                       krw_regular, krw_pay)
-        price_hash = h64(json.dumps(price_tuple, default=str, ensure_ascii=False, separators=(",", ":")))
-        price_rows.append([
-            fetched_at, course_id, locale,
-            regular_price, pay_price, discount_rate, discount_title, discount_ended_at,
-            krw_regular, krw_pay, price_hash
-        ])
-
-        # curriculum_unit
-        if isinstance(contents, dict):
-            c = contents.get("data") or {}
-            # 구조는 기존 코드와 동일하게 처리(가능한 한 안전)
-            for sec in c.get("sections", []) or []:
-                section_id = int(sec.get("id") or 0)
-                section_title = str(sec.get("title") or "")
-                for u in sec.get("units", []) or []:
-                    unit_id = int(u.get("id") or 0)
-                    unit_title = str(u.get("title") or "")
-                    unit_type = str(u.get("type") or "")
-                    runtime_sec = int(u.get("runtimeSec") or 0)
-                    is_preview = to_u8(u.get("isPreview"))
-                    has_video = to_u8(u.get("hasVideo"))
-                    has_attachment = to_u8(u.get("hasAttachment"))
-                    quiz_id = u.get("quizId")
-                    reading_time = u.get("readingTime")
-                    is_challenge_only = to_u8(u.get("isChallengeOnly"))
-
-                    unit_tuple = (section_id, section_title, unit_id, unit_title, unit_type, runtime_sec,
-                                  is_preview, has_video, has_attachment, quiz_id, reading_time, is_challenge_only)
-                    unit_hash = h64(json.dumps(unit_tuple, default=str, ensure_ascii=False, separators=(",", ":")))
-                    curri_rows.append([
-                        fetched_at, course_id, locale,
-                        section_id, section_title,
-                        unit_id, unit_title, unit_type,
-                        runtime_sec, is_preview, has_video, has_attachment,
-                        quiz_id, reading_time, is_challenge_only,
-                        unit_hash
-                    ])
-
-            # instructor_dim & map
-            for mi in c.get("mainInstructors", []) or []:
-                instructor_id = int(mi.get("id") or 0)
-                if instructor_id <= 0:
-                    continue
-                inst_rows.append([
-                    instructor_id, fetched_at,
-                    str(mi.get("name") or ""), str(mi.get("slug") or ""),
-                    str(mi.get("thumbnail") or ""),
-                    int(mi.get("courseCount") or 0),
-                    int(mi.get("studentCount") or 0),
-                    int(mi.get("reviewCount") or 0),
-                    int(mi.get("totalStar") or 0),
-                    int(mi.get("answerCount") or 0),
-                    str(mi.get("introduce") or "")
-                ])
-                map_rows.append([fetched_at, course_id, instructor_id, "main"])
-
-        return {
-            "processed": 1,
-            "snapshot_raw": snap_rows,
-            "course_dim": dim_rows,
-            "metric_fact": metric_rows,
-            "price_fact": price_rows,
-            "curriculum_unit": curri_rows,
-            "instructor_dim": inst_rows,
-            "course_instructor_map": map_rows,
-        }
-
-    except Exception as e:
-        # 세부 정보 노출 최소화
-        snap_rows.append([str(uuid7()), fetched_at, course_id, locale, url, "[]", 0, "ERROR", "EXCEPTION", "{}", 0])
-        return {
-            "processed": 1,
-            "snapshot_raw": snap_rows,
-            "course_dim": dim_rows,
-            "metric_fact": metric_rows,
-            "price_fact": price_rows,
-            "curriculum_unit": curri_rows,
-            "instructor_dim": inst_rows,
-            "course_instructor_map": map_rows,
-        }
 
 def main():
     ch = ch_client()
@@ -486,13 +221,42 @@ def main():
     snap_rows, dim_rows, metric_rows, price_rows, curri_rows, inst_rows, map_rows = ([] for _ in range(7))
 
     while True:
-        sm_url = f"{SITEMAP_BASE}/{SITEMAP_PREFIX}{sitemap_index}.xml"
-        r = http_get(sm_url)
+        # Try primary sitemap base first, then fallback (some environments may get 403 from CDN)
+        sitemap_urls = []
+        for base in (SITEMAP_BASE, SITEMAP_BASE_FALLBACK):
+            u = f"{base}/{SITEMAP_PREFIX}{sitemap_index}.xml"
+            if u not in sitemap_urls:
+                sitemap_urls.append(u)
+
+        r = None
+        sm_url = sitemap_urls[0]
+        for u in sitemap_urls:
+            sm_url = u
+            try:
+                r = http_get(sm_url)
+            except Exception:
+                # http_get already retries transient errors; keep trying next base if available
+                r = None
+            if r is None:
+                continue
+            if r.status_code == 403:
+                # Possible CDN/WAF block - try the next base, and if still blocked, stop gracefully
+                time.sleep(3)
+                continue
+            break
+
+        if r is None:
+            raise RuntimeError(f"Failed to fetch sitemap {sitemap_index}")
         if r.status_code == 404:
             print(f"[done] sitemap {sitemap_index} -> 404")
             set_checkpoint(ch, 0, 0)
             break
-        if r.status_code != 200:
+                if r.status_code != 200:
+            if r.status_code == 403:
+                # Stop gracefully and keep the current checkpoint so the next run can retry.
+                print(f"[warn] sitemap blocked (403). keep checkpoint sitemap_index={sitemap_index}, url_index=0")
+                set_checkpoint(ch, sitemap_index, 0)
+                return
             raise RuntimeError(f"Unexpected status {r.status_code} for {sm_url}")
 
         urls = parse_sitemap_locs(r.content)
@@ -500,36 +264,187 @@ def main():
             set_checkpoint(ch, sitemap_index, 0)
             break
 
-
         i = offset
-        # 이번 sitemap에서 처리할 URL을 배치 크기만큼만 선택
-        remaining = (BATCH_SIZE - processed) if BATCH_SIZE > 0 else (len(urls) - i)
-        take = urls[i:i + max(0, remaining)] if remaining > 0 else []
-        if not take:
-            # 배치 한도에 도달했으면 체크포인트 저장 후 종료
-            set_checkpoint(ch, sitemap_index, i)
-            print(f"[batch] limit hit. saved checkpoint sitemap={sitemap_index} offset={i}")
+        while i < len(urls):
+            if BATCH_SIZE > 0 and processed >= BATCH_SIZE:
+                set_checkpoint(ch, sitemap_index, i)
+                print(f"[batch] limit hit. saved checkpoint sitemap={sitemap_index} offset={i}")
+                break
+
+            url = urls[i]; i += 1
+            course_id, locale = parse_course_id_and_locale(url)
+            if not course_id:
+                continue
+
+            page = http_get(url)
+            if page.status_code != 200:
+                continue
+
+            nd = extract_next_data(page.text)
+            if not nd:
+                continue
+
+            page_props = (nd.get("props") or {}).get("pageProps") or {}
+            queries = ((page_props.get("dehydratedState") or {}).get("queries") or [])
+
+            # snapshot_raw
+            for q in queries:
+                qk = json.dumps(q.get("queryKey"), ensure_ascii=False)
+                payload_obj = (q.get("state") or {}).get("data")
+                if payload_obj is None:
+                    continue
+                payload = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":"))
+                payload_hash = h64(payload)
+                qk_hash = h64(qk)
+                if not should_insert_snapshot(ch, course_id, locale, qk_hash, payload_hash):
+                    continue
+                snap_rows.append([str(uuid7()), fetched_at, course_id, locale, url, qk, qk_hash, "OK", None, payload, payload_hash])
+
+            online_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/online/info")
+            meta_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/meta")
+            curriculum = find_api_data(queries, f"/client/api/v2/courses/{course_id}/curriculum")
+            discounts_best = find_api_data(queries, f"/client/api/v1/discounts/best?courseIds={course_id}")
+            contents = find_api_data(queries, f"/client/api/v1/course/{course_id}/contents?lang=") or find_api_data(queries, f"/client/api/v1/course/{course_id}/contents")
+
+            if isinstance(online_info, dict) and isinstance(meta_info, dict):
+                d = online_info.get("data") or {}
+                m = meta_info.get("data") or {}
+                category = d.get("category") or {}
+                main_c = category.get("main") or {}
+                sub_c = category.get("sub") or {}
+
+                level_code = ""
+                for lv in d.get("levels") or []:
+                    if lv.get("isActive"):
+                        level_code = lv.get("code") or lv.get("title") or ""
+                        break
+
+                unit = d.get("unitSummary") or {}
+                rev = d.get("review") or {}
+                published_at = parse_dt64(d.get("publishedAt")) or datetime(1970,1,1,tzinfo=KST)
+                last_updated_at = parse_dt64(d.get("lastUpdatedAt")) or datetime(1970,1,1,tzinfo=KST)
+
+                dim_rows.append([
+                    course_id, locale, fetched_at,
+                    str(d.get("slug") or ""), str(d.get("enSlug") or ""),
+                    str(d.get("status") or ""),
+                    str(d.get("title") or ""), str(d.get("description") or ""),
+                    str(d.get("thumbnailUrl") or ""),
+                    str(main_c.get("title") or ""), str(main_c.get("slug") or ""),
+                    str(sub_c.get("title") or ""), str(sub_c.get("slug") or ""),
+                    str(level_code),
+                    to_u8(d.get("isNew")), to_u8(d.get("isBest")),
+                    int(d.get("studentCount") or 0), int(d.get("likeCount") or 0),
+                    int(rev.get("count") or 0), float(rev.get("averageStar") or 0.0),
+                    int(unit.get("lectureUnitCount") or 0), int(unit.get("previewUnitCount") or 0),
+                    int(unit.get("runtime") or 0),
+                    to_u8(d.get("providesCertificate")), to_u8(d.get("providesInstructorAnswer")), to_u8(d.get("providesInquiry")),
+                    published_at, last_updated_at,
+                    str(m.get("keywords") or ""),
+                    m.get("categorySlugs") or [],
+                    m.get("skillSlugs") or [],
+                    m.get("commonTagsSlugs") or [],
+                ])
+
+                pay = d.get("paymentInfo") or {}
+                disc = (discounts_best.get("data") if isinstance(discounts_best, dict) else {}) or {}
+                discount = pay.get("discount") or {}
+                discount_rate = int(pay.get("discountRate") or disc.get("discountRate") or 0)
+                discount_title = str(discount.get("title") or disc.get("discountTitle") or "")
+                discount_ended_at = parse_dt64(discount.get("endedAt"))
+
+                # metric_fact change-only
+                metric_tuple = (
+                    int(d.get("studentCount") or 0),
+                    int(d.get("likeCount") or 0),
+                    int(rev.get("count") or 0),
+                    float(rev.get("averageStar") or 0.0),
+                    int(pay.get("krwRegularPrice") or 0),
+                    int(pay.get("krwPaymentPrice") or 0),
+                    discount_rate,
+                    discount_title,
+                    discount_ended_at,
+                )
+                if latest_metric_tuple(ch, course_id, locale) != metric_tuple:
+                    metric_hash = h64(json.dumps(metric_tuple, default=str, ensure_ascii=False, separators=(",", ":")))
+                    metric_rows.append([fetched_at, course_id, locale,
+                                        metric_tuple[0], metric_tuple[1], metric_tuple[2], metric_tuple[3],
+                                        metric_tuple[4], metric_tuple[5],
+                                        metric_tuple[6], metric_tuple[7], metric_tuple[8],
+                                        metric_hash])
+
+                # price_fact change-only
+                price_tuple = (
+                    float(pay.get("regularPrice") or 0.0),
+                    float(pay.get("payPrice") or 0.0),
+                    discount_rate,
+                    discount_title,
+                    discount_ended_at,
+                    int(pay.get("krwRegularPrice") or 0),
+                    int(pay.get("krwPaymentPrice") or 0),
+                )
+                if latest_price_tuple(ch, course_id, locale) != price_tuple:
+                    price_hash = h64(json.dumps(price_tuple, default=str, ensure_ascii=False, separators=(",", ":")))
+                    price_rows.append([fetched_at, course_id, locale,
+                                       price_tuple[0], price_tuple[1],
+                                       price_tuple[2], price_tuple[3], price_tuple[4],
+                                       price_tuple[5], price_tuple[6],
+                                       price_hash])
+
+            # curriculum_unit (latest per unit; include locale)
+            if isinstance(curriculum, dict):
+                cdata = curriculum.get("data") or {}
+                for sec in cdata.get("curriculum", []) or []:
+                    section_id = int(sec.get("id") or 0)
+                    section_title = str(sec.get("title") or "")
+                    for u in sec.get("units", []) or []:
+                        unit_id = int(u.get("id") or 0)
+                        unit_title = str(u.get("title") or "")
+                        unit_type = str(u.get("type") or "")
+                        runtime_sec = int(u.get("runtime") or 0)
+                        is_preview = to_u8(u.get("isPreview"))
+                        has_video = to_u8(u.get("hasVideo"))
+                        has_attachment = to_u8(u.get("hasAttachment"))
+                        quiz_id = u.get("quizId")
+                        reading_time = u.get("readingTime")
+                        is_challenge_only = to_u8(u.get("isChallengeOnly"))
+
+                        unit_tuple = (section_id, section_title, unit_id, unit_title, unit_type, runtime_sec,
+                                      is_preview, has_video, has_attachment, quiz_id, reading_time, is_challenge_only)
+                        unit_hash = h64(json.dumps(unit_tuple, default=str, ensure_ascii=False, separators=(",", ":")))
+
+                        curri_rows.append([fetched_at, course_id, locale,
+                                           section_id, section_title,
+                                           unit_id, unit_title, unit_type,
+                                           runtime_sec, is_preview, has_video, has_attachment,
+                                           quiz_id, reading_time, is_challenge_only,
+                                           unit_hash])
+
+            # instructor_dim & map (Replacing이라 중복 쌓여도 최신으로 수렴)
+            if isinstance(contents, dict):
+                c = contents.get("data") or {}
+                for mi in c.get("mainInstructors", []) or []:
+                    instructor_id = int(mi.get("id") or 0)
+                    if instructor_id <= 0:
+                        continue
+                    inst_rows.append([instructor_id, fetched_at,
+                                      str(mi.get("name") or ""), str(mi.get("slug") or ""),
+                                      str(mi.get("thumbnail") or ""),
+                                      int(mi.get("courseCount") or 0),
+                                      int(mi.get("studentCount") or 0),
+                                      int(mi.get("reviewCount") or 0),
+                                      int(mi.get("totalStar") or 0),
+                                      int(mi.get("answerCount") or 0),
+                                      str(mi.get("introduce") or "")])
+                    map_rows.append([fetched_at, course_id, instructor_id, "main"])
+
+            processed += 1
+            if processed % 50 == 0:
+                print(f"[progress] processed={processed} last_course_id={course_id} sitemap={sitemap_index} offset={i}")
+            jitter_sleep(SLEEP_MIN, SLEEP_MAX)
+
+        if BATCH_SIZE > 0 and processed >= BATCH_SIZE:
             break
-
-        # 병렬 처리(HTTP fetch/parse/build rows)
-        with ThreadPoolExecutor(max_workers=max(1, WORKERS)) as ex:
-            futs = [ex.submit(process_course_url, u, fetched_at) for u in take]
-            done = 0
-            for fut in as_completed(futs):
-                res = fut.result()
-                done += int(res.get("processed") or 0)
-                snap_rows.extend(res.get("snapshot_raw") or [])
-                dim_rows.extend(res.get("course_dim") or [])
-                metric_rows.extend(res.get("metric_fact") or [])
-                price_rows.extend(res.get("price_fact") or [])
-                curri_rows.extend(res.get("curriculum_unit") or [])
-                inst_rows.extend(res.get("instructor_dim") or [])
-                map_rows.extend(res.get("course_instructor_map") or [])
-
-        processed += len(take)
-        i = i + len(take)
-        set_checkpoint(ch, sitemap_index, i)
-        print(f"[progress] sitemap={sitemap_index} processed_total={processed} offset={i}")
 
         sitemap_index += 1
         offset = 0
