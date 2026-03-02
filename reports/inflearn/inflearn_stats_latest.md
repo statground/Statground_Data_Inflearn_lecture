@@ -1,51 +1,51 @@
 # Inflearn 통계 리포트
 
-- 생성 시각(KST): **2026-03-02 20:47:28**
+- 생성 시각(KST): **2026-03-02 22:13:33**
 - 최근 데이터 기준 Lookback: **365일**
 
-## 수집 시점 기준 - 시간별 스냅샷
+## Snapshots by Fetch Hour
 
-- 합계: **75,912**, 마지막: **1,200**, 피크: **7,202**
+- 합계: **75,960**, 마지막: **48**, 피크: **7,202**
 
-![수집 시점 기준 - 시간별 스냅샷](charts/snapshots_hourly.png)
+![Snapshots by Fetch Hour](charts/snapshots_hourly.png)
 
-## 수집 시점 기준 - 일별 스냅샷
+## Snapshots by Fetch Day
 
-- 합계: **75,912**, 마지막: **16,061**, 피크: **45,450**
+- 합계: **75,960**, 마지막: **16,109**, 피크: **45,450**
 
-![수집 시점 기준 - 일별 스냅샷](charts/snapshots_daily.png)
+![Snapshots by Fetch Day](charts/snapshots_daily.png)
 
-## 수집 시점 기준 - 월별 스냅샷
+## Snapshots by Fetch Month
 
-- 합계: **75,912**, 마지막: **61,511**, 피크: **61,511**
+- 합계: **75,960**, 마지막: **61,559**, 피크: **61,559**
 
-![수집 시점 기준 - 월별 스냅샷](charts/snapshots_monthly.png)
+![Snapshots by Fetch Month](charts/snapshots_monthly.png)
 
-## 수집 시점 기준 - 연별 스냅샷
+## Snapshots by Fetch Year
 
-- 합계: **75,912**, 마지막: **75,912**, 피크: **75,912**
+- 합계: **75,960**, 마지막: **75,960**, 피크: **75,960**
 
-![수집 시점 기준 - 연별 스냅샷](charts/snapshots_yearly.png)
+![Snapshots by Fetch Year](charts/snapshots_yearly.png)
 
-## 개설 시점 기준 - 일별 신규 강의
-
-- 합계: **1,434**
-
-![개설 시점 기준 - 일별 신규 강의](charts/published_daily.png)
-
-## 개설 시점 기준 - 월별 신규 강의
+## New Courses by Publish Day
 
 - 합계: **1,434**
 
-![개설 시점 기준 - 월별 신규 강의](charts/published_monthly.png)
+![New Courses by Publish Day](charts/published_daily.png)
 
-## 개설 시점 기준 - 연별 신규 강의
+## New Courses by Publish Month
 
 - 합계: **1,434**
 
-![개설 시점 기준 - 연별 신규 강의](charts/published_yearly.png)
+![New Courses by Publish Month](charts/published_monthly.png)
+
+## New Courses by Publish Year
+
+- 합계: **1,434**
+
+![New Courses by Publish Year](charts/published_yearly.png)
 
 ## 요약
 
-- 누적 강의 수(고유 course_id): **1,259**
+- 누적 강의 수(고유 course_id): **1,260**
 
