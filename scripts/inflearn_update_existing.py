@@ -92,6 +92,8 @@ def set_progress(client, total_done: int, last_batch_done: int):
 def insert_if_rows(client, table: str, rows, cols):
     if not rows:
         return 0
+    if table == "inflearn_course_snapshot_raw":
+        return inflearn_crawl.insert_snapshot_rows_json_each_row(rows)
     client.insert(f"{inflearn_crawl.CH_DATABASE}.{table}", rows, column_names=cols)
     return len(rows)
 
@@ -117,10 +119,16 @@ def main():
 
     # 병렬로 URL 수집/파싱
     results = []
+    failed = 0
     with ThreadPoolExecutor(max_workers=max(1, WORKERS)) as ex:
-        futs = [ex.submit(inflearn_crawl.process_course_url, u, fetched_at) for u in urls]
-        for fut in as_completed(futs):
-            results.append(fut.result())
+        fut_to_url = {ex.submit(inflearn_crawl.process_course_url, u, fetched_at): u for u in urls}
+        for fut in as_completed(fut_to_url):
+            url = fut_to_url[fut]
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                failed += 1
+                print(f"[warn] process_course_url failed url={url} error={type(e).__name__}: {e}")
 
     # 결과 합치기
     snap_rows, dim_rows, metric_rows, price_rows, curri_rows, inst_rows, map_rows = ([] for _ in range(7))
@@ -162,6 +170,8 @@ def main():
     total_done += len(urls)
     set_progress(client, total_done, len(urls))
 
+    if failed:
+        print(f"[warn] failed_urls={failed}")
     print("[inserted]", inserted)
     print("[done]")
 

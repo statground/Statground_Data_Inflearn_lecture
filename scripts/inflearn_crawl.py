@@ -336,14 +336,28 @@ def find_api_data(queries: list[dict], needle: str):
 def to_u8(x) -> int:
     return 1 if x else 0
 
+def clamp_u8_percent(x) -> int:
+    """Clamp discount rate into UInt8-friendly 0..100 range."""
+    try:
+        v = int(float(x))
+    except Exception:
+        return 0
+    if v < 0:
+        return 0
+    if v > 100:
+        return 100
+    return v
+
 def process_course_url(url: str, fetched_at):
     """단일 강의 URL을 처리하여 각 테이블 insert rows를 생성한다.
     - update_existing 배치에서 병렬 호출용
-    - change-only 비교 없이 매번 metric/price row를 생성(테이블이 ReplacingMergeTree라 최신으로 수렴)
+    - snapshot_raw는 매번 생성하여 마지막 수집 시각이 전진하도록 유지
+    - metric/price도 매번 생성(테이블이 ReplacingMergeTree라 최신으로 수렴)
     반환 dict keys:
-      course_dim, metric_fact, price_fact, curriculum_unit, instructor_dim, course_instructor_map
+      snapshot_raw, course_dim, metric_fact, price_fact, curriculum_unit, instructor_dim, course_instructor_map
     """
     rows = {
+        "snapshot_raw": [],
         "course_dim": [],
         "metric_fact": [],
         "price_fact": [],
@@ -368,6 +382,32 @@ def process_course_url(url: str, fetched_at):
 
     page_props = (nd.get("props") or {}).get("pageProps") or {}
     queries = ((page_props.get("dehydratedState") or {}).get("queries") or [])
+
+    # snapshot_raw
+    # update_existing은 inflearn_course_snapshot_raw의 최신 fetched_at이 오래된 강의부터
+    # 다시 고르는 구조이므로, payload 변경 여부와 무관하게 이번 재수집 결과를 기록해야
+    # last_fetched_at이 전진한다.
+    for q in queries:
+        qk = json.dumps(q.get("queryKey"), ensure_ascii=False)
+        payload_obj = (q.get("state") or {}).get("data")
+        if payload_obj is None:
+            continue
+        payload = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":"))
+        payload_hash = h64(payload)
+        qk_hash = h64(qk)
+
+        status_code = "OK"
+        error_code = None
+        if isinstance(payload_obj, dict):
+            if payload_obj.get("statusCode") is not None:
+                status_code = str(payload_obj.get("statusCode"))
+            if payload_obj.get("errorCode") is not None:
+                error_code = str(payload_obj.get("errorCode"))
+
+        rows["snapshot_raw"].append([
+            str(uuid7()), fetched_at, course_id, locale, url,
+            qk, qk_hash, status_code, error_code, payload, payload_hash
+        ])
 
     online_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/online/info")
     meta_info = find_api_data(queries, f"/client/api/v1/course/{course_id}/meta")
