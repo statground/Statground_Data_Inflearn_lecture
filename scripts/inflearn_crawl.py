@@ -23,11 +23,15 @@ def get_session() -> "requests.Session":
     s = getattr(_TLS, "session", None)
     if s is None:
         s = requests.Session()
+        # NOTE:
+        # - Do not force `br` here. GitHub Actions runners may receive Brotli-compressed
+        #   payloads for sitemap/page requests, but requests/urllib3 will not always decode
+        #   them unless an extra Brotli dependency is installed.
+        # - Let requests negotiate a safe Accept-Encoding by itself.
         s.headers.update({
             "User-Agent": UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
-            "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
@@ -110,25 +114,72 @@ def http_get(url: str) -> requests.Response:
         raise RuntimeError(f"Retryable HTTP {r.status_code}")
     return r
 
+def _preview_bytes(data: bytes, limit: int = 160) -> str:
+    return data[:limit].decode("utf-8", errors="replace").replace("\n", " ").replace("\r", " ")
+
+
 def parse_sitemap_locs(xml_bytes: bytes) -> list[str]:
-    root = etree.fromstring(xml_bytes)
+    raw = xml_bytes or b""
+    if raw[:2] == b"\x1f\x8b":
+        import gzip
+        raw = gzip.decompress(raw)
+    raw = raw.lstrip(b"\xef\xbb\xbf\r\n\t ")
+    if not raw:
+        return []
+
+    parser = etree.XMLParser(recover=True, resolve_entities=False, no_network=True)
+    try:
+        root = etree.fromstring(raw, parser=parser)
+    except etree.XMLSyntaxError as e:
+        snippet = _preview_bytes(raw)
+        raise ValueError(f"Invalid sitemap XML: {e}. snippet={snippet!r}") from e
+
     locs = root.xpath(".//sm:loc/text()", namespaces=NS)
+    if not locs:
+        locs = root.xpath(".//*[local-name()='loc']/text()")
     return [x.strip() for x in locs if x and x.strip()]
+
 
 def extract_next_data(html: str) -> dict | None:
     m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
     return json.loads(m.group(1).strip()) if m else None
 
+
+def parse_course_id_from_next_data(nd: dict | None) -> int | None:
+    try:
+        page_props = (nd.get("props") or {}).get("pageProps") or {}
+        queries = ((page_props.get("dehydratedState") or {}).get("queries") or [])
+        for q in queries:
+            qk = json.dumps(q.get("queryKey"), ensure_ascii=False)
+            m = re.search(r"/client/api/v1/course/(\d+)/online/info", qk)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def parse_locale_from_url(url: str) -> str:
+    u = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(u.query)
+    locale = ((qs.get("locale") or [None])[0] or "").strip().lower()
+    if locale:
+        return locale
+    return "en" if u.path.startswith("/en/") else "ko"
+
+
 def parse_course_id_and_locale(url: str) -> tuple[int | None, str]:
     u = urllib.parse.urlparse(url)
     qs = urllib.parse.parse_qs(u.query)
     cid = None
-    if "cid" in qs and qs["cid"]:
-        try:
-            cid = int(qs["cid"][0])
-        except:
-            cid = None
-    locale = "en" if u.path.startswith("/en/") else "ko"
+    for key in ("cid", "courseId", "course_id"):
+        if key in qs and qs[key]:
+            try:
+                cid = int(qs[key][0])
+                break
+            except Exception:
+                cid = None
+    locale = parse_locale_from_url(url)
     return cid, locale
 
 def ch_client():
@@ -238,9 +289,7 @@ def process_course_url(url: str, fetched_at):
         "course_instructor_map": [],
     }
 
-    course_id, locale = parse_course_id_and_locale(url)
-    if not course_id:
-        return rows
+    course_id_hint, locale = parse_course_id_and_locale(url)
 
     page = http_get(url)
     if page.status_code != 200:
@@ -248,6 +297,10 @@ def process_course_url(url: str, fetched_at):
 
     nd = extract_next_data(page.text)
     if not nd:
+        return rows
+
+    course_id = parse_course_id_from_next_data(nd) or course_id_hint
+    if not course_id:
         return rows
 
     page_props = (nd.get("props") or {}).get("pageProps") or {}
@@ -416,41 +469,58 @@ def main():
             if u not in sitemap_urls:
                 sitemap_urls.append(u)
 
-        r = None
+        urls = None
+        status_404_count = 0
+        last_status = None
+        last_error = None
         sm_url = sitemap_urls[0]
+
         for u in sitemap_urls:
             sm_url = u
             try:
                 r = http_get(sm_url)
-            except Exception:
-                # http_get already retries transient errors; keep trying next base if available
-                r = None
-            if r is None:
+            except Exception as e:
+                last_error = f"fetch_error={type(e).__name__}: {e}"
                 continue
-            if r.status_code == 403:
-                # Possible CDN/WAF block - try the next base, and if still blocked, stop gracefully
-                time.sleep(3)
-                continue
-            break
 
-        if r is None:
-            raise RuntimeError(f"Failed to fetch sitemap {sitemap_index}")
-        if r.status_code == 404:
-            print(f"[done] sitemap {sitemap_index} -> 404")
-            set_checkpoint(ch, 0, 0)
-            break
-        if r.status_code != 200:
+            last_status = r.status_code
+            if r.status_code == 404:
+                status_404_count += 1
+                continue
             if r.status_code == 403:
+                # Possible CDN/WAF block - try the next base
+                time.sleep(3)
+                last_error = f"HTTP 403 for {sm_url}"
+                continue
+            if r.status_code != 200:
+                last_error = f"HTTP {r.status_code} for {sm_url}"
+                continue
+
+            try:
+                urls = parse_sitemap_locs(r.content)
+            except Exception as e:
+                last_error = f"invalid sitemap response for {sm_url}: {e}"
+                print(f"[warn] {last_error}")
+                urls = None
+                continue
+
+            if urls:
+                break
+
+            last_error = f"empty sitemap response for {sm_url}"
+            urls = None
+
+        if urls is None:
+            if status_404_count == len(sitemap_urls):
+                print(f"[done] sitemap {sitemap_index} -> 404")
+                set_checkpoint(ch, 0, 0)
+                break
+            if last_status == 403:
                 # Stop gracefully and keep the current checkpoint so the next run can retry.
                 print(f"[warn] sitemap blocked (403). keep checkpoint sitemap_index={sitemap_index}, url_index=0")
                 set_checkpoint(ch, sitemap_index, 0)
                 return
-            raise RuntimeError(f"Unexpected status {r.status_code} for {sm_url}")
-
-        urls = parse_sitemap_locs(r.content)
-        if not urls:
-            set_checkpoint(ch, sitemap_index, 0)
-            break
+            raise RuntimeError(last_error or f"Failed to fetch/parse sitemap {sitemap_index}")
 
         i = offset
         while i < len(urls):
@@ -461,19 +531,17 @@ def main():
 
             url = urls[i]; i += 1
             scanned += 1
-            course_id, locale = parse_course_id_and_locale(url)
-            if not course_id:
-                continue
+            course_id_hint, locale = parse_course_id_and_locale(url)
 
-            # Skip HTTP fetch if we already have this course in course_dim (collect_new only cares about brand-new courses).
-            key = (course_id, locale)
-            exists = exists_cache.get(key)
-            if exists is None:
-                exists = course_exists(ch, course_id, locale)
-                exists_cache[key] = exists
-            if exists:
-                continue
-
+            # Fast-path skip when sitemap URL already exposes the course id.
+            if course_id_hint:
+                key = (course_id_hint, locale)
+                exists = exists_cache.get(key)
+                if exists is None:
+                    exists = course_exists(ch, course_id_hint, locale)
+                    exists_cache[key] = exists
+                if exists:
+                    continue
 
             page = http_get(url)
             if page.status_code != 200:
@@ -481,6 +549,19 @@ def main():
 
             nd = extract_next_data(page.text)
             if not nd:
+                continue
+
+            course_id = parse_course_id_from_next_data(nd) or course_id_hint
+            if not course_id:
+                continue
+
+            # Slow-path skip for sitemap URLs without cid hint.
+            key = (course_id, locale)
+            exists = exists_cache.get(key)
+            if exists is None:
+                exists = course_exists(ch, course_id, locale)
+                exists_cache[key] = exists
+            if exists:
                 continue
 
             page_props = (nd.get("props") or {}).get("pageProps") or {}
