@@ -98,6 +98,7 @@ CH_PORT = _parse_port_any(["CH_PORT", "CLICKHOUSE_PORT"], 8123)
 CH_USER = _get_env_any(["CH_USER", "CLICKHOUSE_USER"], "default")
 CH_PASSWORD = _get_env_any(["CH_PASSWORD", "CLICKHOUSE_PASSWORD"], "")
 CH_DATABASE = _get_env_any(["CH_DATABASE", "CLICKHOUSE_DATABASE"], "statground_lecture")
+CH_SECURE = _get_env_any(["CH_SECURE", "CLICKHOUSE_SECURE"], "0").lower() in {"1", "true", "yes", "y", "on"}
 
 SITEMAP_BASE = _get_env("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps").rstrip("/")
 SITEMAP_BASE_FALLBACK = _get_env("SITEMAP_BASE_FALLBACK", "https://www.inflearn.com/sitemaps").rstrip("/")
@@ -187,7 +188,69 @@ def ch_client():
         host=CH_HOST, port=CH_PORT,
         username=CH_USER, password=CH_PASSWORD,
         database=CH_DATABASE,
+        secure=CH_SECURE,
     )
+
+
+def _dt64_text(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KST)
+    dt = dt.astimezone(KST)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def insert_snapshot_rows_json_each_row(rows: list[list]):
+    """Insert snapshot_raw rows via JSONEachRow over HTTP.
+
+    Why this path exists:
+    - inflearn_course_snapshot_raw.payload is a ClickHouse JSON column.
+    - clickhouse-connect 0.7.x predates the new JSON type support and can fail with
+      `Invalid version for Object structure serialization` on Native inserts.
+    - JSONEachRow is a stable text-format path for JSON columns.
+    """
+    if not rows:
+        return 0
+
+    scheme = "https" if CH_SECURE else "http"
+    url = f"{scheme}://{CH_HOST}:{CH_PORT}/"
+    query = (
+        f"INSERT INTO {CH_DATABASE}.inflearn_course_snapshot_raw "
+        f"(uuid, fetched_at, course_id, locale, source_url, query_key, query_key_hash, "
+        f"status_code, error_code, payload, payload_hash) FORMAT JSONEachRow"
+    )
+
+    body_lines = []
+    for row in rows:
+        payload_value = json.loads(row[9]) if isinstance(row[9], str) else row[9]
+        line = {
+            "uuid": row[0],
+            "fetched_at": _dt64_text(row[1]),
+            "course_id": row[2],
+            "locale": row[3],
+            "source_url": row[4],
+            "query_key": row[5],
+            "query_key_hash": row[6],
+            "status_code": row[7],
+            "error_code": row[8],
+            "payload": payload_value,
+            "payload_hash": row[10],
+        }
+        body_lines.append(json.dumps(line, ensure_ascii=False, separators=(",", ":"), default=str))
+
+    resp = requests.post(
+        url,
+        params={"query": query},
+        data=("\n".join(body_lines) + "\n").encode("utf-8"),
+        auth=(CH_USER, CH_PASSWORD),
+        headers={"Content-Type": "application/x-ndjson; charset=utf-8"},
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        snippet = resp.text[:500].replace("\n", " ").replace("\r", " ")
+        raise RuntimeError(
+            f"snapshot_raw JSONEachRow insert failed: HTTP {resp.status_code}. response={snippet!r}"
+        )
+    return len(rows)
 
 def get_checkpoint(ch) -> tuple[int, int]:
     sql = f"""
@@ -458,6 +521,9 @@ def main():
     scanned = 0    # number of URLs scanned
     exists_cache: dict[tuple[int,str], bool] = {}
     snap_rows, dim_rows, metric_rows, price_rows, curri_rows, inst_rows, map_rows = ([] for _ in range(7))
+    next_checkpoint_sitemap = sitemap_index
+    next_checkpoint_url = offset
+    reset_checkpoint_after_insert = False
 
     while True:
         # Try primary sitemap base first, then fallback (some environments may get 403 from CDN)
@@ -513,20 +579,20 @@ def main():
         if urls is None:
             if status_404_count == len(sitemap_urls):
                 print(f"[done] sitemap {sitemap_index} -> 404")
-                set_checkpoint(ch, 0, 0)
+                reset_checkpoint_after_insert = True
                 break
             if last_status == 403:
                 # Stop gracefully and keep the current checkpoint so the next run can retry.
-                print(f"[warn] sitemap blocked (403). keep checkpoint sitemap_index={sitemap_index}, url_index=0")
-                set_checkpoint(ch, sitemap_index, 0)
-                return
+                print(f"[warn] sitemap blocked (403). will keep checkpoint sitemap_index={sitemap_index}, url_index=0 after successful inserts")
+                next_checkpoint_sitemap, next_checkpoint_url = sitemap_index, 0
+                break
             raise RuntimeError(last_error or f"Failed to fetch/parse sitemap {sitemap_index}")
 
         i = offset
         while i < len(urls):
             if BATCH_SIZE > 0 and processed >= BATCH_SIZE:
-                set_checkpoint(ch, sitemap_index, i)
-                print(f"[batch] limit hit. saved checkpoint sitemap={sitemap_index} offset={i}")
+                next_checkpoint_sitemap, next_checkpoint_url = sitemap_index, i
+                print(f"[batch] limit hit. will save checkpoint after successful inserts sitemap={sitemap_index} offset={i}")
                 break
 
             url = urls[i]; i += 1
@@ -723,12 +789,15 @@ def main():
                 print(f"[progress] scanned={scanned} fetched={processed} last_course_id={course_id} sitemap={sitemap_index} offset={i}")
             jitter_sleep(SLEEP_MIN, SLEEP_MAX)
 
+        if reset_checkpoint_after_insert:
+            break
+
         if BATCH_SIZE > 0 and processed >= BATCH_SIZE:
             break
 
         sitemap_index += 1
         offset = 0
-        set_checkpoint(ch, sitemap_index, 0)
+        next_checkpoint_sitemap, next_checkpoint_url = sitemap_index, 0
         jitter_sleep(SLEEP_MIN, SLEEP_MAX)
 
     def insert_if_rows(table, rows, cols):
@@ -738,8 +807,7 @@ def main():
         return len(rows)
 
     inserted = {
-        "snapshot_raw": insert_if_rows("inflearn_course_snapshot_raw", snap_rows,
-            ["uuid","fetched_at","course_id","locale","source_url","query_key","query_key_hash","status_code","error_code","payload","payload_hash"]),
+        "snapshot_raw": insert_snapshot_rows_json_each_row(snap_rows),
         "course_dim": insert_if_rows("inflearn_course_dim", dim_rows,
             ["course_id","locale","fetched_at","slug","en_slug","status","title","description","thumbnail_url",
              "category_main_title","category_main_slug","category_sub_title","category_sub_slug",
@@ -761,6 +829,13 @@ def main():
         "course_instructor_map": insert_if_rows("inflearn_course_instructor_map", map_rows,
             ["fetched_at","course_id","instructor_id","role"]),
     }
+
+    if reset_checkpoint_after_insert:
+        set_checkpoint(ch, 0, 0)
+        print("[checkpoint] reset to sitemap_index=0, url_index=0")
+    else:
+        set_checkpoint(ch, next_checkpoint_sitemap, next_checkpoint_url)
+        print(f"[checkpoint] saved sitemap_index={next_checkpoint_sitemap}, url_index={next_checkpoint_url}")
 
     print("[inserted]", inserted)
     print("[done]")

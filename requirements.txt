@@ -1,7 +1,7 @@
 requests==2.32.3
 lxml==5.2.2
 beautifulsoup4==4.12.3
-clickhouse-connect==0.7.16
+clickhouse-connect==0.8.17
 uuid6==2024.7.10
 tenacity==8.5.0
 matplotlib==3.9.2
