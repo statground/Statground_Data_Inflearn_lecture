@@ -2,7 +2,7 @@ name: Inflearn - Collect New Courses
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  run:
+  collect_new:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -53,3 +53,50 @@ jobs:
           OPTIMIZE_MONTHS: "2"
         run: |
           python scripts/inflearn_optimize.py
+
+  stats_report:
+    needs: collect_new
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: inflearn-stats-report
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Korean font for charts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+          fc-cache -fv
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install clickhouse-connect matplotlib; fi
+
+      - name: Generate stats report (md + charts)
+        env:
+          CH_HOST: ${{ secrets.CH_HOST }}
+          CH_PORT: ${{ secrets.CH_PORT }}
+          CH_USER: ${{ secrets.CH_USER }}
+          CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
+          CH_DATABASE: ${{ secrets.CH_DATABASE }}
+          STATS_LOOKBACK_DAYS: "365"
+        run: |
+          python scripts/inflearn_stats.py
+
+      - name: Commit reports
+        env:
+          STATS_COMMIT_MESSAGE: "chore(stats): inflearn report update after collect_new batch"
+        run: |
+          bash scripts/inflearn_commit_reports.sh
