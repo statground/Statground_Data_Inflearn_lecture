@@ -119,12 +119,44 @@ def _preview_bytes(data: bytes, limit: int = 160) -> str:
     return data[:limit].decode("utf-8", errors="replace").replace("\n", " ").replace("\r", " ")
 
 
-def parse_sitemap_locs(xml_bytes: bytes) -> list[str]:
+def _normalize_xml_bytes(xml_bytes: bytes) -> bytes:
     raw = xml_bytes or b""
     if raw[:2] == b"\x1f\x8b":
         import gzip
         raw = gzip.decompress(raw)
-    raw = raw.lstrip(b"\xef\xbb\xbf\r\n\t ")
+    return raw.lstrip(b"\xef\xbb\xbf\r\n\t ")
+
+
+def is_access_denied_sitemap(xml_bytes: bytes) -> bool:
+    raw = _normalize_xml_bytes(xml_bytes)
+    if not raw:
+        return False
+
+    # Fast-path string check for CDN/WAF style XML error pages.
+    head = raw[:4096]
+    if b"<Error" in head and b"<Code>AccessDenied</Code>" in head:
+        return True
+
+    parser = etree.XMLParser(recover=True, resolve_entities=False, no_network=True)
+    try:
+        root = etree.fromstring(raw, parser=parser)
+    except Exception:
+        return False
+
+    try:
+        root_name = etree.QName(root).localname.lower()
+    except Exception:
+        root_name = str(getattr(root, "tag", "")).lower()
+
+    if root_name != "error":
+        return False
+
+    code_values = root.xpath(".//*[local-name()='Code']/text()")
+    return any(str(x).strip() == "AccessDenied" for x in code_values)
+
+
+def parse_sitemap_locs(xml_bytes: bytes) -> list[str]:
+    raw = _normalize_xml_bytes(xml_bytes)
     if not raw:
         return []
 
@@ -577,8 +609,10 @@ def main():
 
         urls = None
         status_404_count = 0
+        saw_403 = False
         last_status = None
         last_error = None
+        attempt_summaries = []
         sm_url = sitemap_urls[0]
 
         for u in sitemap_urls:
@@ -586,34 +620,51 @@ def main():
             try:
                 r = http_get(sm_url)
             except Exception as e:
-                last_error = f"fetch_error={type(e).__name__}: {e}"
+                msg = f"fetch_error={type(e).__name__}: {e}"
+                attempt_summaries.append(f"{sm_url} -> {msg}")
+                last_error = msg
                 continue
 
             last_status = r.status_code
             if r.status_code == 404:
                 status_404_count += 1
+                attempt_summaries.append(f"{sm_url} -> HTTP 404")
                 continue
             if r.status_code == 403:
-                # Possible CDN/WAF block - try the next base
+                # Possible CDN/WAF block - try the next base.
+                saw_403 = True
                 time.sleep(3)
                 last_error = f"HTTP 403 for {sm_url}"
+                attempt_summaries.append(f"{sm_url} -> HTTP 403")
                 continue
             if r.status_code != 200:
                 last_error = f"HTTP {r.status_code} for {sm_url}"
+                attempt_summaries.append(f"{sm_url} -> HTTP {r.status_code}")
+                continue
+
+            if is_access_denied_sitemap(r.content):
+                # Some endpoints return a 200 + XML <Error><Code>AccessDenied</Code></Error>
+                # instead of a plain HTTP 403.
+                saw_403 = True
+                last_error = f"AccessDenied sitemap response for {sm_url}"
+                attempt_summaries.append(f"{sm_url} -> AccessDenied XML")
                 continue
 
             try:
                 urls = parse_sitemap_locs(r.content)
             except Exception as e:
                 last_error = f"invalid sitemap response for {sm_url}: {e}"
+                attempt_summaries.append(f"{sm_url} -> invalid XML")
                 print(f"[warn] {last_error}")
                 urls = None
                 continue
 
             if urls:
+                attempt_summaries.append(f"{sm_url} -> OK ({len(urls)} urls)")
                 break
 
             last_error = f"empty sitemap response for {sm_url}"
+            attempt_summaries.append(f"{sm_url} -> empty sitemap")
             urls = None
 
         if urls is None:
@@ -621,10 +672,16 @@ def main():
                 print(f"[done] sitemap {sitemap_index} -> 404")
                 reset_checkpoint_after_insert = True
                 break
-            if last_status == 403:
-                # Stop gracefully and keep the current checkpoint so the next run can retry.
-                print(f"[warn] sitemap blocked (403). will keep checkpoint sitemap_index={sitemap_index}, url_index=0 after successful inserts")
-                next_checkpoint_sitemap, next_checkpoint_url = sitemap_index, 0
+            if saw_403:
+                # Graceful stop: one base was blocked (403 / AccessDenied) while others may be 404.
+                # Keep the exact checkpoint so the next run can retry from the same sitemap.
+                attempts_text = "; ".join(attempt_summaries)
+                print(
+                    f"[warn] sitemap temporarily unavailable. "
+                    f"will keep checkpoint sitemap_index={sitemap_index}, url_index={offset}. "
+                    f"attempts={attempts_text}"
+                )
+                next_checkpoint_sitemap, next_checkpoint_url = sitemap_index, offset
                 break
             raise RuntimeError(last_error or f"Failed to fetch/parse sitemap {sitemap_index}")
 
