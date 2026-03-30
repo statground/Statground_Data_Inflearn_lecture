@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <text x="70" y="28" font-size="20" font-weight="600">개설 시점 기준 - 월별 신규 강의</text>
+  <text x="70" y="402" font-size="12" fill="#555">강의 수</text>
+  <line x1="70" y1="350.00" x2="980" y2="350.00" stroke="#e5e7eb" stroke-width="1"/>
+  <text x="62" y="354.00" font-size="11" fill="#6b7280" text-anchor="end">0</text>
+  <line x1="70" y1="290.00" x2="980" y2="290.00" stroke="#e5e7eb" stroke-width="1"/>
+  <text x="62" y="294.00" font-size="11" fill="#6b7280" text-anchor="end">73</text>
+  <line x1="70" y1="230.00" x2="980" y2="230.00" stroke="#e5e7eb" stroke-width="1"/>
+  <text x="62" y="234.00" font-size="11" fill="#6b7280" text-anchor="end">147</text>
+  <line x1="70" y1="170.00" x2="980" y2="170.00" stroke="#e5e7eb" stroke-width="1"/>
+  <text x="62" y="174.00" font-size="11" fill="#6b7280" text-anchor="end">221</text>
+  <line x1="70" y1="110.00" x2="980" y2="110.00" stroke="#e5e7eb" stroke-width="1"/>
+  <text x="62" y="114.00" font-size="11" fill="#6b7280" text-anchor="end">295</text>
+  <line x1="70" y1="50.00" x2="980" y2="50.00" stroke="#e5e7eb" stroke-width="1"/>
+  <text x="62" y="54.00" font-size="11" fill="#6b7280" text-anchor="end">369</text>
+  <line x1="70" y1="350" x2="980" y2="350" stroke="#111827" stroke-width="1.2"/>
+  <line x1="70" y1="50" x2="70" y2="350" stroke="#111827" stroke-width="1.2"/>
+  <line x1="70.00" y1="350" x2="70.00" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="70.00" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2025-03</text>
+  <line x1="145.83" y1="350" x2="145.83" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="145.83" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2025-04</text>
+  <line x1="221.67" y1="350" x2="221.67" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="221.67" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2025-05</text>
+  <line x1="297.50" y1="350" x2="297.50" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="297.50" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2025-06</text>
+  <line x1="373.33" y1="350" x2="373.33" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="373.33" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2025-07</text>
+  <line x1="449.17" y1="350" x2="449.17" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="449.17" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2025-08</text>
+  <line x1="525.00" y1="350" x2="525.00" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="525.00" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2025-09</text>
+  <line x1="600.83" y1="350" x2="600.83" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="600.83" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2025-10</text>
+  <line x1="676.67" y1="350" x2="676.67" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="676.67" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2025-11</text>
+  <line x1="752.50" y1="350" x2="752.50" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="752.50" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2025-12</text>
+  <line x1="828.33" y1="350" x2="828.33" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="828.33" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2026-01</text>
+  <line x1="904.17" y1="350" x2="904.17" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="904.17" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2026-02</text>
+  <line x1="980.00" y1="350" x2="980.00" y2="356" stroke="#9ca3af" stroke-width="1"/>
+  <text x="980.00" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2026-03</text>
+  <polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="70.00,341.87 145.83,223.17 221.67,187.40 297.50,50.00 373.33,122.36 449.17,187.40 525.00,215.85 600.83,163.01 676.67,139.43 752.50,176.02 828.33,166.26 904.17,133.74 980.00,293.90"/>
+  <circle cx="70.00" cy="341.87" r="2.5" fill="#2563eb"/>
+  <circle cx="145.83" cy="223.17" r="2.5" fill="#2563eb"/>
+  <circle cx="221.67" cy="187.40" r="2.5" fill="#2563eb"/>
+  <circle cx="297.50" cy="50.00" r="2.5" fill="#2563eb"/>
+  <circle cx="373.33" cy="122.36" r="2.5" fill="#2563eb"/>
+  <circle cx="449.17" cy="187.40" r="2.5" fill="#2563eb"/>
+  <circle cx="525.00" cy="215.85" r="2.5" fill="#2563eb"/>
+  <circle cx="600.83" cy="163.01" r="2.5" fill="#2563eb"/>
+  <circle cx="676.67" cy="139.43" r="2.5" fill="#2563eb"/>
+  <circle cx="752.50" cy="176.02" r="2.5" fill="#2563eb"/>
+  <circle cx="828.33" cy="166.26" r="2.5" fill="#2563eb"/>
+  <circle cx="904.17" cy="133.74" r="2.5" fill="#2563eb"/>
+  <circle cx="980.00" cy="293.90" r="2.5" fill="#2563eb"/>
+</svg>
