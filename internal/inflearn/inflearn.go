@@ -821,8 +821,8 @@ func (s *Service) CHInsertRows(ctx context.Context, table string, rows []map[str
 func (s *Service) getCheckpoint(ctx context.Context, source string) (Checkpoint, error) {
 	sql := fmt.Sprintf(`
         SELECT
-          toInt32OrZero(ifNull(argMax(sitemap_index, updated_at), 0)) AS sitemap_index,
-          toInt32OrZero(ifNull(argMax(url_index, updated_at), 0)) AS url_index
+          argMax(sitemap_index, updated_at) AS sitemap_index,
+          argMax(url_index, updated_at) AS url_index
         FROM %s.inflearn_crawl_checkpoint
         WHERE source = %s
     `, s.Cfg.CHDatabase, QuoteSQLString(source))
