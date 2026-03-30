@@ -10,24 +10,25 @@ permissions:
 
 concurrency:
   group: inflearn-collect-new
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   collect_new:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
-          python-version: "3.11"
+          go-version-file: go.mod
+          cache: true
 
-      - name: Install dependencies
+      - name: Build
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install clickhouse-connect requests lxml tenacity uuid6; fi
+          go build ./...
 
       - name: Collect new courses (batch)
         env:
@@ -36,12 +37,14 @@ jobs:
           CH_USER: ${{ secrets.CH_USER }}
           CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
           CH_DATABASE: ${{ secrets.CH_DATABASE }}
+          CH_SECURE: ${{ secrets.CH_SECURE }}
           BATCH_SIZE: "100"
-          WORKERS: "8"
+          MAX_URLS_PER_RUN: "1500"
+          CHECKPOINT_FLUSH_EVERY: "200"
           REQUEST_SLEEP_MIN: "0.2"
           REQUEST_SLEEP_MAX: "0.6"
         run: |
-          python scripts/inflearn_collect_new.py
+          go run ./cmd/inflearn-collect-new
 
       - name: Optimize tables (FINAL)
         env:
@@ -50,13 +53,15 @@ jobs:
           CH_USER: ${{ secrets.CH_USER }}
           CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
           CH_DATABASE: ${{ secrets.CH_DATABASE }}
+          CH_SECURE: ${{ secrets.CH_SECURE }}
           OPTIMIZE_MONTHS: "2"
         run: |
-          python scripts/inflearn_optimize.py
+          go run ./cmd/inflearn-optimize
 
   stats_report:
     needs: collect_new
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     concurrency:
@@ -64,36 +69,27 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
-          python-version: "3.11"
+          go-version-file: go.mod
+          cache: true
 
-      - name: Install Korean font for charts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk
-          fc-cache -fv
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install clickhouse-connect matplotlib; fi
-
-      - name: Generate stats report (md + charts)
+      - name: Generate stats report (md + svg)
         env:
           CH_HOST: ${{ secrets.CH_HOST }}
           CH_PORT: ${{ secrets.CH_PORT }}
           CH_USER: ${{ secrets.CH_USER }}
           CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
           CH_DATABASE: ${{ secrets.CH_DATABASE }}
+          CH_SECURE: ${{ secrets.CH_SECURE }}
           STATS_LOOKBACK_DAYS: "365"
         run: |
-          python scripts/inflearn_stats.py
+          go run ./cmd/inflearn-stats
 
       - name: Commit reports
         env:
