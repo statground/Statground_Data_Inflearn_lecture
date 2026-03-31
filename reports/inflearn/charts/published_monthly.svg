@@ -41,17 +41,17 @@
   <text x="897.27" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2026-02</text>
   <line x1="980.00" y1="350" x2="980.00" y2="356" stroke="#9ca3af" stroke-width="1"/>
   <text x="980.00" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2026-03</text>
-  <polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="70.00,225.14 152.73,187.84 235.45,50.00 318.18,122.16 400.91,186.22 483.64,214.59 566.36,162.70 649.09,135.14 731.82,175.68 814.55,165.14 897.27,131.08 980.00,292.43"/>
-  <circle cx="70.00" cy="225.14" r="2.5" fill="#2563eb"/>
-  <circle cx="152.73" cy="187.84" r="2.5" fill="#2563eb"/>
+  <polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="70.00,223.51 152.73,187.03 235.45,50.00 318.18,119.73 400.91,186.22 483.64,213.78 566.36,160.27 649.09,133.51 731.82,171.62 814.55,162.70 897.27,127.03 980.00,292.43"/>
+  <circle cx="70.00" cy="223.51" r="2.5" fill="#2563eb"/>
+  <circle cx="152.73" cy="187.03" r="2.5" fill="#2563eb"/>
   <circle cx="235.45" cy="50.00" r="2.5" fill="#2563eb"/>
-  <circle cx="318.18" cy="122.16" r="2.5" fill="#2563eb"/>
+  <circle cx="318.18" cy="119.73" r="2.5" fill="#2563eb"/>
   <circle cx="400.91" cy="186.22" r="2.5" fill="#2563eb"/>
-  <circle cx="483.64" cy="214.59" r="2.5" fill="#2563eb"/>
-  <circle cx="566.36" cy="162.70" r="2.5" fill="#2563eb"/>
-  <circle cx="649.09" cy="135.14" r="2.5" fill="#2563eb"/>
-  <circle cx="731.82" cy="175.68" r="2.5" fill="#2563eb"/>
-  <circle cx="814.55" cy="165.14" r="2.5" fill="#2563eb"/>
-  <circle cx="897.27" cy="131.08" r="2.5" fill="#2563eb"/>
+  <circle cx="483.64" cy="213.78" r="2.5" fill="#2563eb"/>
+  <circle cx="566.36" cy="160.27" r="2.5" fill="#2563eb"/>
+  <circle cx="649.09" cy="133.51" r="2.5" fill="#2563eb"/>
+  <circle cx="731.82" cy="171.62" r="2.5" fill="#2563eb"/>
+  <circle cx="814.55" cy="162.70" r="2.5" fill="#2563eb"/>
+  <circle cx="897.27" cy="127.03" r="2.5" fill="#2563eb"/>
   <circle cx="980.00" cy="292.43" r="2.5" fill="#2563eb"/>
 </svg>
