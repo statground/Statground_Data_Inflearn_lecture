@@ -23,8 +23,8 @@
   <text x="525.00" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2026-03</text>
   <line x1="980.00" y1="350" x2="980.00" y2="356" stroke="#9ca3af" stroke-width="1"/>
   <text x="980.00" y="372" font-size="10" fill="#6b7280" text-anchor="middle">2026-04</text>
-  <polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="70.00,344.19 525.00,50.00 980.00,261.46"/>
+  <polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="70.00,344.19 525.00,50.00 980.00,260.96"/>
   <circle cx="70.00" cy="344.19" r="2.5" fill="#2563eb"/>
   <circle cx="525.00" cy="50.00" r="2.5" fill="#2563eb"/>
-  <circle cx="980.00" cy="261.46" r="2.5" fill="#2563eb"/>
+  <circle cx="980.00" cy="260.96" r="2.5" fill="#2563eb"/>
 </svg>
