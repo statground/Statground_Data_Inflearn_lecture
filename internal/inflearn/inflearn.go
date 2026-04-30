@@ -15,9 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,7 +42,22 @@ type Config struct {
 	CHUser               string
 	CHPassword           string
 	CHDatabase           string
+	CHRawDatabase        string
+	CHServiceDatabase    string
+	CHLogDatabase        string
+	CHMartDatabase       string
 	CHSecure             bool
+	IngestMode           string
+	LectureProvider      string
+	KafkaBrokers         []string
+	KafkaUsername        string
+	KafkaPassword        string
+	KafkaTopic           string
+	KafkaClientID        string
+	KafkaBatchSize       int
+	KafkaBatchTimeout    time.Duration
+	ProducerSource       string
+	ProducerIP           string
 	SitemapBase          string
 	SitemapBaseFallback  string
 	SitemapPrefix        string
@@ -55,8 +68,6 @@ type Config struct {
 	Workers              int
 	RequestSleepMin      time.Duration
 	RequestSleepMax      time.Duration
-	OptimizeMonths       int
-	StatsLookbackDays    int
 	UserAgent            string
 }
 
@@ -108,11 +119,6 @@ type updateResult struct {
 	Err  error
 }
 
-type bucketCount struct {
-	Bucket string
-	Count  int64
-}
-
 func loadKST() *time.Location {
 	loc, err := time.LoadLocation("Asia/Seoul")
 	if err != nil {
@@ -131,8 +137,23 @@ func LoadConfig() (Config, error) {
 		CHPort:               parsePort(envFirst("CH_PORT", "CLICKHOUSE_PORT"), 8123),
 		CHUser:               envFirstDefault([]string{"CH_USER", "CLICKHOUSE_USER"}, "default"),
 		CHPassword:           envFirstDefault([]string{"CH_PASSWORD", "CLICKHOUSE_PASSWORD"}, ""),
-		CHDatabase:           envFirstDefault([]string{"CH_DATABASE", "CLICKHOUSE_DATABASE"}, "statground_lecture"),
+		CHDatabase:           envFirstDefault([]string{"CH_DATABASE", "CLICKHOUSE_DATABASE"}, "Data_Lecture_Inflearn_Raw"),
+		CHRawDatabase:        envDefault("CH_RAW_DATABASE", "Data_Lecture_Inflearn_Raw"),
+		CHServiceDatabase:    envDefault("CH_SERVICE_DATABASE", "Data_Lecture_Inflearn_Service"),
+		CHLogDatabase:        envDefault("CH_LOG_DATABASE", "Data_Lecture_Inflearn_Log"),
+		CHMartDatabase:       envDefault("CH_MART_DATABASE", "Data_Lecture_Inflearn_Mart"),
 		CHSecure:             parseBool(envFirstDefault([]string{"CH_SECURE", "CLICKHOUSE_SECURE"}, "0")),
+		IngestMode:           strings.ToLower(envDefault("INGEST_MODE", "kafka")),
+		LectureProvider:      envDefault("LECTURE_PROVIDER", "inflearn"),
+		KafkaBrokers:         splitCSV(envDefault("KAFKA_BROKERS", "")),
+		KafkaUsername:        envDefault("KAFKA_USERNAME", ""),
+		KafkaPassword:        envDefault("KAFKA_PASSWORD", ""),
+		KafkaTopic:           envDefault("KAFKA_TOPIC", "lecture.events"),
+		KafkaClientID:        envDefault("KAFKA_CLIENT_ID", "statground-inflearn-crawler"),
+		KafkaBatchSize:       parsePositiveInt(envDefault("KAFKA_BATCH_SIZE", "100"), 100),
+		KafkaBatchTimeout:    parseSecondsDefault(envDefault("KAFKA_BATCH_TIMEOUT", "1.0"), time.Second),
+		ProducerSource:       envDefault("PRODUCER_SOURCE", "github_actions"),
+		ProducerIP:           envDefault("PRODUCER_IP", "::"),
 		SitemapBase:          strings.TrimRight(envDefault("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps"), "/"),
 		SitemapBaseFallback:  strings.TrimRight(envDefault("SITEMAP_BASE_FALLBACK", "https://www.inflearn.com/sitemaps"), "/"),
 		SitemapPrefix:        envDefault("SITEMAP_PREFIX", "sitemap-courseDetail-"),
@@ -143,9 +164,19 @@ func LoadConfig() (Config, error) {
 		Workers:              parsePositiveInt(envDefault("WORKERS", "8"), 8),
 		RequestSleepMin:      parseSeconds(envDefault("REQUEST_SLEEP_MIN", "0.2")),
 		RequestSleepMax:      parseSeconds(envDefault("REQUEST_SLEEP_MAX", "0.6")),
-		OptimizeMonths:       parsePositiveInt(envDefault("OPTIMIZE_MONTHS", "2"), 2),
-		StatsLookbackDays:    parsePositiveInt(envDefault("STATS_LOOKBACK_DAYS", "365"), 365),
 		UserAgent:            envDefault("CRAWLER_USER_AGENT", "Mozilla/5.0 (compatible; StatgroundCrawler/2.0; +https://www.statground.net)"),
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.IngestMode)) {
+	case "kafka", "kafka_clickhouse", "kafka-clickhouse", "event", "events":
+		cfg.IngestMode = "kafka"
+	default:
+		return Config{}, fmt.Errorf("unsupported INGEST_MODE=%q; Statground Inflearn crawler now supports Kafka ingestion only", cfg.IngestMode)
+	}
+	if len(cfg.KafkaBrokers) == 0 {
+		return Config{}, fmt.Errorf("missing required env: KAFKA_BROKERS")
+	}
+	if strings.TrimSpace(cfg.KafkaTopic) == "" {
+		return Config{}, fmt.Errorf("missing required env: KAFKA_TOPIC")
 	}
 	return cfg, nil
 }
@@ -233,6 +264,14 @@ func parseSeconds(raw string) time.Duration {
 		return 0
 	}
 	return time.Duration(v * float64(time.Second))
+}
+
+func parseSecondsDefault(raw string, fallback time.Duration) time.Duration {
+	out := parseSeconds(raw)
+	if out <= 0 {
+		return fallback
+	}
+	return out
 }
 
 func NowDT64() time.Time {
@@ -728,7 +767,11 @@ func (s *Service) chBaseURL() string {
 
 func (s *Service) chPost(ctx context.Context, sql string, data []byte, contentType string) ([]byte, error) {
 	values := url.Values{}
-	values.Set("database", s.Cfg.CHDatabase)
+	database := s.Cfg.CHRawDatabase
+	if strings.TrimSpace(database) == "" {
+		database = s.Cfg.CHDatabase
+	}
+	values.Set("database", database)
 	if len(data) > 0 {
 		values.Set("query", sql)
 	}
@@ -771,13 +814,6 @@ func (s *Service) chPost(ctx context.Context, sql string, data []byte, contentTy
 	return out, nil
 }
 
-func (s *Service) CHExec(ctx context.Context, sql string) error {
-	execCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	_, err := s.chPost(execCtx, sql, nil, "text/plain; charset=utf-8")
-	return err
-}
-
 func (s *Service) CHQueryRows(ctx context.Context, sql string) ([]map[string]any, error) {
 	sql = strings.TrimSpace(sql)
 	upper := strings.ToUpper(sql)
@@ -799,33 +835,14 @@ func (s *Service) CHQueryRows(ctx context.Context, sql string) ([]map[string]any
 	return resp.Data, nil
 }
 
-func (s *Service) CHInsertRows(ctx context.Context, table string, rows []map[string]any) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	for _, row := range rows {
-		if err := enc.Encode(row); err != nil {
-			return err
-		}
-	}
-	insertSQL := fmt.Sprintf("INSERT INTO %s.%s FORMAT JSONEachRow", s.Cfg.CHDatabase, table)
-	insertCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-	defer cancel()
-	_, err := s.chPost(insertCtx, insertSQL, buf.Bytes(), "application/x-ndjson; charset=utf-8")
-	return err
-}
-
 func (s *Service) getCheckpoint(ctx context.Context, source string) (Checkpoint, error) {
 	sql := fmt.Sprintf(`
         SELECT
           argMax(sitemap_index, updated_at) AS sitemap_index,
           argMax(url_index, updated_at) AS url_index
-        FROM %s.inflearn_crawl_checkpoint
+        FROM %s.inflearn_crawl_checkpoint FINAL
         WHERE source = %s
-    `, s.Cfg.CHDatabase, QuoteSQLString(source))
+    `, chIdent(s.Cfg.CHRawDatabase), QuoteSQLString(source))
 	rows, err := s.CHQueryRows(ctx, sql)
 	if err != nil {
 		return Checkpoint{}, err
@@ -833,28 +850,19 @@ func (s *Service) getCheckpoint(ctx context.Context, source string) (Checkpoint,
 	if len(rows) == 0 {
 		return Checkpoint{}, nil
 	}
-	return Checkpoint{
-		SitemapIndex: asInt(rows[0]["sitemap_index"]),
-		URLIndex:     asInt(rows[0]["url_index"]),
-	}, nil
+	return Checkpoint{SitemapIndex: asInt(rows[0]["sitemap_index"]), URLIndex: asInt(rows[0]["url_index"])}, nil
 }
 
 func (s *Service) setCheckpoint(ctx context.Context, source string, cp Checkpoint) error {
-	row := map[string]any{
-		"source":        source,
-		"updated_at":    FormatCHTime(NowDT64()),
-		"sitemap_index": cp.SitemapIndex,
-		"url_index":     cp.URLIndex,
-	}
-	return s.CHInsertRows(ctx, "inflearn_crawl_checkpoint", []map[string]any{row})
+	return s.PublishCheckpoint(ctx, source, cp)
 }
 
 func (s *Service) courseExists(ctx context.Context, courseID int, locale string) (bool, error) {
 	sql := fmt.Sprintf(`
         SELECT count() AS c
-        FROM %s.inflearn_course_dim
+        FROM %s.inflearn_course_dim FINAL
         WHERE course_id = %d AND locale = %s
-    `, s.Cfg.CHDatabase, courseID, QuoteSQLString(locale))
+    `, chIdent(s.Cfg.CHServiceDatabase), courseID, QuoteSQLString(locale))
 	rows, err := s.CHQueryRows(ctx, sql)
 	if err != nil {
 		return false, err
@@ -1047,28 +1055,7 @@ func (r *CourseRows) Reset() {
 }
 
 func (r CourseRows) InsertAll(ctx context.Context, s *Service) error {
-	if err := s.CHInsertRows(ctx, "inflearn_course_snapshot_raw", r.SnapshotRaw); err != nil {
-		return err
-	}
-	if err := s.CHInsertRows(ctx, "inflearn_course_dim", r.CourseDim); err != nil {
-		return err
-	}
-	if err := s.CHInsertRows(ctx, "inflearn_course_metric_fact", r.MetricFact); err != nil {
-		return err
-	}
-	if err := s.CHInsertRows(ctx, "inflearn_course_price_fact", r.PriceFact); err != nil {
-		return err
-	}
-	if err := s.CHInsertRows(ctx, "inflearn_course_curriculum_unit", r.CurriculumUnit); err != nil {
-		return err
-	}
-	if err := s.CHInsertRows(ctx, "inflearn_instructor_dim", r.InstructorDim); err != nil {
-		return err
-	}
-	if err := s.CHInsertRows(ctx, "inflearn_course_instructor_map", r.CourseInstructor); err != nil {
-		return err
-	}
-	return nil
+	return s.PublishCourseRows(ctx, r)
 }
 
 func (s *Service) fetchCourseAPI(ctx context.Context, path string) (map[string]any, int, error) {
@@ -1637,7 +1624,7 @@ func (s *Service) pickUpdateURLs(ctx context.Context, limit int) ([]updatePick, 
         FROM latest
         ORDER BY last_fetched_at ASC
         LIMIT %d
-    `, s.Cfg.CHDatabase, limit)
+    `, chIdent(s.Cfg.CHRawDatabase), limit)
 	rows, err := s.CHQueryRows(ctx, sql)
 	if err != nil {
 		return nil, err
@@ -1745,408 +1732,4 @@ func (s *Service) RunUpdateExisting(ctx context.Context) error {
 	}
 	fmt.Printf("[done] processed=%d failed=%d\n", len(picks)-failed, failed)
 	return nil
-}
-
-func recentPartitions(nMonths int) []int {
-	if nMonths < 1 {
-		nMonths = 1
-	}
-	now := time.Now().In(KST)
-	year, month, _ := now.Date()
-	parts := make([]int, 0, nMonths)
-	for i := 0; i < nMonths; i++ {
-		parts = append(parts, year*100+int(month))
-		month--
-		if month == 0 {
-			month = 12
-			year--
-		}
-	}
-	return parts
-}
-
-func (s *Service) RunOptimize(ctx context.Context) error {
-	partitioned := []string{
-		"inflearn_course_snapshot_raw",
-		"inflearn_course_dim",
-		"inflearn_course_metric_fact",
-		"inflearn_course_price_fact",
-		"inflearn_course_curriculum_unit",
-		"inflearn_instructor_dim",
-		"inflearn_course_instructor_map",
-	}
-	full := []string{
-		"inflearn_crawl_checkpoint",
-	}
-	parts := recentPartitions(s.Cfg.OptimizeMonths)
-	for _, table := range partitioned {
-		for _, part := range parts {
-			sql := fmt.Sprintf("OPTIMIZE TABLE %s.%s PARTITION %d FINAL", s.Cfg.CHDatabase, table, part)
-			if err := s.CHExec(ctx, sql); err != nil {
-				continue
-			}
-		}
-	}
-	for _, table := range full {
-		sql := fmt.Sprintf("OPTIMIZE TABLE %s.%s FINAL", s.Cfg.CHDatabase, table)
-		if err := s.CHExec(ctx, sql); err != nil {
-			continue
-		}
-	}
-	return nil
-}
-
-func ensureDir(path string) error {
-	return os.MkdirAll(path, 0o755)
-}
-
-func fmtInt(v int64) string {
-	sign := ""
-	if v < 0 {
-		sign = "-"
-		v = -v
-	}
-	s := strconv.FormatInt(v, 10)
-	if len(s) <= 3 {
-		return sign + s
-	}
-	var parts []string
-	for len(s) > 3 {
-		parts = append([]string{s[len(s)-3:]}, parts...)
-		s = s[:len(s)-3]
-	}
-	parts = append([]string{s}, parts...)
-	return sign + strings.Join(parts, ",")
-}
-
-func escapeXML(s string) string {
-	replacer := strings.NewReplacer(
-		"&", "&amp;",
-		"<", "&lt;",
-		">", "&gt;",
-		`"`, "&quot;",
-		"'", "&apos;",
-	)
-	return replacer.Replace(s)
-}
-
-func latestSnapshotAt(ctx context.Context, s *Service) (time.Time, bool, error) {
-	sql := fmt.Sprintf(`
-        SELECT ifNull(formatDateTime(max(fetched_at), '%%Y-%%m-%%d %%H:%%i:%%s'), '') AS mx
-        FROM %s.inflearn_course_snapshot_raw
-    `, s.Cfg.CHDatabase)
-	rows, err := s.CHQueryRows(ctx, sql)
-	if err != nil {
-		return time.Time{}, false, err
-	}
-	if len(rows) == 0 || strings.TrimSpace(asString(rows[0]["mx"])) == "" {
-		return time.Time{}, false, nil
-	}
-	t, ok := ParseDT64(asString(rows[0]["mx"]))
-	return t, ok, nil
-}
-
-func (s *Service) queryBucketCounts(ctx context.Context, sql string) ([]bucketCount, error) {
-	rows, err := s.CHQueryRows(ctx, sql)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]bucketCount, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, bucketCount{
-			Bucket: asString(row["bucket"]),
-			Count:  asInt64(row["cnt"]),
-		})
-	}
-	return out, nil
-}
-
-func sumCounts(rows []bucketCount) int64 {
-	var total int64
-	for _, row := range rows {
-		total += row.Count
-	}
-	return total
-}
-
-func maxCount(rows []bucketCount) int64 {
-	var peak int64
-	for _, row := range rows {
-		if row.Count > peak {
-			peak = row.Count
-		}
-	}
-	return peak
-}
-
-func writeSVGLineChart(title, yLabel string, rows []bucketCount, outPath string) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	const (
-		width  = 1000
-		height = 420
-		left   = 70
-		right  = 20
-		top    = 50
-		bottom = 70
-	)
-	plotW := float64(width - left - right)
-	plotH := float64(height - top - bottom)
-	maxY := maxCount(rows)
-	if maxY <= 0 {
-		maxY = 1
-	}
-
-	type point struct{ X, Y float64 }
-	points := make([]point, 0, len(rows))
-	for i, row := range rows {
-		var x float64
-		if len(rows) == 1 {
-			x = float64(left) + plotW/2
-		} else {
-			x = float64(left) + (float64(i)/float64(len(rows)-1))*plotW
-		}
-		y := float64(top) + plotH - (float64(row.Count)/float64(maxY))*plotH
-		points = append(points, point{X: x, Y: y})
-	}
-
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">`, width, height, width, height))
-	b.WriteString(`
-  <rect width="100%" height="100%" fill="#ffffff"/>`)
-	b.WriteString(fmt.Sprintf(`
-  <text x="%d" y="28" font-size="20" font-weight="600">%s</text>`, left, escapeXML(title)))
-	b.WriteString(fmt.Sprintf(`
-  <text x="%d" y="%d" font-size="12" fill="#555">%s</text>`, left, height-18, escapeXML(yLabel)))
-
-	for i := 0; i <= 5; i++ {
-		yValue := float64(i) / 5 * float64(maxY)
-		y := float64(top) + plotH - (float64(i)/5)*plotH
-		b.WriteString(fmt.Sprintf(`
-  <line x1="%d" y1="%.2f" x2="%d" y2="%.2f" stroke="#e5e7eb" stroke-width="1"/>`, left, y, width-right, y))
-		b.WriteString(fmt.Sprintf(`
-  <text x="%d" y="%.2f" font-size="11" fill="#6b7280" text-anchor="end">%s</text>`, left-8, y+4, escapeXML(fmtInt(int64(yValue)))))
-	}
-
-	b.WriteString(fmt.Sprintf(`
-  <line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#111827" stroke-width="1.2"/>`, left, height-bottom, width-right, height-bottom))
-	b.WriteString(fmt.Sprintf(`
-  <line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#111827" stroke-width="1.2"/>`, left, top, left, height-bottom))
-
-	step := 1
-	if len(rows) > 24 {
-		step = len(rows) / 12
-		if step < 1 {
-			step = 1
-		}
-	}
-	tickSet := map[int]struct{}{}
-	for i := 0; i < len(rows); i += step {
-		tickSet[i] = struct{}{}
-	}
-	tickSet[len(rows)-1] = struct{}{}
-	indexes := make([]int, 0, len(tickSet))
-	for idx := range tickSet {
-		indexes = append(indexes, idx)
-	}
-	sort.Ints(indexes)
-	for _, idx := range indexes {
-		p := points[idx]
-		b.WriteString(fmt.Sprintf(`
-  <line x1="%.2f" y1="%d" x2="%.2f" y2="%d" stroke="#9ca3af" stroke-width="1"/>`, p.X, height-bottom, p.X, height-bottom+6))
-		b.WriteString(fmt.Sprintf(`
-  <text x="%.2f" y="%d" font-size="10" fill="#6b7280" text-anchor="middle">%s</text>`, p.X, height-bottom+22, escapeXML(rows[idx].Bucket)))
-	}
-
-	pts := make([]string, 0, len(points))
-	for _, p := range points {
-		pts = append(pts, fmt.Sprintf("%.2f,%.2f", p.X, p.Y))
-	}
-	b.WriteString(fmt.Sprintf(`
-  <polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="%s"/>`, strings.Join(pts, " ")))
-	for _, p := range points {
-		b.WriteString(fmt.Sprintf(`
-  <circle cx="%.2f" cy="%.2f" r="2.5" fill="#2563eb"/>`, p.X, p.Y))
-	}
-	b.WriteString(`
-</svg>
-`)
-	return os.WriteFile(outPath, []byte(b.String()), 0o644)
-}
-
-func (s *Service) RunStats(ctx context.Context) error {
-	reportDir := filepath.Join("reports", "inflearn")
-	chartsDir := filepath.Join(reportDir, "charts")
-	if err := ensureDir(chartsDir); err != nil {
-		return err
-	}
-
-	latestAt, ok, err := latestSnapshotAt(ctx, s)
-	if err != nil {
-		return err
-	}
-	since := NowDT64().AddDate(0, 0, -s.Cfg.StatsLookbackDays)
-	if ok {
-		since = latestAt.AddDate(0, 0, -s.Cfg.StatsLookbackDays)
-	}
-	sinceStr := FormatCHTime(since)
-
-	hourly, err := s.queryBucketCounts(ctx, fmt.Sprintf(`
-        SELECT formatDateTime(toStartOfHour(fetched_at), '%%Y-%%m-%%d %%H') AS bucket, count() AS cnt
-        FROM %s.inflearn_course_snapshot_raw
-        WHERE fetched_at >= toDateTime64(%s, 3, 'Asia/Seoul')
-        GROUP BY bucket
-        ORDER BY bucket
-    `, s.Cfg.CHDatabase, QuoteSQLString(sinceStr)))
-	if err != nil {
-		return err
-	}
-	daily, err := s.queryBucketCounts(ctx, fmt.Sprintf(`
-        SELECT formatDateTime(toDate(fetched_at), '%%Y-%%m-%%d') AS bucket, count() AS cnt
-        FROM %s.inflearn_course_snapshot_raw
-        WHERE fetched_at >= toDateTime64(%s, 3, 'Asia/Seoul')
-        GROUP BY bucket
-        ORDER BY bucket
-    `, s.Cfg.CHDatabase, QuoteSQLString(sinceStr)))
-	if err != nil {
-		return err
-	}
-	monthly, err := s.queryBucketCounts(ctx, fmt.Sprintf(`
-        SELECT formatDateTime(toStartOfMonth(fetched_at), '%%Y-%%m') AS bucket, count() AS cnt
-        FROM %s.inflearn_course_snapshot_raw
-        WHERE fetched_at >= toDateTime64(%s, 3, 'Asia/Seoul')
-        GROUP BY bucket
-        ORDER BY bucket
-    `, s.Cfg.CHDatabase, QuoteSQLString(sinceStr)))
-	if err != nil {
-		return err
-	}
-	yearly, err := s.queryBucketCounts(ctx, fmt.Sprintf(`
-        SELECT toString(toYear(fetched_at)) AS bucket, count() AS cnt
-        FROM %s.inflearn_course_snapshot_raw
-        WHERE fetched_at >= toDateTime64(%s, 3, 'Asia/Seoul')
-        GROUP BY bucket
-        ORDER BY bucket
-    `, s.Cfg.CHDatabase, QuoteSQLString(sinceStr)))
-	if err != nil {
-		return err
-	}
-
-	pubDaily, err := s.queryBucketCounts(ctx, fmt.Sprintf(`
-        SELECT formatDateTime(toDate(published_at), '%%Y-%%m-%%d') AS bucket, count() AS cnt
-        FROM %s.inflearn_course_dim
-        WHERE published_at >= toDateTime64(%s, 3, 'Asia/Seoul')
-        GROUP BY bucket
-        ORDER BY bucket
-    `, s.Cfg.CHDatabase, QuoteSQLString(sinceStr)))
-	if err != nil {
-		return err
-	}
-	pubMonthly, err := s.queryBucketCounts(ctx, fmt.Sprintf(`
-        SELECT formatDateTime(toStartOfMonth(published_at), '%%Y-%%m') AS bucket, count() AS cnt
-        FROM %s.inflearn_course_dim
-        WHERE published_at >= toDateTime64(%s, 3, 'Asia/Seoul')
-        GROUP BY bucket
-        ORDER BY bucket
-    `, s.Cfg.CHDatabase, QuoteSQLString(sinceStr)))
-	if err != nil {
-		return err
-	}
-	pubYearly, err := s.queryBucketCounts(ctx, fmt.Sprintf(`
-        SELECT toString(toYear(published_at)) AS bucket, count() AS cnt
-        FROM %s.inflearn_course_dim
-        WHERE published_at >= toDateTime64(%s, 3, 'Asia/Seoul')
-        GROUP BY bucket
-        ORDER BY bucket
-    `, s.Cfg.CHDatabase, QuoteSQLString(sinceStr)))
-	if err != nil {
-		return err
-	}
-
-	charts := []struct {
-		Title  string
-		YLabel string
-		Rows   []bucketCount
-		File   string
-	}{
-		{"수집 시점 기준 - 시간별 스냅샷", "스냅샷 수", hourly, filepath.Join(chartsDir, "snapshots_hourly.svg")},
-		{"수집 시점 기준 - 일별 스냅샷", "스냅샷 수", daily, filepath.Join(chartsDir, "snapshots_daily.svg")},
-		{"수집 시점 기준 - 월별 스냅샷", "스냅샷 수", monthly, filepath.Join(chartsDir, "snapshots_monthly.svg")},
-		{"수집 시점 기준 - 연별 스냅샷", "스냅샷 수", yearly, filepath.Join(chartsDir, "snapshots_yearly.svg")},
-		{"개설 시점 기준 - 일별 신규 강의", "강의 수", pubDaily, filepath.Join(chartsDir, "published_daily.svg")},
-		{"개설 시점 기준 - 월별 신규 강의", "강의 수", pubMonthly, filepath.Join(chartsDir, "published_monthly.svg")},
-		{"개설 시점 기준 - 연별 신규 강의", "강의 수", pubYearly, filepath.Join(chartsDir, "published_yearly.svg")},
-	}
-	for _, chart := range charts {
-		if err := writeSVGLineChart(chart.Title, chart.YLabel, chart.Rows, chart.File); err != nil {
-			return err
-		}
-	}
-
-	totalRows, err := s.CHQueryRows(ctx, fmt.Sprintf(`SELECT uniqExact(course_id) AS c FROM %s.inflearn_course_dim`, s.Cfg.CHDatabase))
-	if err != nil {
-		return err
-	}
-	totalCourses := int64(0)
-	if len(totalRows) > 0 {
-		totalCourses = asInt64(totalRows[0]["c"])
-	}
-
-	lines := []string{
-		"# Inflearn 통계 리포트",
-		"",
-		fmt.Sprintf("- 생성 시각(KST): **%s**", NowDT64().Format("2006-01-02 15:04:05")),
-		fmt.Sprintf("- 최근 데이터 기준 Lookback: **%d일**", s.Cfg.StatsLookbackDays),
-		"",
-	}
-
-	addSection := func(title string, rows []bucketCount, imageName string) {
-		total := sumCounts(rows)
-		last := int64(0)
-		if len(rows) > 0 {
-			last = rows[len(rows)-1].Count
-		}
-		peak := maxCount(rows)
-		lines = append(lines,
-			fmt.Sprintf("## %s", title),
-			"",
-			fmt.Sprintf("- 합계: **%s**, 마지막: **%s**, 피크: **%s**", fmtInt(total), fmtInt(last), fmtInt(peak)),
-			"",
-		)
-		if len(rows) > 0 {
-			lines = append(lines, fmt.Sprintf("![%s](charts/%s)", title, imageName), "")
-		}
-	}
-	addPublished := func(title string, rows []bucketCount, imageName string) {
-		total := sumCounts(rows)
-		lines = append(lines,
-			fmt.Sprintf("## %s", title),
-			"",
-			fmt.Sprintf("- 합계: **%s**", fmtInt(total)),
-			"",
-		)
-		if len(rows) > 0 {
-			lines = append(lines, fmt.Sprintf("![%s](charts/%s)", title, imageName), "")
-		}
-	}
-
-	addSection("수집 시점 기준 - 시간별 스냅샷", hourly, "snapshots_hourly.svg")
-	addSection("수집 시점 기준 - 일별 스냅샷", daily, "snapshots_daily.svg")
-	addSection("수집 시점 기준 - 월별 스냅샷", monthly, "snapshots_monthly.svg")
-	addSection("수집 시점 기준 - 연별 스냅샷", yearly, "snapshots_yearly.svg")
-	addPublished("개설 시점 기준 - 일별 신규 강의", pubDaily, "published_daily.svg")
-	addPublished("개설 시점 기준 - 월별 신규 강의", pubMonthly, "published_monthly.svg")
-	addPublished("개설 시점 기준 - 연별 신규 강의", pubYearly, "published_yearly.svg")
-
-	lines = append(lines,
-		"## 요약",
-		"",
-		fmt.Sprintf("- 누적 강의 수(고유 course_id): **%s**", fmtInt(totalCourses)),
-		"",
-	)
-
-	reportPath := filepath.Join(reportDir, "inflearn_stats_latest.md")
-	return os.WriteFile(reportPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 }

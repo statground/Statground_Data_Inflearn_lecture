@@ -26,72 +26,38 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Download Go modules
+        run: |
+          go mod download
+
       - name: Build
         run: |
           go build ./...
 
-      - name: Update existing courses (batch)
+      - name: Update existing Inflearn courses and publish Kafka events
         env:
           CH_HOST: ${{ secrets.CH_HOST }}
           CH_PORT: ${{ secrets.CH_PORT }}
           CH_USER: ${{ secrets.CH_USER }}
           CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
-          CH_DATABASE: ${{ secrets.CH_DATABASE }}
           CH_SECURE: ${{ secrets.CH_SECURE }}
+          CH_DATABASE: Data_Lecture_Inflearn_Raw
+          CH_RAW_DATABASE: Data_Lecture_Inflearn_Raw
+          CH_SERVICE_DATABASE: Data_Lecture_Inflearn_Service
+          CH_LOG_DATABASE: Data_Lecture_Inflearn_Log
+          CH_MART_DATABASE: Data_Lecture_Inflearn_Mart
+          INGEST_MODE: kafka
+          LECTURE_PROVIDER: inflearn
+          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
+          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME }}
+          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD }}
+          KAFKA_TOPIC: lecture.events
+          KAFKA_CLIENT_ID: statground-inflearn-update-existing
+          PRODUCER_SOURCE: github_actions
+          PRODUCER_IP: "::"
           UPDATE_BATCH_SIZE: "100"
           WORKERS: "8"
           REQUEST_SLEEP_MIN: "0.2"
           REQUEST_SLEEP_MAX: "0.6"
         run: |
           go run ./cmd/inflearn-update-existing
-
-      - name: Optimize tables (FINAL)
-        env:
-          CH_HOST: ${{ secrets.CH_HOST }}
-          CH_PORT: ${{ secrets.CH_PORT }}
-          CH_USER: ${{ secrets.CH_USER }}
-          CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
-          CH_DATABASE: ${{ secrets.CH_DATABASE }}
-          CH_SECURE: ${{ secrets.CH_SECURE }}
-          OPTIMIZE_MONTHS: "2"
-        run: |
-          go run ./cmd/inflearn-optimize
-
-  stats_report:
-    needs: update_existing
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    concurrency:
-      group: inflearn-stats-report
-      cancel-in-progress: false
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Generate stats report (md + svg)
-        env:
-          CH_HOST: ${{ secrets.CH_HOST }}
-          CH_PORT: ${{ secrets.CH_PORT }}
-          CH_USER: ${{ secrets.CH_USER }}
-          CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
-          CH_DATABASE: ${{ secrets.CH_DATABASE }}
-          CH_SECURE: ${{ secrets.CH_SECURE }}
-          STATS_LOOKBACK_DAYS: "365"
-        run: |
-          go run ./cmd/inflearn-stats
-
-      - name: Commit reports
-        env:
-          STATS_COMMIT_MESSAGE: "chore(stats): inflearn report update after update_existing batch"
-        run: |
-          bash scripts/inflearn_commit_reports.sh
