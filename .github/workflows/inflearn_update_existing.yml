@@ -26,13 +26,38 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Download Go modules
+      - name: Validate required repository secrets
+        env:
+          CH_HOST: ${{ secrets.CH_HOST }}
+          CH_PORT: ${{ secrets.CH_PORT }}
+          CH_USER: ${{ secrets.CH_USER }}
+          CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
+          CH_SECURE: ${{ secrets.CH_SECURE }}
+          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
+          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
+          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
         run: |
-          go mod download
+          test -n "$CH_HOST" || { echo "CH_HOST secret is required"; exit 1; }
+          test -n "$CH_PORT" || { echo "CH_PORT secret is required"; exit 1; }
+          test -n "$CH_USER" || { echo "CH_USER secret is required"; exit 1; }
+          test -n "$CH_PASSWORD" || { echo "CH_PASSWORD secret is required"; exit 1; }
+          test -n "$CH_SECURE" || { echo "CH_SECURE secret is required"; exit 1; }
+          test -n "$KAFKA_BROKERS" || { echo "KAFKA_BROKERS secret is required"; exit 1; }
+          test -n "$KAFKA_USERNAME" || { echo "Kafka SASL username is required. Add either KAFKA_USERNAME or KAFKA_EXTERNAL_USER repository secret"; exit 1; }
+          test -n "$KAFKA_PASSWORD" || { echo "Kafka SASL password is required. Add either KAFKA_PASSWORD or KAFKA_EXTERNAL_PASSWORD repository secret"; exit 1; }
 
-      - name: Build
+      - name: Resolve Go modules and checksums
+        env:
+          GOPROXY: https://proxy.golang.org,direct
         run: |
-          go build ./...
+          go mod download all
+          go mod verify
+
+      - name: Build active Inflearn crawler commands
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: |
+          go build -mod=mod ./cmd/inflearn-collect-new ./cmd/inflearn-update-existing
 
       - name: Update existing Inflearn courses and publish Kafka events
         env:
@@ -49,8 +74,8 @@ jobs:
           INGEST_MODE: kafka
           LECTURE_PROVIDER: inflearn
           KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
-          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME }}
-          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD }}
+          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
+          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
           KAFKA_TOPIC: lecture.events
           KAFKA_CLIENT_ID: statground-inflearn-update-existing
           PRODUCER_SOURCE: github_actions
@@ -60,4 +85,4 @@ jobs:
           REQUEST_SLEEP_MIN: "0.2"
           REQUEST_SLEEP_MAX: "0.6"
         run: |
-          go run ./cmd/inflearn-update-existing
+          go run -mod=mod ./cmd/inflearn-update-existing
