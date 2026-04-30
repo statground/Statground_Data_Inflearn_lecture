@@ -58,6 +58,8 @@ type Config struct {
 	KafkaBatchTimeout    time.Duration
 	ProducerSource       string
 	ProducerIP           string
+	StateBackend         string
+	StateDir             string
 	SitemapBase          string
 	SitemapBaseFallback  string
 	SitemapPrefix        string
@@ -129,9 +131,7 @@ func loadKST() *time.Location {
 
 func LoadConfig() (Config, error) {
 	host := envFirst("CH_HOST", "CLICKHOUSE_HOST")
-	if host == "" {
-		return Config{}, fmt.Errorf("missing required env: CH_HOST or CLICKHOUSE_HOST")
-	}
+	stateBackend := strings.ToLower(strings.TrimSpace(envDefault("STATE_BACKEND", "local")))
 	cfg := Config{
 		CHHost:               host,
 		CHPort:               parsePort(envFirst("CH_PORT", "CLICKHOUSE_PORT"), 8123),
@@ -154,6 +154,8 @@ func LoadConfig() (Config, error) {
 		KafkaBatchTimeout:    parseSecondsDefault(envDefault("KAFKA_BATCH_TIMEOUT", "1.0"), time.Second),
 		ProducerSource:       envDefault("PRODUCER_SOURCE", "github_actions"),
 		ProducerIP:           envDefault("PRODUCER_IP", "::"),
+		StateBackend:         stateBackend,
+		StateDir:             envDefault("STATE_DIR", ".statground_state"),
 		SitemapBase:          strings.TrimRight(envDefault("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps"), "/"),
 		SitemapBaseFallback:  strings.TrimRight(envDefault("SITEMAP_BASE_FALLBACK", "https://www.inflearn.com/sitemaps"), "/"),
 		SitemapPrefix:        envDefault("SITEMAP_PREFIX", "sitemap-courseDetail-"),
@@ -171,6 +173,17 @@ func LoadConfig() (Config, error) {
 		cfg.IngestMode = "kafka"
 	default:
 		return Config{}, fmt.Errorf("unsupported INGEST_MODE=%q; Statground Inflearn crawler now supports Kafka ingestion only", cfg.IngestMode)
+	}
+	switch cfg.StateBackend {
+	case "", "local", "file", "github_cache", "github-cache":
+		cfg.StateBackend = "local"
+	case "clickhouse", "ch":
+		cfg.StateBackend = "clickhouse"
+	default:
+		return Config{}, fmt.Errorf("unsupported STATE_BACKEND=%q; use local or clickhouse", cfg.StateBackend)
+	}
+	if cfg.StateBackend == "clickhouse" && strings.TrimSpace(cfg.CHHost) == "" {
+		return Config{}, fmt.Errorf("missing required env: CH_HOST or CLICKHOUSE_HOST when STATE_BACKEND=clickhouse")
 	}
 	if len(cfg.KafkaBrokers) == 0 {
 		return Config{}, fmt.Errorf("missing required env: KAFKA_BROKERS")
@@ -836,6 +849,9 @@ func (s *Service) CHQueryRows(ctx context.Context, sql string) ([]map[string]any
 }
 
 func (s *Service) getCheckpoint(ctx context.Context, source string) (Checkpoint, error) {
+	if s.UseLocalState() {
+		return s.localGetCheckpoint(source)
+	}
 	sql := fmt.Sprintf(`
         SELECT
           argMax(sitemap_index, updated_at) AS sitemap_index,
@@ -854,10 +870,19 @@ func (s *Service) getCheckpoint(ctx context.Context, source string) (Checkpoint,
 }
 
 func (s *Service) setCheckpoint(ctx context.Context, source string, cp Checkpoint) error {
-	return s.PublishCheckpoint(ctx, source, cp)
+	if err := s.PublishCheckpoint(ctx, source, cp); err != nil {
+		return err
+	}
+	if s.UseLocalState() {
+		return s.localSetCheckpoint(source, cp)
+	}
+	return nil
 }
 
 func (s *Service) courseExists(ctx context.Context, courseID int, locale string) (bool, error) {
+	if s.UseLocalState() {
+		return s.localCourseExists(courseID, locale)
+	}
 	sql := fmt.Sprintf(`
         SELECT count() AS c
         FROM %s.inflearn_course_dim FINAL
@@ -1452,6 +1477,11 @@ func (s *Service) flushCollectBatch(ctx context.Context, batch *CourseRows, cp C
 	if err := batch.InsertAll(ctx, s); err != nil {
 		return err
 	}
+	if s.UseLocalState() {
+		if err := s.localRememberCourseRows(*batch); err != nil {
+			return err
+		}
+	}
 	if err := s.setCheckpoint(ctx, collectCheckpointSource, cp); err != nil {
 		return err
 	}
@@ -1605,6 +1635,9 @@ func (s *Service) RunCollectNew(ctx context.Context) error {
 }
 
 func (s *Service) pickUpdateURLs(ctx context.Context, limit int) ([]updatePick, error) {
+	if s.UseLocalState() {
+		return s.localPickUpdateURLs(limit)
+	}
 	sql := fmt.Sprintf(`
         WITH latest AS (
           SELECT
@@ -1721,6 +1754,11 @@ func (s *Service) RunUpdateExisting(ctx context.Context) error {
 
 	if err := batch.InsertAll(ctx, s); err != nil {
 		return err
+	}
+	if s.UseLocalState() {
+		if err := s.localRememberCourseRows(batch); err != nil {
+			return err
+		}
 	}
 	totalDone += len(picks)
 	if err := s.setUpdateProgress(ctx, totalDone, len(picks)); err != nil {

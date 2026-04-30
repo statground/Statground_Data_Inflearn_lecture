@@ -2,3 +2,5 @@
 /dist/
 *.out
 *.test
+
+.statground_state/

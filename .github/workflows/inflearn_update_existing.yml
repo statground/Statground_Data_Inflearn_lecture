@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  STATE_DIR: .statground_state
+
 concurrency:
   group: inflearn-update-existing
   cancel-in-progress: false
@@ -20,6 +23,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Restore crawler state
+        uses: actions/cache/restore@v4
+        with:
+          path: .statground_state
+          key: inflearn-crawler-state-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            inflearn-crawler-state-${{ github.ref_name }}-
+            inflearn-crawler-state-
+
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
@@ -28,20 +40,10 @@ jobs:
 
       - name: Validate required repository secrets
         env:
-          CH_HOST: ${{ secrets.CH_HOST }}
-          CH_PORT: ${{ secrets.CH_PORT }}
-          CH_USER: ${{ secrets.CH_USER }}
-          CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
-          CH_SECURE: ${{ secrets.CH_SECURE }}
           KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
           KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
           KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
         run: |
-          test -n "$CH_HOST" || { echo "CH_HOST secret is required"; exit 1; }
-          test -n "$CH_PORT" || { echo "CH_PORT secret is required"; exit 1; }
-          test -n "$CH_USER" || { echo "CH_USER secret is required"; exit 1; }
-          test -n "$CH_PASSWORD" || { echo "CH_PASSWORD secret is required"; exit 1; }
-          test -n "$CH_SECURE" || { echo "CH_SECURE secret is required"; exit 1; }
           test -n "$KAFKA_BROKERS" || { echo "KAFKA_BROKERS secret is required"; exit 1; }
           test -n "$KAFKA_USERNAME" || { echo "Kafka SASL username is required. Add either KAFKA_USERNAME or KAFKA_EXTERNAL_USER repository secret"; exit 1; }
           test -n "$KAFKA_PASSWORD" || { echo "Kafka SASL password is required. Add either KAFKA_PASSWORD or KAFKA_EXTERNAL_PASSWORD repository secret"; exit 1; }
@@ -61,16 +63,8 @@ jobs:
 
       - name: Update existing Inflearn courses and publish Kafka events
         env:
-          CH_HOST: ${{ secrets.CH_HOST }}
-          CH_PORT: ${{ secrets.CH_PORT }}
-          CH_USER: ${{ secrets.CH_USER }}
-          CH_PASSWORD: ${{ secrets.CH_PASSWORD }}
-          CH_SECURE: ${{ secrets.CH_SECURE }}
-          CH_DATABASE: Data_Lecture_Inflearn_Raw
-          CH_RAW_DATABASE: Data_Lecture_Inflearn_Raw
-          CH_SERVICE_DATABASE: Data_Lecture_Inflearn_Service
-          CH_LOG_DATABASE: Data_Lecture_Inflearn_Log
-          CH_MART_DATABASE: Data_Lecture_Inflearn_Mart
+          STATE_BACKEND: local
+          STATE_DIR: .statground_state
           INGEST_MODE: kafka
           LECTURE_PROVIDER: inflearn
           KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
@@ -86,3 +80,10 @@ jobs:
           REQUEST_SLEEP_MAX: "0.6"
         run: |
           go run -mod=mod ./cmd/inflearn-update-existing
+
+      - name: Save crawler state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .statground_state
+          key: inflearn-crawler-state-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
