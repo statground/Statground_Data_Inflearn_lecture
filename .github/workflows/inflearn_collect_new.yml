@@ -47,6 +47,12 @@ jobs:
           test -n "$KAFKA_BROKERS" || { echo "KAFKA_BROKERS secret is required"; exit 1; }
           test -n "$KAFKA_USERNAME" || { echo "Kafka SASL username is required. Add either KAFKA_USERNAME or KAFKA_EXTERNAL_USER repository secret"; exit 1; }
           test -n "$KAFKA_PASSWORD" || { echo "Kafka SASL password is required. Add either KAFKA_PASSWORD or KAFKA_EXTERNAL_PASSWORD repository secret"; exit 1; }
+          case ",$KAFKA_BROKERS," in
+            *,127.0.0.1:*|*,localhost:*|*,0.0.0.0:*|*,[::1]:*)
+              echo "KAFKA_BROKERS must be a public IP/domain endpoint, not a loopback address"
+              exit 1
+              ;;
+          esac
 
       - name: Resolve Go modules and checksums
         env:

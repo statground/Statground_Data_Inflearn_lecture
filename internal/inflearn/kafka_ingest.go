@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/sasl/plain"
@@ -59,6 +61,79 @@ func (s *Service) kafkaHost() string {
 		return "github-actions"
 	}
 	return host
+}
+
+func (s *Service) ValidateKafkaIngest(ctx context.Context) error {
+	if !s.UseKafkaIngest() {
+		return nil
+	}
+	if len(s.Cfg.KafkaBrokers) == 0 {
+		return fmt.Errorf("KAFKA_BROKERS is empty")
+	}
+	if strings.TrimSpace(s.Cfg.KafkaTopic) == "" {
+		return fmt.Errorf("KAFKA_TOPIC is empty")
+	}
+	for _, broker := range s.Cfg.KafkaBrokers {
+		if isLoopbackBrokerEndpoint(broker) {
+			return fmt.Errorf("KAFKA_BROKERS must be an externally reachable Kafka bootstrap address, not %q; use the server public IP/domain and ensure Kafka server .env KAFKA_PUBLIC_HOST is also public", broker)
+		}
+	}
+
+	dialer := &kafka.Dialer{
+		ClientID: s.Cfg.KafkaClientID,
+		Timeout:  10 * time.Second,
+	}
+	if strings.TrimSpace(s.Cfg.KafkaUsername) != "" || strings.TrimSpace(s.Cfg.KafkaPassword) != "" {
+		dialer.SASLMechanism = plain.Mechanism{Username: s.Cfg.KafkaUsername, Password: s.Cfg.KafkaPassword}
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	conn, err := dialer.DialContext(probeCtx, "tcp", s.Cfg.KafkaBrokers[0])
+	if err != nil {
+		return fmt.Errorf("kafka preflight failed to connect to bootstrap broker %q: %w", s.Cfg.KafkaBrokers[0], err)
+	}
+	defer conn.Close()
+
+	partitions, err := conn.ReadPartitions(s.Cfg.KafkaTopic)
+	if err != nil {
+		return fmt.Errorf("kafka preflight failed to read metadata for topic %q: %w", s.Cfg.KafkaTopic, err)
+	}
+	if len(partitions) == 0 {
+		return fmt.Errorf("kafka preflight found zero partitions for topic %q", s.Cfg.KafkaTopic)
+	}
+
+	for _, partition := range partitions {
+		leaderHost := strings.TrimSpace(partition.Leader.Host)
+		if isLoopbackHost(leaderHost) {
+			return fmt.Errorf("kafka broker metadata advertises loopback listener %s:%d for topic=%s partition=%d; fix the Kafka server .env KAFKA_PUBLIC_HOST to the public IP/domain, then force-recreate Kafka_Platform", leaderHost, partition.Leader.Port, partition.Topic, partition.ID)
+		}
+	}
+
+	fmt.Printf("[kafka] preflight ok topic=%s partitions=%d bootstrap=%s\n", s.Cfg.KafkaTopic, len(partitions), s.Cfg.KafkaBrokers[0])
+	return nil
+}
+
+func isLoopbackBrokerEndpoint(raw string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(raw))
+	if err != nil {
+		host = strings.TrimSpace(raw)
+		if strings.Contains(host, ":") {
+			host = strings.Split(host, ":")[0]
+		}
+	}
+	return isLoopbackHost(host)
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	switch host {
+	case "", "localhost", "127.0.0.1", "::1", "0.0.0.0":
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
 }
 
 func (s *Service) kafkaWriter() *kafka.Writer {

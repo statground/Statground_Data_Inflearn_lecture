@@ -1490,6 +1490,9 @@ func (s *Service) flushCollectBatch(ctx context.Context, batch *CourseRows, cp C
 }
 
 func (s *Service) RunCollectNew(ctx context.Context) error {
+	if err := s.ValidateKafkaIngest(ctx); err != nil {
+		return err
+	}
 	cp, err := s.getCheckpoint(ctx, collectCheckpointSource)
 	if err != nil {
 		return err
@@ -1690,6 +1693,9 @@ func (s *Service) setUpdateProgress(ctx context.Context, totalDone, lastBatchDon
 }
 
 func (s *Service) RunUpdateExisting(ctx context.Context) error {
+	if err := s.ValidateKafkaIngest(ctx); err != nil {
+		return err
+	}
 	totalDone, _, err := s.getUpdateProgress(ctx)
 	if err != nil {
 		return err
