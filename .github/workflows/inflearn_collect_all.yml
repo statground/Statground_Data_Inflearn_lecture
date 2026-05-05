@@ -1,8 +1,8 @@
-name: Inflearn - Update Existing Courses
+name: Inflearn - Collect All Courses
 
 on:
   schedule:
-    - cron: "30 * * * *"
+    - cron: "5 */4 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -12,13 +12,13 @@ env:
   STATE_DIR: .statground_state
 
 concurrency:
-  group: inflearn-update-existing
+  group: inflearn-collector-all
   cancel-in-progress: false
 
 jobs:
-  update_existing:
+  collect_all:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 55
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -66,6 +66,27 @@ jobs:
           GOPROXY: https://proxy.golang.org,direct
         run: |
           go build -mod=mod ./cmd/inflearn-collect-new ./cmd/inflearn-update-existing
+
+      - name: Collect new Inflearn courses and publish Kafka events
+        env:
+          STATE_BACKEND: local
+          STATE_DIR: .statground_state
+          INGEST_MODE: kafka
+          LECTURE_PROVIDER: inflearn
+          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
+          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
+          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
+          KAFKA_TOPIC: lecture.events
+          KAFKA_CLIENT_ID: statground-inflearn-collect-new
+          PRODUCER_SOURCE: github_actions
+          PRODUCER_IP: "::"
+          BATCH_SIZE: "100"
+          MAX_URLS_PER_RUN: "1500"
+          CHECKPOINT_FLUSH_EVERY: "200"
+          REQUEST_SLEEP_MIN: "0.2"
+          REQUEST_SLEEP_MAX: "0.6"
+        run: |
+          go run -mod=mod ./cmd/inflearn-collect-new
 
       - name: Update existing Inflearn courses and publish Kafka events
         env:
