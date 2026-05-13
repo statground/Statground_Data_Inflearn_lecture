@@ -40,9 +40,9 @@ jobs:
 
       - name: Validate required repository secrets
         env:
-          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
-          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
-          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
+          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS2 || secrets.KAFKA_BROKERS }}
+          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME2 || secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
+          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD2 || secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
         run: |
           test -n "$KAFKA_BROKERS" || { echo "KAFKA_BROKERS secret is required"; exit 1; }
           test -n "$KAFKA_USERNAME" || { echo "Kafka SASL username is required. Add either KAFKA_USERNAME or KAFKA_EXTERNAL_USER repository secret"; exit 1; }
@@ -73,9 +73,9 @@ jobs:
           STATE_DIR: .statground_state
           INGEST_MODE: kafka
           LECTURE_PROVIDER: inflearn
-          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
-          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
-          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
+          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS2 || secrets.KAFKA_BROKERS }}
+          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME2 || secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
+          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD2 || secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
           KAFKA_TOPIC: lecture.events
           KAFKA_CLIENT_ID: statground-inflearn-collect-new
           PRODUCER_SOURCE: github_actions
@@ -94,9 +94,9 @@ jobs:
           STATE_DIR: .statground_state
           INGEST_MODE: kafka
           LECTURE_PROVIDER: inflearn
-          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
-          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
-          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
+          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS2 || secrets.KAFKA_BROKERS }}
+          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME2 || secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
+          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD2 || secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
           KAFKA_TOPIC: lecture.events
           KAFKA_CLIENT_ID: statground-inflearn-update-existing
           PRODUCER_SOURCE: github_actions
