@@ -856,7 +856,7 @@ func (s *Service) getCheckpoint(ctx context.Context, source string) (Checkpoint,
         SELECT
           argMax(sitemap_index, updated_at) AS sitemap_index,
           argMax(url_index, updated_at) AS url_index
-        FROM %s.inflearn_crawl_checkpoint FINAL
+        FROM %s.inflearn_crawl_checkpoint
         WHERE source = %s
     `, chIdent(s.Cfg.CHRawDatabase), QuoteSQLString(source))
 	rows, err := s.CHQueryRows(ctx, sql)
@@ -885,8 +885,13 @@ func (s *Service) courseExists(ctx context.Context, courseID int, locale string)
 	}
 	sql := fmt.Sprintf(`
         SELECT count() AS c
-        FROM %s.inflearn_course_dim FINAL
-        WHERE course_id = %d AND locale = %s
+        FROM (
+          SELECT 1
+          FROM %s.inflearn_course_dim
+          WHERE course_id = %d AND locale = %s
+          GROUP BY course_id, locale
+          LIMIT 1
+        )
     `, chIdent(s.Cfg.CHServiceDatabase), courseID, QuoteSQLString(locale))
 	rows, err := s.CHQueryRows(ctx, sql)
 	if err != nil {
