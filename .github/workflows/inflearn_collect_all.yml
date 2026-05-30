@@ -13,7 +13,7 @@ env:
 
 concurrency:
   group: inflearn-collector-all
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   collect_all:
