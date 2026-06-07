@@ -71,6 +71,16 @@ type Config struct {
 	RequestSleepMin      time.Duration
 	RequestSleepMax      time.Duration
 	UserAgent            string
+
+	TranslationTargetLanguages []string
+	TranslationBatchSize       int
+	TranslationMaxPerRun       int
+	TranslationTable           string
+	TranslationProvider        string
+	TranslationEndpoint        string
+	TranslationAPIKey          string
+	TranslationModel           string
+	TranslationDryRun          bool
 }
 
 type Service struct {

@@ -1,0 +1,76 @@
+name: Inflearn - Translate Display Metadata
+
+on:
+  schedule:
+    - cron: "35 */8 * * *"
+  workflow_dispatch:
+    inputs:
+      languages:
+        description: "Comma-separated Statground UI language codes"
+        required: false
+        default: "ko,en,ja,zh-Hans,zh-Hant,es,fr,de,pt-BR,ru,id,vi,th,ms,fil,hi,ar,it,nl,pl,sv,tr,uk"
+      max_per_run:
+        description: "Maximum translation rows per run"
+        required: false
+        default: "80"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inflearn-translate-display
+  cancel-in-progress: true
+
+jobs:
+  translate_display:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve Go modules and checksums
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: |
+          go mod download all
+          go mod verify
+
+      - name: Build translation command
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: go build -mod=mod ./cmd/inflearn-translate-display
+
+      - name: Translate missing display metadata
+        env:
+          CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
+          CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
+          CH_USER: ${{ secrets.CH_USER || secrets.CLICKHOUSE_USER }}
+          CH_PASSWORD: ${{ secrets.CH_PASSWORD || secrets.CLICKHOUSE_PASSWORD }}
+          CH_SERVICE_DATABASE: Data_Lecture_Inflearn_Service
+          INFLEARN_TRANSLATION_API_KEY: ${{ secrets.INFLEARN_TRANSLATION_API_KEY || secrets.OPENAI_API_KEY || secrets.GH_MODELS_API_KEY || secrets.GITHUB_MODELS_API_KEY }}
+          GH_MODELS_API_KEY: ${{ secrets.GH_MODELS_API_KEY || secrets.GITHUB_MODELS_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          INFLEARN_TRANSLATION_PROVIDER: ${{ vars.INFLEARN_TRANSLATION_PROVIDER }}
+          INFLEARN_TRANSLATION_MODEL: ${{ vars.INFLEARN_TRANSLATION_MODEL }}
+          INFLEARN_TRANSLATION_TARGET_LANGS_INPUT: ${{ github.event.inputs.languages }}
+          INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT: ${{ github.event.inputs.max_per_run }}
+          INFLEARN_TRANSLATION_BATCH_SIZE: "12"
+        run: |
+          if [ -z "$CH_HOST" ] || [ -z "$CH_USER" ]; then
+            echo "ClickHouse secrets are not configured; skipping translation run."
+            exit 0
+          fi
+          if [ -z "$INFLEARN_TRANSLATION_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$GH_MODELS_API_KEY" ]; then
+            echo "Translation API key is not configured; skipping translation run."
+            exit 0
+          fi
+          export INFLEARN_TRANSLATION_TARGET_LANGS="${INFLEARN_TRANSLATION_TARGET_LANGS_INPUT:-ko,en,ja,zh-Hans,zh-Hant,es,fr,de,pt-BR,ru,id,vi,th,ms,fil,hi,ar,it,nl,pl,sv,tr,uk}"
+          export INFLEARN_TRANSLATION_MAX_PER_RUN="${INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT:-80}"
+          go run -mod=mod ./cmd/inflearn-translate-display
