@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -47,6 +48,7 @@ func LoadTranslationConfig() (Config, error) {
 		CHSecure:                   parseBool(envFirstDefault([]string{"CH_SECURE", "CLICKHOUSE_SECURE"}, "0")),
 		UserAgent:                  envDefault("CRAWLER_USER_AGENT", "Mozilla/5.0 (compatible; StatgroundCrawler/2.0; +https://www.statground.net)"),
 		TranslationTargetLanguages: normalizeTranslationTargets(targets),
+		TranslationCourseIDs:       parseTranslationCourseIDs(envDefault("INFLEARN_TRANSLATION_COURSE_IDS", "")),
 		TranslationBatchSize:       parsePositiveInt(envDefault("INFLEARN_TRANSLATION_BATCH_SIZE", "12"), 12),
 		TranslationMaxPerRun:       parsePositiveInt(envDefault("INFLEARN_TRANSLATION_MAX_PER_RUN", "80"), 80),
 		TranslationTable:           envDefault("INFLEARN_TRANSLATION_TABLE", "Data_Lecture_Inflearn_Service.inflearn_course_display_translation"),
@@ -123,7 +125,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 				"description":         compactTranslationText(translated.Description, 4000),
 				"category_main_title": compactTranslationText(translated.CategoryMainTitle, 300),
 				"category_sub_title":  compactTranslationText(translated.CategorySubTitle, 300),
-				"level_code":          compactTranslationText(translated.LevelCode, 120),
+				"level_code":          compactTranslationText(localizeTranslationLevel(target, translated.LevelCode), 120),
 				"keywords":            compactTranslationText(translated.Keywords, 1200),
 				"model":               s.Cfg.TranslationModel,
 				"prompt_hash":         H64(translationPromptContract),
@@ -166,6 +168,10 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
 	if target == "en" {
 		sourcePreference = "multiIf(c.locale = 'en', 0, c.locale = 'ko', 1, 9)"
 	}
+	courseIDFilter := ""
+	if len(s.Cfg.TranslationCourseIDs) > 0 {
+		courseIDFilter = fmt.Sprintf("AND course_id IN (%s)", translationCourseIDListSQL(s.Cfg.TranslationCourseIDs))
+	}
 	textExpr := "concat(title, ' ', description, ' ', category_main_title, ' ', category_sub_title, ' ', keywords)"
 	nativePredicate := translationNativePredicateSQL(target, "title", textExpr)
 	sql := fmt.Sprintf(`
@@ -185,6 +191,7 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
             max(fetched_at) AS max_fetched_at
           FROM %s.inflearn_course_dim
           WHERE locale IN ('ko', 'en')
+            %s
           GROUP BY course_id, locale
           HAVING status_latest = 'PUBLISH' AND title != ''
         ),
@@ -197,8 +204,8 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
         existing AS (
           SELECT course_id AS existing_course_id
           FROM %s
-          WHERE target_language = %s
-            AND generation_status = 'success'
+          WHERE toString(target_language) = %s
+            AND toString(generation_status) = 'success'
           GROUP BY existing_course_id
         ),
         scored AS (
@@ -220,7 +227,7 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
             %s AS source_rank
           FROM latest AS c
           LEFT JOIN native_target AS n ON n.native_course_id = c.course_id
-          LEFT JOIN existing AS e ON e.existing_course_id = c.course_id
+          LEFT JOIN existing AS e ON e.existing_course_id = toUInt32(c.course_id)
           WHERE n.native_course_id = 0 AND e.existing_course_id = 0
         ),
         per_course AS (
@@ -248,7 +255,7 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
         ORDER BY order_latest_activity_at DESC, order_max_fetched_at DESC, course_id DESC
         LIMIT %d
         SETTINGS max_execution_time = 20, timeout_overflow_mode = 'break', max_threads = 4
-    `, chIdent(s.Cfg.CHServiceDatabase), nativePredicate, chTablePath(s.Cfg.TranslationTable), QuoteSQLString(target), sourcePreference, limit)
+    `, chIdent(s.Cfg.CHServiceDatabase), courseIDFilter, nativePredicate, chTablePath(s.Cfg.TranslationTable), QuoteSQLString(target), sourcePreference, limit)
 	if parseBool(envDefault("INFLEARN_TRANSLATION_DEBUG_SQL", "0")) {
 		fmt.Printf("[debug_sql] target=%s\n%s\n", target, sql)
 	}
@@ -400,32 +407,70 @@ func normalizeTranslationTarget(raw string) string {
 	return ""
 }
 
+func parseTranslationCourseIDs(raw string) []int {
+	parts := splitCSV(raw)
+	out := make([]int, 0, len(parts))
+	seen := map[int]struct{}{}
+	for _, part := range parts {
+		id, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func translationCourseIDListSQL(ids []int) string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		out = append(out, strconv.Itoa(id))
+	}
+	if len(out) == 0 {
+		return "0"
+	}
+	return strings.Join(out, ", ")
+}
+
 func translationNativePredicateSQL(target, titleExpr, textExpr string) string {
-	hangul := translationScriptCountSQL(titleExpr, "가-힣")
-	kana := translationScriptCountSQL(titleExpr, "ぁ-んァ-ン")
-	han := translationScriptCountSQL(titleExpr, "一-龥")
-	cyrillic := translationScriptCountSQL(titleExpr, "А-Яа-яЁёІіЇїЄєҐґ")
-	arabic := translationScriptCountSQL(titleExpr, "؀-ۿ")
-	devanagari := translationScriptCountSQL(titleExpr, "ऀ-ॿ")
-	thai := translationScriptCountSQL(titleExpr, "ก-๿")
-	latin := translationScriptCountSQL(titleExpr, "A-Za-zÀ-ÿĀ-žĐđıİŞşĞğÇçÖöÜüÑñ")
+	titleHangul := translationScriptCountSQL(titleExpr, "가-힣")
+	titleKana := translationScriptCountSQL(titleExpr, "ぁ-んァ-ン")
+	titleCyrillic := translationScriptCountSQL(titleExpr, "А-Яа-яЁёІіЇїЄєҐґ")
+	titleArabic := translationScriptCountSQL(titleExpr, "؀-ۿ")
+	titleDevanagari := translationScriptCountSQL(titleExpr, "ऀ-ॿ")
+	titleThai := translationScriptCountSQL(titleExpr, "ก-๿")
+	titleLatin := translationScriptCountSQL(titleExpr, "A-Za-zÀ-ÿĀ-žĐđıİŞşĞğÇçÖöÜüÑñ")
+	textHangul := translationScriptCountSQL(textExpr, "가-힣")
+	textKana := translationScriptCountSQL(textExpr, "ぁ-んァ-ン")
+	textHan := translationScriptCountSQL(textExpr, "一-龥")
+	textCyrillic := translationScriptCountSQL(textExpr, "А-Яа-яЁёІіЇїЄєҐґ")
+	textArabic := translationScriptCountSQL(textExpr, "؀-ۿ")
+	textDevanagari := translationScriptCountSQL(textExpr, "ऀ-ॿ")
+	textThai := translationScriptCountSQL(textExpr, "ก-๿")
 	switch normalizeTranslationTarget(target) {
 	case "ko":
-		return fmt.Sprintf("%s >= 4 AND %s = 0 AND %s <= 2 AND (%s * 3) >= %s", hangul, kana, han, hangul, latin)
+		return fmt.Sprintf("%s >= 4 AND %s = 0 AND %s = 0 AND %s <= 4 AND (%s * 3) >= %s", titleHangul, titleKana, textKana, textHan, titleHangul, titleLatin)
 	case "ja":
-		return fmt.Sprintf("%s >= 2", kana)
+		return fmt.Sprintf("%s >= 2 AND %s = 0", textKana, textHangul)
 	case "zh-Hans", "zh-Hant":
-		return fmt.Sprintf("%s >= 2 AND %s = 0 AND %s = 0", han, hangul, kana)
+		return fmt.Sprintf("%s >= 2 AND %s = 0 AND %s = 0", textHan, textHangul, textKana)
 	case "ru", "uk":
-		return fmt.Sprintf("%s >= 2", cyrillic)
+		return fmt.Sprintf("%s >= 2", titleCyrillic)
 	case "ar":
-		return fmt.Sprintf("%s >= 2", arabic)
+		return fmt.Sprintf("%s >= 2", titleArabic)
 	case "hi":
-		return fmt.Sprintf("%s >= 2", devanagari)
+		return fmt.Sprintf("%s >= 2", titleDevanagari)
 	case "th":
-		return fmt.Sprintf("%s >= 2", thai)
+		return fmt.Sprintf("%s >= 2", titleThai)
 	default:
-		return fmt.Sprintf("%s >= 3 AND (%s + %s + %s + %s + %s + %s + %s) = 0", latin, hangul, kana, han, cyrillic, arabic, devanagari, thai)
+		return fmt.Sprintf("%s >= 3 AND (%s + %s + %s + %s + %s + %s + %s) = 0", titleLatin, textHangul, textKana, textHan, textCyrillic, textArabic, textDevanagari, textThai)
 	}
 }
 
@@ -484,6 +529,34 @@ func targetLanguageName(target string) string {
 	default:
 		return target
 	}
+}
+
+func localizeTranslationLevel(target, raw string) string {
+	value := strings.TrimSpace(raw)
+	key := strings.ToLower(strings.NewReplacer(" ", "", "_", "", "-", "").Replace(value))
+	if key == "" {
+		return value
+	}
+	levels := map[string]map[string]string{
+		"beginner": {
+			"ko": "초급", "en": "Beginner", "ja": "初級", "zh-Hans": "初级", "zh-Hant": "初級",
+		},
+		"intermediate": {
+			"ko": "중급", "en": "Intermediate", "ja": "中級", "zh-Hans": "中级", "zh-Hant": "中級",
+		},
+		"advanced": {
+			"ko": "고급", "en": "Advanced", "ja": "上級", "zh-Hans": "高级", "zh-Hant": "高級",
+		},
+		"alllevels": {
+			"ko": "전체 수준", "en": "All levels", "ja": "全レベル", "zh-Hans": "所有级别", "zh-Hant": "所有級別",
+		},
+	}
+	if byLang, ok := levels[key]; ok {
+		if label := byLang[normalizeTranslationTarget(target)]; label != "" {
+			return label
+		}
+	}
+	return value
 }
 
 func inferTranslationProvider() string {

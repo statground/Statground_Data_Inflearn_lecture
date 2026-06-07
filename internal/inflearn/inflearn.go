@@ -73,6 +73,7 @@ type Config struct {
 	UserAgent            string
 
 	TranslationTargetLanguages []string
+	TranslationCourseIDs       []int
 	TranslationBatchSize       int
 	TranslationMaxPerRun       int
 	TranslationTable           string

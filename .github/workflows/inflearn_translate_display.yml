@@ -13,6 +13,10 @@ on:
         description: "Maximum translation rows per run"
         required: false
         default: "80"
+      course_ids:
+        description: "Optional comma-separated Inflearn course IDs for a narrow backfill"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -61,6 +65,7 @@ jobs:
           INFLEARN_TRANSLATION_MODEL: ${{ vars.INFLEARN_TRANSLATION_MODEL }}
           INFLEARN_TRANSLATION_TARGET_LANGS_INPUT: ${{ github.event.inputs.languages }}
           INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT: ${{ github.event.inputs.max_per_run }}
+          INFLEARN_TRANSLATION_COURSE_IDS: ${{ github.event.inputs.course_ids }}
           INFLEARN_TRANSLATION_BATCH_SIZE: "12"
         run: |
           if [ -z "$CH_HOST" ] || [ -z "$CH_USER" ]; then
