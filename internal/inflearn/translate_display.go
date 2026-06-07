@@ -13,6 +13,7 @@ import (
 )
 
 const translationPromptContract = "inflearn-course-display-translation-v1:no-links:json-only"
+const curriculumTranslationPromptContract = "inflearn-course-curriculum-translation-v1:no-links:json-only"
 
 type displayTranslationCandidate struct {
 	CourseID          int
@@ -34,6 +35,20 @@ type displayTranslationResult struct {
 	Keywords          string `json:"keywords"`
 }
 
+type displayCurriculumTranslationCandidate struct {
+	CourseID     int
+	SourceLocale string
+	SectionID    int
+	SectionTitle string
+	UnitID       int
+	UnitTitle    string
+}
+
+type displayCurriculumTranslationResult struct {
+	SectionTitle string `json:"section_title"`
+	UnitTitle    string `json:"unit_title"`
+}
+
 func LoadTranslationConfig() (Config, error) {
 	host := envFirst("CH_HOST", "CLICKHOUSE_HOST")
 	targets := splitCSV(envDefault("INFLEARN_TRANSLATION_TARGET_LANGS", "ko,en,ja,zh-Hans,zh-Hant,es,fr,de,pt-BR,ru,id,vi,th,ms,fil,hi,ar,it,nl,pl,sv,tr,uk"))
@@ -52,6 +67,7 @@ func LoadTranslationConfig() (Config, error) {
 		TranslationBatchSize:       parsePositiveInt(envDefault("INFLEARN_TRANSLATION_BATCH_SIZE", "12"), 12),
 		TranslationMaxPerRun:       parsePositiveInt(envDefault("INFLEARN_TRANSLATION_MAX_PER_RUN", "80"), 80),
 		TranslationTable:           envDefault("INFLEARN_TRANSLATION_TABLE", "Data_Lecture_Inflearn_Service.inflearn_course_display_translation"),
+		TranslationCurriculumTable: envDefault("INFLEARN_CURRICULUM_TRANSLATION_TABLE", "Data_Lecture_Inflearn_Service.inflearn_course_curriculum_display_translation"),
 		TranslationProvider:        strings.ToLower(strings.TrimSpace(envDefault("INFLEARN_TRANSLATION_PROVIDER", ""))),
 		TranslationEndpoint:        strings.TrimSpace(envDefault("INFLEARN_TRANSLATION_ENDPOINT", "")),
 		TranslationAPIKey:          envFirst("INFLEARN_TRANSLATION_API_KEY", "OPENAI_API_KEY", "GH_MODELS_API_KEY", "GITHUB_MODELS_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY"),
@@ -85,6 +101,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 	}
 	remaining := s.Cfg.TranslationMaxPerRun
 	totalInserted := 0
+	totalCurriculumInserted := 0
 	for _, target := range s.Cfg.TranslationTargetLanguages {
 		if remaining <= 0 {
 			break
@@ -143,7 +160,63 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 		}
 		fmt.Printf("[translate] target=%s inserted=%d remaining=%d\n", target, len(rows), remaining)
 	}
-	fmt.Printf("[done] display_translations_inserted=%d\n", totalInserted)
+	for _, target := range s.Cfg.TranslationTargetLanguages {
+		if remaining <= 0 {
+			break
+		}
+		limit := s.Cfg.TranslationBatchSize
+		if limit > remaining {
+			limit = remaining
+		}
+		candidates, err := s.pickDisplayCurriculumTranslationCandidates(ctx, target, limit)
+		if err != nil {
+			return err
+		}
+		if len(candidates) == 0 {
+			fmt.Printf("[translate-curriculum] target=%s candidates=0\n", target)
+			continue
+		}
+		rows := make([]map[string]any, 0, len(candidates))
+		for _, candidate := range candidates {
+			sourceHash := candidate.SourceHash()
+			if s.Cfg.TranslationDryRun {
+				fmt.Printf("[translate-curriculum:dry-run] target=%s course_id=%d section_id=%d unit_id=%d source_locale=%s source_hash=%d title=%q\n", target, candidate.CourseID, candidate.SectionID, candidate.UnitID, candidate.SourceLocale, sourceHash, candidate.UnitTitle)
+				remaining--
+				continue
+			}
+			translated, err := s.translateCurriculumCandidate(ctx, target, candidate)
+			if err != nil {
+				fmt.Printf("[warn] translate curriculum failed target=%s course_id=%d unit_id=%d error=%s\n", target, candidate.CourseID, candidate.UnitID, sanitizeTranslationError(err))
+				continue
+			}
+			now := FormatCHTime(NowDT64())
+			rows = append(rows, map[string]any{
+				"course_id":         candidate.CourseID,
+				"source_locale":     candidate.SourceLocale,
+				"target_language":   target,
+				"section_id":        candidate.SectionID,
+				"unit_id":           candidate.UnitID,
+				"source_hash":       sourceHash,
+				"translated_at":     now,
+				"section_title":     compactTranslationText(translated.SectionTitle, 500),
+				"unit_title":        compactTranslationText(translated.UnitTitle, 500),
+				"model":             s.Cfg.TranslationModel,
+				"prompt_hash":       H64(curriculumTranslationPromptContract),
+				"generation_status": "success",
+				"generation_error":  "",
+				"ingested_at":       now,
+			})
+			remaining--
+		}
+		if len(rows) > 0 {
+			if err := s.insertCurriculumTranslations(ctx, rows); err != nil {
+				return err
+			}
+			totalCurriculumInserted += len(rows)
+		}
+		fmt.Printf("[translate-curriculum] target=%s inserted=%d remaining=%d\n", target, len(rows), remaining)
+	}
+	fmt.Printf("[done] display_translations_inserted=%d curriculum_translations_inserted=%d\n", totalInserted, totalCurriculumInserted)
 	return nil
 }
 
@@ -156,6 +229,16 @@ func (c displayTranslationCandidate) SourceHash() uint64 {
 		c.CategorySubTitle,
 		c.LevelCode,
 		c.Keywords,
+	}, "\x1f"))
+}
+
+func (c displayCurriculumTranslationCandidate) SourceHash() uint64 {
+	return H64(strings.Join([]string{
+		c.SourceLocale,
+		strconv.Itoa(c.SectionID),
+		c.SectionTitle,
+		strconv.Itoa(c.UnitID),
+		c.UnitTitle,
 	}, "\x1f"))
 }
 
@@ -348,6 +431,182 @@ func (s *Service) translateDisplayCandidate(ctx context.Context, target string, 
 	return out, nil
 }
 
+func (s *Service) pickDisplayCurriculumTranslationCandidates(ctx context.Context, target string, limit int) ([]displayCurriculumTranslationCandidate, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	target = normalizeTranslationTarget(target)
+	sourcePreference := "multiIf(c.locale = 'ko', 0, c.locale = 'en', 1, 9)"
+	if target == "en" {
+		sourcePreference = "multiIf(c.locale = 'en', 0, c.locale = 'ko', 1, 9)"
+	}
+	courseIDFilter := ""
+	if len(s.Cfg.TranslationCourseIDs) > 0 {
+		courseIDFilter = fmt.Sprintf("AND course_id IN (%s)", translationCourseIDListSQL(s.Cfg.TranslationCourseIDs))
+	}
+	textExpr := "concat(section_title, ' ', unit_title)"
+	nativePredicate := translationNativePredicateSQL(target, "unit_title", textExpr)
+	sql := fmt.Sprintf(`
+        WITH latest AS (
+          SELECT
+            course_id AS course_id,
+            locale AS locale,
+            section_id AS section_id,
+            unit_id AS unit_id,
+            argMax(section_title, fetched_at) AS section_title,
+            argMax(unit_title, fetched_at) AS unit_title,
+            max(fetched_at) AS max_fetched_at
+          FROM %s.inflearn_course_curriculum_unit
+          WHERE locale IN ('ko', 'en')
+            %s
+          GROUP BY course_id, locale, section_id, unit_id
+          HAVING unit_title != ''
+        ),
+        native_target AS (
+          SELECT course_id AS native_course_id, section_id AS native_section_id, unit_id AS native_unit_id
+          FROM latest
+          WHERE %s
+          GROUP BY native_course_id, native_section_id, native_unit_id
+        ),
+        existing AS (
+          SELECT course_id AS existing_course_id, section_id AS existing_section_id, unit_id AS existing_unit_id
+          FROM %s
+          WHERE toString(target_language) = %s
+            AND toString(generation_status) = 'success'
+          GROUP BY existing_course_id, existing_section_id, existing_unit_id
+        ),
+        scored AS (
+          SELECT
+            c.course_id AS course_id,
+            c.locale AS locale,
+            c.section_id AS section_id,
+            c.unit_id AS unit_id,
+            c.section_title AS section_title,
+            c.unit_title AS unit_title,
+            c.max_fetched_at AS max_fetched_at,
+            %s AS source_rank
+          FROM latest AS c
+          LEFT JOIN native_target AS n
+            ON n.native_course_id = toUInt32(c.course_id)
+           AND n.native_section_id = toUInt32(c.section_id)
+           AND n.native_unit_id = toUInt32(c.unit_id)
+          LEFT JOIN existing AS e
+            ON e.existing_course_id = toUInt32(c.course_id)
+           AND e.existing_section_id = toUInt32(c.section_id)
+           AND e.existing_unit_id = toUInt32(c.unit_id)
+          WHERE n.native_course_id = 0 AND e.existing_course_id = 0
+        ),
+        per_unit AS (
+          SELECT
+            course_id,
+            section_id,
+            unit_id,
+            argMin(
+              tuple(locale, section_title, unit_title),
+              tuple(source_rank, -toUnixTimestamp64Milli(max_fetched_at), -toInt64(course_id), -toInt64(section_id), -toInt64(unit_id))
+            ) AS best,
+            max(max_fetched_at) AS order_max_fetched_at
+          FROM scored
+          GROUP BY course_id, section_id, unit_id
+        )
+        SELECT
+          course_id,
+          tupleElement(best, 1) AS locale,
+          section_id,
+          tupleElement(best, 2) AS section_title,
+          unit_id,
+          tupleElement(best, 3) AS unit_title
+        FROM per_unit
+        ORDER BY order_max_fetched_at DESC, course_id DESC, section_id ASC, unit_id ASC
+        LIMIT %d
+        SETTINGS max_execution_time = 20, timeout_overflow_mode = 'break', max_threads = 4
+    `, chIdent(s.Cfg.CHServiceDatabase), courseIDFilter, nativePredicate, chTablePathWithDefault(s.Cfg.TranslationCurriculumTable, "Data_Lecture_Inflearn_Service", "inflearn_course_curriculum_display_translation"), QuoteSQLString(target), sourcePreference, limit)
+	rows, err := s.CHQueryRows(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]displayCurriculumTranslationCandidate, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, displayCurriculumTranslationCandidate{
+			CourseID:     asInt(row["course_id"]),
+			SourceLocale: asString(row["locale"]),
+			SectionID:    asInt(row["section_id"]),
+			SectionTitle: asString(row["section_title"]),
+			UnitID:       asInt(row["unit_id"]),
+			UnitTitle:    asString(row["unit_title"]),
+		})
+	}
+	return out, nil
+}
+
+func (s *Service) translateCurriculumCandidate(ctx context.Context, target string, candidate displayCurriculumTranslationCandidate) (displayCurriculumTranslationResult, error) {
+	target = normalizeTranslationTarget(target)
+	input := map[string]any{
+		"target_language":      target,
+		"target_language_name": targetLanguageName(target),
+		"section_title":        candidate.SectionTitle,
+		"unit_title":           candidate.UnitTitle,
+	}
+	inputJSON, _ := json.Marshal(input)
+	prompt := "Translate the Inflearn curriculum section and unit title into the requested target language. Preserve brand names, programming language names, library names, and proper nouns when appropriate. Do not add hyperlinks or markdown. Return strict JSON with keys section_title and unit_title only.\n\nINPUT:\n" + string(inputJSON)
+	payload := map[string]any{
+		"model": s.Cfg.TranslationModel,
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are a precise course curriculum translator for a multilingual education search interface."},
+			{"role": "user", "content": prompt},
+		},
+		"temperature": 0.2,
+	}
+	body, _ := json.Marshal(payload)
+	reqCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, s.Cfg.TranslationEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return displayCurriculumTranslationResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", s.Cfg.UserAgent)
+	req.Header.Set("Authorization", "Bearer "+s.Cfg.TranslationAPIKey)
+	resp, err := s.HTTPClient.Do(req)
+	if err != nil {
+		return displayCurriculumTranslationResult{}, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return displayCurriculumTranslationResult{}, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return displayCurriculumTranslationResult{}, fmt.Errorf("translation provider http %d", resp.StatusCode)
+	}
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return displayCurriculumTranslationResult{}, err
+	}
+	if len(parsed.Choices) == 0 {
+		return displayCurriculumTranslationResult{}, fmt.Errorf("translation provider returned no choices")
+	}
+	content := extractJSONObject(parsed.Choices[0].Message.Content)
+	var out displayCurriculumTranslationResult
+	if err := json.Unmarshal([]byte(content), &out); err != nil {
+		return displayCurriculumTranslationResult{}, err
+	}
+	if strings.TrimSpace(out.UnitTitle) == "" {
+		return displayCurriculumTranslationResult{}, fmt.Errorf("translation unit title is empty")
+	}
+	if strings.TrimSpace(out.SectionTitle) == "" {
+		out.SectionTitle = candidate.SectionTitle
+	}
+	return out, nil
+}
+
 func (s *Service) insertDisplayTranslations(ctx context.Context, rows []map[string]any) error {
 	if len(rows) == 0 {
 		return nil
@@ -360,6 +619,24 @@ func (s *Service) insertDisplayTranslations(ctx context.Context, rows []map[stri
 		}
 	}
 	sql := fmt.Sprintf("INSERT INTO %s FORMAT JSONEachRow", chTablePath(s.Cfg.TranslationTable))
+	insertCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	_, err := s.chPost(insertCtx, sql, buf.Bytes(), "application/x-ndjson")
+	return err
+}
+
+func (s *Service) insertCurriculumTranslations(ctx context.Context, rows []map[string]any) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, row := range rows {
+		if err := enc.Encode(row); err != nil {
+			return err
+		}
+	}
+	sql := fmt.Sprintf("INSERT INTO %s FORMAT JSONEachRow", chTablePathWithDefault(s.Cfg.TranslationCurriculumTable, "Data_Lecture_Inflearn_Service", "inflearn_course_curriculum_display_translation"))
 	insertCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	_, err := s.chPost(insertCtx, sql, buf.Bytes(), "application/x-ndjson")
@@ -603,9 +880,13 @@ func defaultTranslationModel(provider string) string {
 }
 
 func chTablePath(raw string) string {
+	return chTablePathWithDefault(raw, "Data_Lecture_Inflearn_Service", "inflearn_course_display_translation")
+}
+
+func chTablePathWithDefault(raw, defaultDB, defaultTable string) string {
 	parts := strings.Split(strings.TrimSpace(raw), ".")
 	if len(parts) != 2 {
-		return chIdent("Data_Lecture_Inflearn_Service") + "." + chIdent("inflearn_course_display_translation")
+		return chIdent(defaultDB) + "." + chIdent(defaultTable)
 	}
 	return chIdent(parts[0]) + "." + chIdent(parts[1])
 }

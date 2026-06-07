@@ -77,6 +77,7 @@ type Config struct {
 	TranslationBatchSize       int
 	TranslationMaxPerRun       int
 	TranslationTable           string
+	TranslationCurriculumTable string
 	TranslationProvider        string
 	TranslationEndpoint        string
 	TranslationAPIKey          string
