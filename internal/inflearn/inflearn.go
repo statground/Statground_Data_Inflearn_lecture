@@ -63,6 +63,13 @@ type Config struct {
 	SitemapBase          string
 	SitemapBaseFallback  string
 	SitemapPrefix        string
+	RecentHeadEnabled   bool
+	RecentSearchBaseURL string
+	CourseAPIBaseURL     string
+	RecentHeadPages     int
+	RecentHeadPageSize  int
+	RecentHeadSort      string
+	RecentHeadTypes     string
 	BatchSize            int
 	MaxURLsPerRun        int
 	CheckpointFlushEvery int
@@ -171,6 +178,13 @@ func LoadConfig() (Config, error) {
 		SitemapBase:          strings.TrimRight(envDefault("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps"), "/"),
 		SitemapBaseFallback:  strings.TrimRight(envDefault("SITEMAP_BASE_FALLBACK", "https://www.inflearn.com/sitemaps"), "/"),
 		SitemapPrefix:        envDefault("SITEMAP_PREFIX", "sitemap-courseDetail-"),
+		RecentHeadEnabled:   parseBool(envDefault("INFLEARN_RECENT_HEAD_ENABLED", "true")),
+		RecentSearchBaseURL: strings.TrimRight(envDefault("INFLEARN_RECENT_SEARCH_BASE_URL", "https://course-api.inflearn.com"), "/"),
+		CourseAPIBaseURL:     strings.TrimRight(envDefault("INFLEARN_COURSE_API_BASE_URL", "https://course-api.inflearn.com"), "/"),
+		RecentHeadPages:     parsePositiveInt(envDefault("INFLEARN_RECENT_HEAD_PAGES", "5"), 5),
+		RecentHeadPageSize:  parsePositiveInt(envDefault("INFLEARN_RECENT_HEAD_PAGE_SIZE", "100"), 100),
+		RecentHeadSort:      envDefault("INFLEARN_RECENT_HEAD_SORT", "RECENT"),
+		RecentHeadTypes:     envDefault("INFLEARN_RECENT_HEAD_TYPES", "ONLINE"),
 		BatchSize:            parsePositiveInt(envDefault("BATCH_SIZE", "100"), 100),
 		MaxURLsPerRun:        parsePositiveInt(envDefault("MAX_URLS_PER_RUN", "1500"), 1500),
 		CheckpointFlushEvery: parsePositiveInt(envDefault("CHECKPOINT_FLUSH_EVERY", "200"), 200),
@@ -895,6 +909,21 @@ func (s *Service) courseExists(ctx context.Context, courseID int, locale string)
 	if s.UseLocalState() {
 		return s.localCourseExists(courseID, locale)
 	}
+	return s.courseExistsInClickHouse(ctx, courseID, locale)
+}
+
+func (s *Service) hasClickHouseConfig() bool {
+	return strings.TrimSpace(s.Cfg.CHHost) != "" && s.Cfg.CHPort > 0 && strings.TrimSpace(s.Cfg.CHUser) != ""
+}
+
+func (s *Service) courseExistsForRecentHead(ctx context.Context, courseID int, locale string) (bool, error) {
+	if s.hasClickHouseConfig() {
+		return s.courseExistsInClickHouse(ctx, courseID, locale)
+	}
+	return s.courseExists(ctx, courseID, locale)
+}
+
+func (s *Service) courseExistsInClickHouse(ctx context.Context, courseID int, locale string) (bool, error) {
 	sql := fmt.Sprintf(`
         SELECT count() AS c
         FROM (
@@ -913,6 +942,130 @@ func (s *Service) courseExists(ctx context.Context, courseID int, locale string)
 		return false, nil
 	}
 	return asInt64(rows[0]["c"]) > 0, nil
+}
+
+func (s *Service) recentSearchURL(page int) string {
+	values := url.Values{}
+	values.Set("pageSize", strconv.Itoa(s.Cfg.RecentHeadPageSize))
+	values.Set("pageNumber", strconv.Itoa(page))
+	values.Set("sort", s.Cfg.RecentHeadSort)
+	values.Set("types", s.Cfg.RecentHeadTypes)
+	values.Set("isBot", "false")
+	base := strings.TrimRight(s.Cfg.RecentSearchBaseURL, "/")
+	if base == "" {
+		base = "https://course-api.inflearn.com"
+	}
+	return base + "/client/api/v2/courses/search?" + values.Encode()
+}
+
+func (s *Service) fetchRecentCourseURLs(ctx context.Context) ([]string, error) {
+	if !s.Cfg.RecentHeadEnabled {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	urls := make([]string, 0, s.Cfg.RecentHeadPages*s.Cfg.RecentHeadPageSize)
+	for page := 1; page <= s.Cfg.RecentHeadPages; page++ {
+		payload, status, err := s.httpGetJSON(ctx, s.recentSearchURL(page))
+		if err != nil {
+			return urls, err
+		}
+		if status != http.StatusOK || payload == nil {
+			return urls, fmt.Errorf("recent course search returned http %d on page %d", status, page)
+		}
+		pageURLs := recentCourseURLsFromSearchPayload(payload)
+		if len(pageURLs) == 0 {
+			break
+		}
+		for _, rawURL := range pageURLs {
+			courseID, locale := ParseCourseIDAndLocale(rawURL)
+			if courseID <= 0 {
+				continue
+			}
+			key := fmt.Sprintf("%d|%s", courseID, locale)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			urls = append(urls, rawURL)
+		}
+		if len(pageURLs) < s.Cfg.RecentHeadPageSize {
+			break
+		}
+		JitterSleep(s.Cfg.RequestSleepMin, s.Cfg.RequestSleepMax)
+	}
+	return urls, nil
+}
+
+func recentCourseURLsFromSearchPayload(payload map[string]any) []string {
+	data := asMap(payload["data"])
+	items := asSlice(data["items"])
+	out := make([]string, 0, len(items))
+	for _, raw := range items {
+		item := asMap(raw)
+		course := asMap(item["course"])
+		courseID := firstPositiveInt(
+			item["id"],
+			item["courseId"],
+			item["course_id"],
+			course["id"],
+			course["courseId"],
+			course["course_id"],
+		)
+		if courseID <= 0 {
+			continue
+		}
+		rawURL := normalizeInflearnCourseURL(
+			firstNonEmpty(asString(item["url"]), asString(course["url"])),
+			courseID,
+			firstNonEmpty(asString(item["slug"]), asString(course["slug"])),
+		)
+		if rawURL != "" {
+			out = append(out, rawURL)
+		}
+	}
+	return out
+}
+
+func normalizeInflearnCourseURL(rawURL string, courseID int, slug string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL != "" {
+		if strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://") {
+			return ensureCourseIDQuery(rawURL, courseID)
+		}
+		if strings.HasPrefix(rawURL, "/") {
+			return ensureCourseIDQuery("https://www.inflearn.com"+rawURL, courseID)
+		}
+	}
+	slug = strings.Trim(strings.TrimSpace(slug), "/")
+	if courseID <= 0 || slug == "" {
+		return ""
+	}
+	return fmt.Sprintf("https://www.inflearn.com/course/%s?cid=%d", url.PathEscape(slug), courseID)
+}
+
+func ensureCourseIDQuery(rawURL string, courseID int) string {
+	if courseID <= 0 {
+		return rawURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	values := parsed.Query()
+	if values.Get("cid") == "" && values.Get("courseId") == "" && values.Get("course_id") == "" {
+		values.Set("cid", strconv.Itoa(courseID))
+		parsed.RawQuery = values.Encode()
+	}
+	return parsed.String()
+}
+
+func firstPositiveInt(values ...any) int {
+	for _, value := range values {
+		if n := asInt(value); n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 func normalizeXMLBytes(body []byte) []byte {
@@ -1101,7 +1254,11 @@ func (r CourseRows) InsertAll(ctx context.Context, s *Service) error {
 }
 
 func (s *Service) fetchCourseAPI(ctx context.Context, path string) (map[string]any, int, error) {
-	return s.httpGetJSON(ctx, "https://www.inflearn.com"+path)
+	base := strings.TrimRight(s.Cfg.CourseAPIBaseURL, "/")
+	if base == "" {
+		base = "https://course-api.inflearn.com"
+	}
+	return s.httpGetJSON(ctx, base+path)
 }
 
 func (s *Service) fetchCourseData(ctx context.Context, courseURL string, fetchedAt time.Time) (*CourseFetchedData, error) {
@@ -1506,6 +1663,72 @@ func (s *Service) flushCollectBatch(ctx context.Context, batch *CourseRows, cp C
 	return nil
 }
 
+func (s *Service) collectRecentHead(ctx context.Context, batch *CourseRows, existsCache map[string]bool, batchLimit int) (int, int, error) {
+	if !s.Cfg.RecentHeadEnabled || batchLimit <= 0 {
+		return 0, 0, nil
+	}
+	urls, err := s.fetchRecentCourseURLs(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	scanned := 0
+	processed := 0
+	for _, rawURL := range urls {
+		if processed >= batchLimit {
+			break
+		}
+		courseIDHint, locale := ParseCourseIDAndLocale(rawURL)
+		if courseIDHint <= 0 {
+			continue
+		}
+		scanned++
+		cacheKey := fmt.Sprintf("%d|%s", courseIDHint, locale)
+		exists, ok := existsCache[cacheKey]
+		if !ok {
+			exists, err = s.courseExistsForRecentHead(ctx, courseIDHint, locale)
+			if err != nil {
+				return scanned, processed, err
+			}
+			existsCache[cacheKey] = exists
+		}
+		if exists {
+			continue
+		}
+
+		fetchedAt := NowDT64()
+		data, err := s.fetchCourseData(ctx, rawURL, fetchedAt)
+		if err != nil {
+			fmt.Printf("[warn] recent head fetch failed url=%s error=%v\n", rawURL, err)
+			continue
+		}
+		if data.CourseID > 0 {
+			cacheKey = fmt.Sprintf("%d|%s", data.CourseID, data.Locale)
+			if exists, ok := existsCache[cacheKey]; !ok {
+				exists, err = s.courseExistsForRecentHead(ctx, data.CourseID, data.Locale)
+				if err != nil {
+					return scanned, processed, err
+				}
+				existsCache[cacheKey] = exists
+			}
+			if existsCache[cacheKey] {
+				continue
+			}
+		}
+
+		batch.Append(buildCourseRows(data, fetchedAt))
+		processed++
+		existsCache[cacheKey] = true
+		if processed%20 == 0 {
+			fmt.Printf("[recent-head] processed=%d last_course_id=%d\n", processed, data.CourseID)
+		}
+		JitterSleep(s.Cfg.RequestSleepMin, s.Cfg.RequestSleepMax)
+	}
+	if scanned > 0 || processed > 0 {
+		fmt.Printf("[recent-head] scanned=%d processed=%d candidates=%d\n", scanned, processed, len(urls))
+	}
+	return scanned, processed, nil
+}
+
 func (s *Service) RunCollectNew(ctx context.Context) error {
 	if err := s.ValidateKafkaIngest(ctx); err != nil {
 		return err
@@ -1525,6 +1748,18 @@ func (s *Service) RunCollectNew(ctx context.Context) error {
 	flushEvery := s.Cfg.CheckpointFlushEvery
 	resetAfter := false
 	stop := false
+
+	recentScanned, recentProcessed, err := s.collectRecentHead(ctx, batch, existsCache, s.Cfg.BatchSize)
+	if err != nil {
+		fmt.Printf("[warn] recent head collect failed error=%v\n", err)
+	} else {
+		scanned += recentScanned
+		processed += recentProcessed
+	}
+	if processed >= s.Cfg.BatchSize {
+		fmt.Printf("[batch] recent-head new-course limit hit processed=%d batch_size=%d\n", processed, s.Cfg.BatchSize)
+		stop = true
+	}
 
 	for !stop {
 		urls, reachedEnd, temporarilyUnavailable, err := s.fetchSitemapURLs(ctx, current.SitemapIndex)
