@@ -63,13 +63,13 @@ type Config struct {
 	SitemapBase          string
 	SitemapBaseFallback  string
 	SitemapPrefix        string
-	RecentHeadEnabled   bool
-	RecentSearchBaseURL string
+	RecentHeadEnabled    bool
+	RecentSearchBaseURL  string
 	CourseAPIBaseURL     string
-	RecentHeadPages     int
-	RecentHeadPageSize  int
-	RecentHeadSort      string
-	RecentHeadTypes     string
+	RecentHeadPages      int
+	RecentHeadPageSize   int
+	RecentHeadSort       string
+	RecentHeadTypes      string
 	BatchSize            int
 	MaxURLsPerRun        int
 	CheckpointFlushEvery int
@@ -178,13 +178,13 @@ func LoadConfig() (Config, error) {
 		SitemapBase:          strings.TrimRight(envDefault("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps"), "/"),
 		SitemapBaseFallback:  strings.TrimRight(envDefault("SITEMAP_BASE_FALLBACK", "https://www.inflearn.com/sitemaps"), "/"),
 		SitemapPrefix:        envDefault("SITEMAP_PREFIX", "sitemap-courseDetail-"),
-		RecentHeadEnabled:   parseBool(envDefault("INFLEARN_RECENT_HEAD_ENABLED", "true")),
-		RecentSearchBaseURL: strings.TrimRight(envDefault("INFLEARN_RECENT_SEARCH_BASE_URL", "https://course-api.inflearn.com"), "/"),
+		RecentHeadEnabled:    parseBool(envDefault("INFLEARN_RECENT_HEAD_ENABLED", "true")),
+		RecentSearchBaseURL:  strings.TrimRight(envDefault("INFLEARN_RECENT_SEARCH_BASE_URL", "https://course-api.inflearn.com"), "/"),
 		CourseAPIBaseURL:     strings.TrimRight(envDefault("INFLEARN_COURSE_API_BASE_URL", "https://course-api.inflearn.com"), "/"),
-		RecentHeadPages:     parsePositiveInt(envDefault("INFLEARN_RECENT_HEAD_PAGES", "5"), 5),
-		RecentHeadPageSize:  parsePositiveInt(envDefault("INFLEARN_RECENT_HEAD_PAGE_SIZE", "100"), 100),
-		RecentHeadSort:      envDefault("INFLEARN_RECENT_HEAD_SORT", "RECENT"),
-		RecentHeadTypes:     envDefault("INFLEARN_RECENT_HEAD_TYPES", "ONLINE"),
+		RecentHeadPages:      parsePositiveInt(envDefault("INFLEARN_RECENT_HEAD_PAGES", "5"), 5),
+		RecentHeadPageSize:   parsePositiveInt(envDefault("INFLEARN_RECENT_HEAD_PAGE_SIZE", "100"), 100),
+		RecentHeadSort:       envDefault("INFLEARN_RECENT_HEAD_SORT", "RECENT"),
+		RecentHeadTypes:      envDefault("INFLEARN_RECENT_HEAD_TYPES", "ONLINE"),
 		BatchSize:            parsePositiveInt(envDefault("BATCH_SIZE", "100"), 100),
 		MaxURLsPerRun:        parsePositiveInt(envDefault("MAX_URLS_PER_RUN", "1500"), 1500),
 		CheckpointFlushEvery: parsePositiveInt(envDefault("CHECKPOINT_FLUSH_EVERY", "200"), 200),
@@ -439,14 +439,41 @@ func ParseLocaleFromURL(raw string) string {
 	if err != nil {
 		return "ko"
 	}
-	locale := strings.ToLower(strings.TrimSpace(u.Query().Get("locale")))
+	locale := normalizeInflearnURLLocale(u.Query().Get("locale"))
 	if locale != "" {
 		return locale
 	}
-	if strings.HasPrefix(u.Path, "/en/") {
-		return "en"
+	parts := strings.Split(strings.Trim(u.EscapedPath(), "/"), "/")
+	if len(parts) > 0 {
+		if locale := normalizeInflearnURLLocale(parts[0]); locale != "" {
+			return locale
+		}
 	}
 	return "ko"
+}
+
+func normalizeInflearnURLLocale(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "":
+		return ""
+	case "ko", "ko-kr", "kr":
+		return "ko"
+	case "en", "en-us", "en-gb":
+		return "en"
+	case "ja", "ja-jp":
+		return "ja"
+	case "zh-hans", "zh-cn", "zh-sg":
+		return "zh-Hans"
+	case "zh-hant", "zh-tw", "zh-hk":
+		return "zh-Hant"
+	case "es", "fr", "de", "ru", "id", "vi", "th", "ms", "fil", "hi", "ar", "it", "nl", "pl", "sv", "tr", "uk":
+		return value
+	case "pt", "pt-br":
+		return "pt-BR"
+	default:
+		return ""
+	}
 }
 
 func ParseCourseIDAndLocale(raw string) (int, string) {
@@ -924,16 +951,7 @@ func (s *Service) courseExistsForRecentHead(ctx context.Context, courseID int, l
 }
 
 func (s *Service) courseExistsInClickHouse(ctx context.Context, courseID int, locale string) (bool, error) {
-	sql := fmt.Sprintf(`
-        SELECT count() AS c
-        FROM (
-          SELECT 1
-          FROM %s.inflearn_course_dim
-          WHERE course_id = %d AND locale = %s
-          GROUP BY course_id, locale
-          LIMIT 1
-        )
-    `, chIdent(s.Cfg.CHServiceDatabase), courseID, QuoteSQLString(locale))
+	sql := courseExistsSQL(s.Cfg.CHServiceDatabase, courseID, locale)
 	rows, err := s.CHQueryRows(ctx, sql)
 	if err != nil {
 		return false, err
@@ -942,6 +960,36 @@ func (s *Service) courseExistsInClickHouse(ctx context.Context, courseID int, lo
 		return false, nil
 	}
 	return asInt64(rows[0]["c"]) > 0, nil
+}
+
+func courseExistsSQL(serviceDatabase string, courseID int, locale string) string {
+	locale = normalizeInflearnURLLocale(locale)
+	if locale == "" {
+		locale = "ko"
+	}
+	localeHaving := ""
+	if locale == "ko" {
+		localeHaving = `
+          HAVING match(title, '[가-힣]')
+             OR match(description, '[가-힣]')
+             OR match(category_main_title, '[가-힣]')
+             OR match(category_sub_title, '[가-힣]')`
+	}
+	return fmt.Sprintf(`
+        SELECT count() AS c
+        FROM (
+          SELECT
+            argMax(title, fetched_at) AS title,
+            argMax(description, fetched_at) AS description,
+            argMax(category_main_title, fetched_at) AS category_main_title,
+            argMax(category_sub_title, fetched_at) AS category_sub_title
+          FROM %s.inflearn_course_dim
+          WHERE course_id = %d AND locale = %s
+          GROUP BY course_id, locale
+          %s
+          LIMIT 1
+        )
+    `, chIdent(serviceDatabase), courseID, QuoteSQLString(locale), localeHaving)
 }
 
 func (s *Service) recentSearchURL(page int) string {
@@ -1942,6 +1990,39 @@ func (s *Service) getUpdateProgress(ctx context.Context) (int, int, error) {
 
 func (s *Service) setUpdateProgress(ctx context.Context, totalDone, lastBatchDone int) error {
 	return s.setCheckpoint(ctx, updateCheckpointSource, Checkpoint{SitemapIndex: totalDone, URLIndex: lastBatchDone})
+}
+
+func (s *Service) RunCollectURLs(ctx context.Context, urls []string) error {
+	batch := CourseRows{}
+	fetchedAt := NowDT64()
+	processed := 0
+	for _, rawURL := range urls {
+		rawURL = strings.TrimSpace(rawURL)
+		if rawURL == "" {
+			continue
+		}
+		data, err := s.fetchCourseData(ctx, rawURL, fetchedAt)
+		if err != nil {
+			return fmt.Errorf("collect url %s: %w", rawURL, err)
+		}
+		rows := buildCourseRows(data, fetchedAt)
+		batch.Append(rows)
+		processed++
+	}
+	if processed == 0 {
+		return fmt.Errorf("no course urls provided")
+	}
+	if err := batch.InsertAll(ctx, s); err != nil {
+		return err
+	}
+	if s.UseLocalState() {
+		if err := s.localRememberCourseRows(batch); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("[collect-urls] processed=%d snapshot=%d course_dim=%d curriculum=%d instructor=%d\n",
+		processed, len(batch.SnapshotRaw), len(batch.CourseDim), len(batch.CurriculumUnit), len(batch.InstructorDim))
+	return nil
 }
 
 func (s *Service) RunUpdateExisting(ctx context.Context) error {

@@ -78,7 +78,7 @@ jobs:
         env:
           GOPROXY: https://proxy.golang.org,direct
         run: |
-          go build -mod=mod ./cmd/inflearn-collect-new ./cmd/inflearn-update-existing
+          go build -mod=mod ./cmd/inflearn-collect-new ./cmd/inflearn-update-existing ./cmd/inflearn-collect-urls
 
       - name: Collect new Inflearn courses and publish Kafka events
         env:
