@@ -133,6 +133,25 @@ jobs:
         run: |
           go run -mod=mod ./cmd/inflearn-update-existing
 
+      - name: Refresh MirType provider practice content
+        env:
+          CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
+          CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
+          CH_USER: ${{ secrets.CH_USER || secrets.CLICKHOUSE_USER }}
+          CH_PASSWORD: ${{ secrets.CH_PASSWORD || secrets.CLICKHOUSE_PASSWORD }}
+          CH_PROTOCOL: ${{ secrets.CLICKHOUSE_PROTOCOL || secrets.CH_PROTOCOL || 'http' }}
+          CH_HTTP_URL_PATH: ${{ secrets.CLICKHOUSE_HTTP_URL_PATH || secrets.CH_HTTP_URL_PATH }}
+        run: |
+          if [ -z "$CH_HOST" ] || [ -z "$CH_USER" ] || [ -z "$CH_PASSWORD" ]; then
+            echo "Skipping MirType provider practice content refresh because ClickHouse secrets are not configured"
+            exit 0
+          fi
+          CH_PORT="${CH_PORT:-8123}"
+          CH_PROTOCOL="${CH_PROTOCOL:-http}"
+          CH_BASE_URL="${CH_PROTOCOL}://${CH_HOST}:${CH_PORT}/${CH_HTTP_URL_PATH}"
+          curl --fail --silent --show-error --max-time 300 -u "$CH_USER:$CH_PASSWORD" "$CH_BASE_URL" --data-binary "SYSTEM REFRESH VIEW mirtype_content.mv_provider_practice_content_refresh"
+          curl --fail --silent --show-error --max-time 60 -u "$CH_USER:$CH_PASSWORD" "$CH_BASE_URL" --data-binary "SELECT * FROM mirtype_content.v_provider_practice_content_current FORMAT TSVWithNames"
+
       - name: Save crawler state
         if: always()
         uses: actions/cache/save@v4
