@@ -158,7 +158,7 @@ func (s *Service) insertClickHouseRows(ctx context.Context, database, table stri
 	}
 	chunkSize := s.Cfg.CHInsertChunkSize
 	if chunkSize <= 0 {
-		chunkSize = 1000
+		chunkSize = 100
 	}
 	for start := 0; start < len(rows); start += chunkSize {
 		end := start + chunkSize
@@ -166,7 +166,7 @@ func (s *Service) insertClickHouseRows(ctx context.Context, database, table stri
 			end = len(rows)
 		}
 		if err := s.insertClickHouseRowsChunk(ctx, database, table, columns, rows[start:end]); err != nil {
-			return err
+			return fmt.Errorf("clickhouse insert %s.%s rows=%d offset=%d: %w", database, table, end-start, start, err)
 		}
 	}
 	return nil
@@ -174,8 +174,8 @@ func (s *Service) insertClickHouseRows(ctx context.Context, database, table stri
 
 func (s *Service) insertClickHouseRowsChunk(ctx context.Context, database, table string, columns []string, rows []map[string]any) error {
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "INSERT INTO %s.%s (%s) SETTINGS insert_distributed_sync = 1 FORMAT JSONEachRow\n",
-		chIdent(database), chIdent(table), clickHouseColumnList(columns))
+	fmt.Fprintf(&buf, "INSERT INTO %s.%s (%s) SETTINGS insert_distributed_sync = %d FORMAT JSONEachRow\n",
+		chIdent(database), chIdent(table), clickHouseColumnList(columns), boolToInt(s.Cfg.CHInsertDistributedSync))
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	for _, row := range rows {
@@ -183,10 +183,21 @@ func (s *Service) insertClickHouseRowsChunk(ctx context.Context, database, table
 			return err
 		}
 	}
-	insertCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	timeout := s.Cfg.CHInsertTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	insertCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	_, err := s.chPost(insertCtx, strings.TrimSpace(buf.String()), nil, "application/x-ndjson")
 	return err
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func clickHouseColumnList(columns []string) string {

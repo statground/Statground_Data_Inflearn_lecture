@@ -37,54 +37,56 @@ const (
 )
 
 type Config struct {
-	CHHost               string
-	CHPort               int
-	CHUser               string
-	CHPassword           string
-	CHDatabase           string
-	CHRawDatabase        string
-	CHServiceDatabase    string
-	CHLogDatabase        string
-	CHMartDatabase       string
-	CHSecure             bool
-	CHInsertChunkSize    int
-	IngestMode           string
-	LectureProvider      string
-	KafkaBrokers         []string
-	KafkaUsername        string
-	KafkaPassword        string
-	KafkaTopic           string
-	KafkaClientID        string
-	KafkaBatchSize       int
-	KafkaBatchTimeout    time.Duration
+	CHHost                  string
+	CHPort                  int
+	CHUser                  string
+	CHPassword              string
+	CHDatabase              string
+	CHRawDatabase           string
+	CHServiceDatabase       string
+	CHLogDatabase           string
+	CHMartDatabase          string
+	CHSecure                bool
+	CHInsertChunkSize       int
+	CHInsertTimeout         time.Duration
+	CHInsertDistributedSync bool
+	IngestMode              string
+	LectureProvider         string
+	KafkaBrokers            []string
+	KafkaUsername           string
+	KafkaPassword           string
+	KafkaTopic              string
+	KafkaClientID           string
+	KafkaBatchSize          int
+	KafkaBatchTimeout       time.Duration
 	KafkaWriteAttempts      int
 	KafkaWriteBackoffMin    time.Duration
 	KafkaWriteBackoffMax    time.Duration
 	KafkaPartitionFallback  bool
 	KafkaFallbackPartitions []int
 	KafkaFallbackTimeout    time.Duration
-	ProducerSource       string
-	ProducerIP           string
-	StateBackend         string
-	StateDir             string
-	SitemapBase          string
-	SitemapBaseFallback  string
-	SitemapPrefix        string
-	RecentHeadEnabled    bool
-	RecentSearchBaseURL  string
-	CourseAPIBaseURL     string
-	RecentHeadPages      int
-	RecentHeadPageSize   int
-	RecentHeadSort       string
-	RecentHeadTypes      string
-	BatchSize            int
-	MaxURLsPerRun        int
-	CheckpointFlushEvery int
-	UpdateBatchSize      int
-	Workers              int
-	RequestSleepMin      time.Duration
-	RequestSleepMax      time.Duration
-	UserAgent            string
+	ProducerSource          string
+	ProducerIP              string
+	StateBackend            string
+	StateDir                string
+	SitemapBase             string
+	SitemapBaseFallback     string
+	SitemapPrefix           string
+	RecentHeadEnabled       bool
+	RecentSearchBaseURL     string
+	CourseAPIBaseURL        string
+	RecentHeadPages         int
+	RecentHeadPageSize      int
+	RecentHeadSort          string
+	RecentHeadTypes         string
+	BatchSize               int
+	MaxURLsPerRun           int
+	CheckpointFlushEvery    int
+	UpdateBatchSize         int
+	Workers                 int
+	RequestSleepMin         time.Duration
+	RequestSleepMax         time.Duration
+	UserAgent               string
 
 	TranslationTargetLanguages []string
 	TranslationCourseIDs       []int
@@ -159,54 +161,56 @@ func LoadConfig() (Config, error) {
 	host := envFirst("CH_HOST", "CLICKHOUSE_HOST")
 	stateBackend := strings.ToLower(strings.TrimSpace(envDefault("STATE_BACKEND", "local")))
 	cfg := Config{
-		CHHost:               host,
-		CHPort:               parsePort(envFirst("CH_PORT", "CLICKHOUSE_PORT"), 8123),
-		CHUser:               envFirstDefault([]string{"CH_USER", "CLICKHOUSE_USER"}, "default"),
-		CHPassword:           envFirstDefault([]string{"CH_PASSWORD", "CLICKHOUSE_PASSWORD"}, ""),
-		CHDatabase:           envFirstDefault([]string{"CH_DATABASE", "CLICKHOUSE_DATABASE"}, "Data_Lecture_Inflearn_Raw"),
-		CHRawDatabase:        envDefault("CH_RAW_DATABASE", "Data_Lecture_Inflearn_Raw"),
-		CHServiceDatabase:    envDefault("CH_SERVICE_DATABASE", "Data_Lecture_Inflearn_Service"),
-		CHLogDatabase:        envDefault("CH_LOG_DATABASE", "Data_Lecture_Inflearn_Log"),
-		CHMartDatabase:       envDefault("CH_MART_DATABASE", "Data_Lecture_Inflearn_Mart"),
-		CHSecure:             parseBool(envFirstDefault([]string{"CH_SECURE", "CLICKHOUSE_SECURE"}, "0")),
-		CHInsertChunkSize:    parsePositiveInt(envDefault("CH_INSERT_CHUNK_SIZE", "1000"), 1000),
-		IngestMode:           strings.ToLower(envDefault("INGEST_MODE", "clickhouse")),
-		LectureProvider:      envDefault("LECTURE_PROVIDER", "inflearn"),
-		KafkaBrokers:         splitCSV(envDefault("KAFKA_BROKERS", "")),
-		KafkaUsername:        envDefault("KAFKA_USERNAME", envDefault("KAFKA_EXTERNAL_USER", "")),
-		KafkaPassword:        envDefault("KAFKA_PASSWORD", envDefault("KAFKA_EXTERNAL_PASSWORD", "")),
-		KafkaTopic:           envDefault("KAFKA_TOPIC", "lecture.events"),
-		KafkaClientID:        envDefault("KAFKA_CLIENT_ID", "statground-inflearn-crawler"),
-		KafkaBatchSize:       parsePositiveInt(envDefault("KAFKA_BATCH_SIZE", "100"), 100),
-		KafkaBatchTimeout:    parseSecondsDefault(envDefault("KAFKA_BATCH_TIMEOUT", "1.0"), time.Second),
+		CHHost:                  host,
+		CHPort:                  parsePort(envFirst("CH_PORT", "CLICKHOUSE_PORT"), 8123),
+		CHUser:                  envFirstDefault([]string{"CH_USER", "CLICKHOUSE_USER"}, "default"),
+		CHPassword:              envFirstDefault([]string{"CH_PASSWORD", "CLICKHOUSE_PASSWORD"}, ""),
+		CHDatabase:              envFirstDefault([]string{"CH_DATABASE", "CLICKHOUSE_DATABASE"}, "Data_Lecture_Inflearn_Raw"),
+		CHRawDatabase:           envDefault("CH_RAW_DATABASE", "Data_Lecture_Inflearn_Raw"),
+		CHServiceDatabase:       envDefault("CH_SERVICE_DATABASE", "Data_Lecture_Inflearn_Service"),
+		CHLogDatabase:           envDefault("CH_LOG_DATABASE", "Data_Lecture_Inflearn_Log"),
+		CHMartDatabase:          envDefault("CH_MART_DATABASE", "Data_Lecture_Inflearn_Mart"),
+		CHSecure:                parseBool(envFirstDefault([]string{"CH_SECURE", "CLICKHOUSE_SECURE"}, "0")),
+		CHInsertChunkSize:       parsePositiveInt(envDefault("CH_INSERT_CHUNK_SIZE", "100"), 100),
+		CHInsertTimeout:         parseSecondsDefault(envDefault("CH_INSERT_TIMEOUT_SECONDS", "300"), 5*time.Minute),
+		CHInsertDistributedSync: parseBool(envDefault("CH_INSERT_DISTRIBUTED_SYNC", "false")),
+		IngestMode:              strings.ToLower(envDefault("INGEST_MODE", "clickhouse")),
+		LectureProvider:         envDefault("LECTURE_PROVIDER", "inflearn"),
+		KafkaBrokers:            splitCSV(envDefault("KAFKA_BROKERS", "")),
+		KafkaUsername:           envDefault("KAFKA_USERNAME", envDefault("KAFKA_EXTERNAL_USER", "")),
+		KafkaPassword:           envDefault("KAFKA_PASSWORD", envDefault("KAFKA_EXTERNAL_PASSWORD", "")),
+		KafkaTopic:              envDefault("KAFKA_TOPIC", "lecture.events"),
+		KafkaClientID:           envDefault("KAFKA_CLIENT_ID", "statground-inflearn-crawler"),
+		KafkaBatchSize:          parsePositiveInt(envDefault("KAFKA_BATCH_SIZE", "100"), 100),
+		KafkaBatchTimeout:       parseSecondsDefault(envDefault("KAFKA_BATCH_TIMEOUT", "1.0"), time.Second),
 		KafkaWriteAttempts:      parsePositiveInt(envDefault("KAFKA_WRITE_ATTEMPTS", "5"), 5),
 		KafkaWriteBackoffMin:    parseSecondsDefault(envDefault("KAFKA_WRITE_BACKOFF_MIN", envDefault("KAFKA_WRITE_BACKOFF_MIN_SECONDS", "1.0")), time.Second),
 		KafkaWriteBackoffMax:    parseSecondsDefault(envDefault("KAFKA_WRITE_BACKOFF_MAX", envDefault("KAFKA_WRITE_BACKOFF_MAX_SECONDS", "12.0")), 12*time.Second),
 		KafkaPartitionFallback:  parseBool(envDefault("KAFKA_PARTITION_FALLBACK_ENABLED", "true")),
 		KafkaFallbackPartitions: parseIntCSV(envDefault("KAFKA_FALLBACK_PARTITIONS", "")),
 		KafkaFallbackTimeout:    parseSecondsDefault(envDefault("KAFKA_PARTITION_FALLBACK_TIMEOUT_SECONDS", "8.0"), 8*time.Second),
-		ProducerSource:       envDefault("PRODUCER_SOURCE", "github_actions"),
-		ProducerIP:           envDefault("PRODUCER_IP", "::"),
-		StateBackend:         stateBackend,
-		StateDir:             envDefault("STATE_DIR", ".statground_state"),
-		SitemapBase:          strings.TrimRight(envDefault("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps"), "/"),
-		SitemapBaseFallback:  strings.TrimRight(envDefault("SITEMAP_BASE_FALLBACK", "https://www.inflearn.com/sitemaps"), "/"),
-		SitemapPrefix:        envDefault("SITEMAP_PREFIX", "sitemap-courseDetail-"),
-		RecentHeadEnabled:    parseBool(envDefault("INFLEARN_RECENT_HEAD_ENABLED", "true")),
-		RecentSearchBaseURL:  strings.TrimRight(envDefault("INFLEARN_RECENT_SEARCH_BASE_URL", "https://course-api.inflearn.com"), "/"),
-		CourseAPIBaseURL:     strings.TrimRight(envDefault("INFLEARN_COURSE_API_BASE_URL", "https://course-api.inflearn.com"), "/"),
-		RecentHeadPages:      parsePositiveInt(envDefault("INFLEARN_RECENT_HEAD_PAGES", "5"), 5),
-		RecentHeadPageSize:   parsePositiveInt(envDefault("INFLEARN_RECENT_HEAD_PAGE_SIZE", "100"), 100),
-		RecentHeadSort:       envDefault("INFLEARN_RECENT_HEAD_SORT", "RECENT"),
-		RecentHeadTypes:      envDefault("INFLEARN_RECENT_HEAD_TYPES", "ONLINE"),
-		BatchSize:            parsePositiveInt(envDefault("BATCH_SIZE", "100"), 100),
-		MaxURLsPerRun:        parsePositiveInt(envDefault("MAX_URLS_PER_RUN", "1500"), 1500),
-		CheckpointFlushEvery: parsePositiveInt(envDefault("CHECKPOINT_FLUSH_EVERY", "200"), 200),
-		UpdateBatchSize:      parsePositiveInt(envDefault("UPDATE_BATCH_SIZE", "100"), 100),
-		Workers:              parsePositiveInt(envDefault("WORKERS", "8"), 8),
-		RequestSleepMin:      parseSeconds(envDefault("REQUEST_SLEEP_MIN", "0.2")),
-		RequestSleepMax:      parseSeconds(envDefault("REQUEST_SLEEP_MAX", "0.6")),
-		UserAgent:            envDefault("CRAWLER_USER_AGENT", "Mozilla/5.0 (compatible; StatgroundCrawler/2.0; +https://www.statground.net)"),
+		ProducerSource:          envDefault("PRODUCER_SOURCE", "github_actions"),
+		ProducerIP:              envDefault("PRODUCER_IP", "::"),
+		StateBackend:            stateBackend,
+		StateDir:                envDefault("STATE_DIR", ".statground_state"),
+		SitemapBase:             strings.TrimRight(envDefault("SITEMAP_BASE", "https://cdn.inflearn.com/sitemaps"), "/"),
+		SitemapBaseFallback:     strings.TrimRight(envDefault("SITEMAP_BASE_FALLBACK", "https://www.inflearn.com/sitemaps"), "/"),
+		SitemapPrefix:           envDefault("SITEMAP_PREFIX", "sitemap-courseDetail-"),
+		RecentHeadEnabled:       parseBool(envDefault("INFLEARN_RECENT_HEAD_ENABLED", "true")),
+		RecentSearchBaseURL:     strings.TrimRight(envDefault("INFLEARN_RECENT_SEARCH_BASE_URL", "https://course-api.inflearn.com"), "/"),
+		CourseAPIBaseURL:        strings.TrimRight(envDefault("INFLEARN_COURSE_API_BASE_URL", "https://course-api.inflearn.com"), "/"),
+		RecentHeadPages:         parsePositiveInt(envDefault("INFLEARN_RECENT_HEAD_PAGES", "5"), 5),
+		RecentHeadPageSize:      parsePositiveInt(envDefault("INFLEARN_RECENT_HEAD_PAGE_SIZE", "100"), 100),
+		RecentHeadSort:          envDefault("INFLEARN_RECENT_HEAD_SORT", "RECENT"),
+		RecentHeadTypes:         envDefault("INFLEARN_RECENT_HEAD_TYPES", "ONLINE"),
+		BatchSize:               parsePositiveInt(envDefault("BATCH_SIZE", "100"), 100),
+		MaxURLsPerRun:           parsePositiveInt(envDefault("MAX_URLS_PER_RUN", "1500"), 1500),
+		CheckpointFlushEvery:    parsePositiveInt(envDefault("CHECKPOINT_FLUSH_EVERY", "200"), 200),
+		UpdateBatchSize:         parsePositiveInt(envDefault("UPDATE_BATCH_SIZE", "100"), 100),
+		Workers:                 parsePositiveInt(envDefault("WORKERS", "8"), 8),
+		RequestSleepMin:         parseSeconds(envDefault("REQUEST_SLEEP_MIN", "0.2")),
+		RequestSleepMax:         parseSeconds(envDefault("REQUEST_SLEEP_MAX", "0.6")),
+		UserAgent:               envDefault("CRAWLER_USER_AGENT", "Mozilla/5.0 (compatible; StatgroundCrawler/2.0; +https://www.statground.net)"),
 	}
 	switch strings.ToLower(strings.TrimSpace(cfg.IngestMode)) {
 	case "kafka", "kafka_clickhouse", "kafka-clickhouse", "event", "events":

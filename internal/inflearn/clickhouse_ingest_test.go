@@ -1,6 +1,9 @@
 package inflearn
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	t.Setenv("INGEST_MODE", "clickhouse")
@@ -14,6 +17,15 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	}
 	if cfg.IngestMode != "clickhouse" {
 		t.Fatalf("IngestMode = %q, want clickhouse", cfg.IngestMode)
+	}
+	if cfg.CHInsertChunkSize != 100 {
+		t.Fatalf("CHInsertChunkSize = %d, want 100", cfg.CHInsertChunkSize)
+	}
+	if cfg.CHInsertTimeout != 5*time.Minute {
+		t.Fatalf("CHInsertTimeout = %s, want 5m", cfg.CHInsertTimeout)
+	}
+	if cfg.CHInsertDistributedSync {
+		t.Fatal("CHInsertDistributedSync should default to false")
 	}
 }
 
@@ -42,5 +54,14 @@ func TestClickHouseSnapshotRowsConvertPayloadToPayloadJSON(t *testing.T) {
 	}
 	if got := rows[0]["payload_json"]; got != `{"statusCode":"OK"}` {
 		t.Fatalf("payload_json = %#v", got)
+	}
+}
+
+func TestBoolToInt(t *testing.T) {
+	if got := boolToInt(false); got != 0 {
+		t.Fatalf("boolToInt(false) = %d, want 0", got)
+	}
+	if got := boolToInt(true); got != 1 {
+		t.Fatalf("boolToInt(true) = %d, want 1", got)
 	}
 }

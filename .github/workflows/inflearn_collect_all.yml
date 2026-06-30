@@ -71,7 +71,9 @@ jobs:
           CH_RAW_DATABASE: Data_Lecture_Inflearn_Raw
           CH_SERVICE_DATABASE: Data_Lecture_Inflearn_Service
           INGEST_MODE: clickhouse
-          CH_INSERT_CHUNK_SIZE: "1000"
+          CH_INSERT_CHUNK_SIZE: "100"
+          CH_INSERT_TIMEOUT_SECONDS: "300"
+          CH_INSERT_DISTRIBUTED_SYNC: "false"
           LECTURE_PROVIDER: inflearn
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
@@ -100,7 +102,9 @@ jobs:
           CH_RAW_DATABASE: Data_Lecture_Inflearn_Raw
           CH_SERVICE_DATABASE: Data_Lecture_Inflearn_Service
           INGEST_MODE: clickhouse
-          CH_INSERT_CHUNK_SIZE: "1000"
+          CH_INSERT_CHUNK_SIZE: "100"
+          CH_INSERT_TIMEOUT_SECONDS: "300"
+          CH_INSERT_DISTRIBUTED_SYNC: "false"
           LECTURE_PROVIDER: inflearn
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
