@@ -47,6 +47,7 @@ type Config struct {
 	CHLogDatabase        string
 	CHMartDatabase       string
 	CHSecure             bool
+	CHInsertChunkSize    int
 	IngestMode           string
 	LectureProvider      string
 	KafkaBrokers         []string
@@ -168,7 +169,8 @@ func LoadConfig() (Config, error) {
 		CHLogDatabase:        envDefault("CH_LOG_DATABASE", "Data_Lecture_Inflearn_Log"),
 		CHMartDatabase:       envDefault("CH_MART_DATABASE", "Data_Lecture_Inflearn_Mart"),
 		CHSecure:             parseBool(envFirstDefault([]string{"CH_SECURE", "CLICKHOUSE_SECURE"}, "0")),
-		IngestMode:           strings.ToLower(envDefault("INGEST_MODE", "kafka")),
+		CHInsertChunkSize:    parsePositiveInt(envDefault("CH_INSERT_CHUNK_SIZE", "1000"), 1000),
+		IngestMode:           strings.ToLower(envDefault("INGEST_MODE", "clickhouse")),
 		LectureProvider:      envDefault("LECTURE_PROVIDER", "inflearn"),
 		KafkaBrokers:         splitCSV(envDefault("KAFKA_BROKERS", "")),
 		KafkaUsername:        envDefault("KAFKA_USERNAME", envDefault("KAFKA_EXTERNAL_USER", "")),
@@ -209,8 +211,10 @@ func LoadConfig() (Config, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.IngestMode)) {
 	case "kafka", "kafka_clickhouse", "kafka-clickhouse", "event", "events":
 		cfg.IngestMode = "kafka"
+	case "", "clickhouse", "ch", "direct", "db":
+		cfg.IngestMode = "clickhouse"
 	default:
-		return Config{}, fmt.Errorf("unsupported INGEST_MODE=%q; Statground Inflearn crawler now supports Kafka ingestion only", cfg.IngestMode)
+		return Config{}, fmt.Errorf("unsupported INGEST_MODE=%q; use clickhouse or kafka", cfg.IngestMode)
 	}
 	switch cfg.StateBackend {
 	case "", "local", "file", "github_cache", "github-cache":
@@ -226,11 +230,16 @@ func LoadConfig() (Config, error) {
 	if cfg.KafkaWriteBackoffMax < cfg.KafkaWriteBackoffMin {
 		cfg.KafkaWriteBackoffMax = cfg.KafkaWriteBackoffMin
 	}
-	if len(cfg.KafkaBrokers) == 0 {
-		return Config{}, fmt.Errorf("missing required env: KAFKA_BROKERS")
+	if cfg.IngestMode == "clickhouse" && !hasClickHouseConfig(cfg) {
+		return Config{}, fmt.Errorf("missing required env: CH_HOST/CLICKHOUSE_HOST and CH_USER/CLICKHOUSE_USER when INGEST_MODE=clickhouse")
 	}
-	if strings.TrimSpace(cfg.KafkaTopic) == "" {
-		return Config{}, fmt.Errorf("missing required env: KAFKA_TOPIC")
+	if cfg.IngestMode == "kafka" {
+		if len(cfg.KafkaBrokers) == 0 {
+			return Config{}, fmt.Errorf("missing required env: KAFKA_BROKERS")
+		}
+		if strings.TrimSpace(cfg.KafkaTopic) == "" {
+			return Config{}, fmt.Errorf("missing required env: KAFKA_TOPIC")
+		}
 	}
 	return cfg, nil
 }
@@ -950,8 +959,14 @@ func (s *Service) getCheckpoint(ctx context.Context, source string) (Checkpoint,
 }
 
 func (s *Service) setCheckpoint(ctx context.Context, source string, cp Checkpoint) error {
-	if err := s.PublishCheckpoint(ctx, source, cp); err != nil {
-		return err
+	if s.UseClickHouseIngest() {
+		if err := s.InsertCheckpointClickHouse(ctx, source, cp); err != nil {
+			return err
+		}
+	} else {
+		if err := s.PublishCheckpoint(ctx, source, cp); err != nil {
+			return err
+		}
 	}
 	if s.UseLocalState() {
 		return s.localSetCheckpoint(source, cp)
@@ -967,7 +982,11 @@ func (s *Service) courseExists(ctx context.Context, courseID int, locale string)
 }
 
 func (s *Service) hasClickHouseConfig() bool {
-	return strings.TrimSpace(s.Cfg.CHHost) != "" && s.Cfg.CHPort > 0 && strings.TrimSpace(s.Cfg.CHUser) != ""
+	return hasClickHouseConfig(s.Cfg)
+}
+
+func hasClickHouseConfig(cfg Config) bool {
+	return strings.TrimSpace(cfg.CHHost) != "" && cfg.CHPort > 0 && strings.TrimSpace(cfg.CHUser) != ""
 }
 
 func (s *Service) courseExistsForRecentHead(ctx context.Context, courseID int, locale string) (bool, error) {
@@ -1325,6 +1344,9 @@ func (r *CourseRows) Reset() {
 }
 
 func (r CourseRows) InsertAll(ctx context.Context, s *Service) error {
+	if s.UseClickHouseIngest() {
+		return s.InsertCourseRowsClickHouse(ctx, r)
+	}
 	return s.PublishCourseRows(ctx, r)
 }
 
@@ -1805,7 +1827,7 @@ func (s *Service) collectRecentHead(ctx context.Context, batch *CourseRows, exis
 }
 
 func (s *Service) RunCollectNew(ctx context.Context) error {
-	if err := s.ValidateKafkaIngest(ctx); err != nil {
+	if err := s.ValidateIngest(ctx); err != nil {
 		return err
 	}
 	cp, err := s.getCheckpoint(ctx, collectCheckpointSource)
@@ -2020,6 +2042,9 @@ func (s *Service) setUpdateProgress(ctx context.Context, totalDone, lastBatchDon
 }
 
 func (s *Service) RunCollectURLs(ctx context.Context, urls []string) error {
+	if err := s.ValidateIngest(ctx); err != nil {
+		return err
+	}
 	batch := CourseRows{}
 	fetchedAt := NowDT64()
 	processed := 0
@@ -2053,7 +2078,7 @@ func (s *Service) RunCollectURLs(ctx context.Context, urls []string) error {
 }
 
 func (s *Service) RunUpdateExisting(ctx context.Context) error {
-	if err := s.ValidateKafkaIngest(ctx); err != nil {
+	if err := s.ValidateIngest(ctx); err != nil {
 		return err
 	}
 	totalDone, _, err := s.getUpdateProgress(ctx)
