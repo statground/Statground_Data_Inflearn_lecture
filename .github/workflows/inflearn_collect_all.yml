@@ -2,7 +2,7 @@ name: Inflearn - Collect All Courses
 
 on:
   schedule:
-    - cron: "5 */4 * * *"
+    - cron: "5 */12 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -80,6 +80,11 @@ jobs:
         run: |
           go build -mod=mod ./cmd/inflearn-collect-new ./cmd/inflearn-update-existing ./cmd/inflearn-collect-urls
 
+      - name: Run unit tests
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: go test -mod=mod ./...
+
       - name: Collect new Inflearn courses and publish Kafka events
         env:
           STATE_BACKEND: local
@@ -96,6 +101,11 @@ jobs:
           KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD2 || secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
           KAFKA_TOPIC: lecture.events
           KAFKA_CLIENT_ID: statground-inflearn-collect-new
+          KAFKA_WRITE_ATTEMPTS: "8"
+          KAFKA_WRITE_BACKOFF_MIN: "1.0"
+          KAFKA_WRITE_BACKOFF_MAX: "20.0"
+          KAFKA_PARTITION_FALLBACK_ENABLED: "true"
+          KAFKA_PARTITION_FALLBACK_TIMEOUT_SECONDS: "8.0"
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
           BATCH_SIZE: "100"
@@ -124,6 +134,11 @@ jobs:
           KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD2 || secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
           KAFKA_TOPIC: lecture.events
           KAFKA_CLIENT_ID: statground-inflearn-update-existing
+          KAFKA_WRITE_ATTEMPTS: "8"
+          KAFKA_WRITE_BACKOFF_MIN: "1.0"
+          KAFKA_WRITE_BACKOFF_MAX: "20.0"
+          KAFKA_PARTITION_FALLBACK_ENABLED: "true"
+          KAFKA_PARTITION_FALLBACK_TIMEOUT_SECONDS: "8.0"
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
           UPDATE_BATCH_SIZE: "100"

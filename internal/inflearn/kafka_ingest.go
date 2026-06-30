@@ -3,9 +3,12 @@ package inflearn
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +16,11 @@ import (
 	"github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/sasl/plain"
 )
+
+type kafkaMessageWriter interface {
+	WriteMessages(context.Context, ...kafka.Message) error
+	Close() error
+}
 
 type lectureKafkaEvent struct {
 	EventUUID string `json:"event_uuid"`
@@ -214,10 +222,14 @@ func isLoopbackHost(host string) bool {
 }
 
 func (s *Service) kafkaWriter() *kafka.Writer {
+	return s.kafkaWriterWithBalancer(&kafka.Hash{})
+}
+
+func (s *Service) kafkaWriterWithBalancer(balancer kafka.Balancer) *kafka.Writer {
 	w := &kafka.Writer{
 		Addr:                   kafka.TCP(s.Cfg.KafkaBrokers...),
 		Topic:                  s.Cfg.KafkaTopic,
-		Balancer:               &kafka.Hash{},
+		Balancer:               balancer,
 		RequiredAcks:           kafka.RequireAll,
 		AllowAutoTopicCreation: false,
 		BatchSize:              s.Cfg.KafkaBatchSize,
@@ -241,8 +253,6 @@ func (s *Service) publishKafkaEvents(ctx context.Context, events []lectureKafkaE
 	if len(s.Cfg.KafkaBrokers) == 0 {
 		return fmt.Errorf("KAFKA_BROKERS is empty")
 	}
-	w := s.kafkaWriter()
-	defer w.Close()
 
 	messages := make([]kafka.Message, 0, len(events))
 	for _, ev := range events {
@@ -256,7 +266,338 @@ func (s *Service) publishKafkaEvents(ctx context.Context, events []lectureKafkaE
 			Time:  NowDT64(),
 		})
 	}
-	return w.WriteMessages(ctx, messages...)
+	return s.writeKafkaMessagesWithRetry(ctx, messages, func() kafkaMessageWriter {
+		return s.kafkaWriter()
+	}, sleepContext)
+}
+
+func (s *Service) writeKafkaMessagesWithRetry(ctx context.Context, messages []kafka.Message, newWriter func() kafkaMessageWriter, sleep func(context.Context, time.Duration) error) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	attempts := s.Cfg.KafkaWriteAttempts
+	if attempts <= 0 {
+		attempts = 5
+	}
+	backoffMin := s.Cfg.KafkaWriteBackoffMin
+	if backoffMin <= 0 {
+		backoffMin = time.Second
+	}
+	backoffMax := s.Cfg.KafkaWriteBackoffMax
+	if backoffMax <= 0 {
+		backoffMax = 12 * time.Second
+	}
+	if backoffMax < backoffMin {
+		backoffMax = backoffMin
+	}
+
+	pending := messages
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		w := newWriter()
+		err := w.WriteMessages(ctx, pending...)
+		_ = w.Close()
+		if err == nil {
+			if attempt > 1 {
+				fmt.Printf("[kafka] publish retry succeeded attempt=%d messages=%d\n", attempt, len(pending))
+			}
+			return nil
+		}
+
+		lastErr = err
+		failed, retryable := retryableKafkaFailedMessages(pending, err)
+		if len(failed) == 0 || !retryable {
+			return err
+		}
+		if attempt == attempts {
+			if s.Cfg.KafkaPartitionFallback && shouldUseKafkaPartitionFallback(err) {
+				if fallbackErr := s.writeKafkaMessagesToWritablePartition(ctx, failed); fallbackErr == nil {
+					return nil
+				} else {
+					return fmt.Errorf("kafka publish failed after fixed-partition fallback: %s; original_reason=%s", shortKafkaError(fallbackErr), kafkaRetryReason(err))
+				}
+			}
+			return err
+		}
+
+		fmt.Printf("[kafka] retrying publish attempt=%d/%d failed_messages=%d reason=%s\n", attempt+1, attempts, len(failed), kafkaRetryReason(err))
+		if err := sleep(ctx, kafkaBackoffDuration(attempt, backoffMin, backoffMax)); err != nil {
+			return err
+		}
+		pending = failed
+	}
+	return lastErr
+}
+
+func (s *Service) writeKafkaMessagesToWritablePartition(ctx context.Context, messages []kafka.Message) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	partitions, err := s.fallbackPartitionIDs(ctx)
+	if err != nil {
+		return err
+	}
+	if len(partitions) == 0 {
+		return fmt.Errorf("kafka partition fallback found zero partitions for topic=%s", s.Cfg.KafkaTopic)
+	}
+
+	timeout := s.Cfg.KafkaFallbackTimeout
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	pending := messages
+	var lastErr error
+	for _, partition := range partitions {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		w := s.kafkaWriterWithBalancer(fixedPartitionBalancer{partition: partition})
+		err := w.WriteMessages(attemptCtx, pending...)
+		_ = w.Close()
+		cancel()
+		if err == nil {
+			fmt.Printf("[kafka] fixed partition fallback succeeded partition=%d messages=%d\n", partition, len(pending))
+			return nil
+		}
+
+		lastErr = err
+		failed, retryable := retryableKafkaFailedMessages(pending, err)
+		if len(failed) == 0 {
+			return nil
+		}
+		pending = failed
+		fmt.Printf("[kafka] fixed partition fallback failed partition=%d failed_messages=%d reason=%s error=%s\n", partition, len(pending), kafkaRetryReason(err), shortKafkaError(err))
+		if !retryable {
+			return err
+		}
+	}
+	return fmt.Errorf("kafka fixed partition fallback exhausted partitions=%v failed_messages=%d last_error=%s", partitions, len(pending), shortKafkaError(lastErr))
+}
+
+func (s *Service) fallbackPartitionIDs(ctx context.Context) ([]int, error) {
+	if len(s.Cfg.KafkaFallbackPartitions) > 0 {
+		out := append([]int(nil), s.Cfg.KafkaFallbackPartitions...)
+		sort.Ints(out)
+		return uniqueInts(out), nil
+	}
+
+	dialer := &kafka.Dialer{
+		ClientID: s.Cfg.KafkaClientID,
+		Timeout:  10 * time.Second,
+		DialFunc: kafkaAdvertisedBrokerDialFunc(s.Cfg.KafkaBrokers, 10*time.Second),
+	}
+	if strings.TrimSpace(s.Cfg.KafkaUsername) != "" || strings.TrimSpace(s.Cfg.KafkaPassword) != "" {
+		dialer.SASLMechanism = plain.Mechanism{Username: s.Cfg.KafkaUsername, Password: s.Cfg.KafkaPassword}
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	conn, err := dialer.DialContext(probeCtx, "tcp", s.Cfg.KafkaBrokers[0])
+	if err != nil {
+		return nil, fmt.Errorf("kafka partition fallback failed to connect to bootstrap broker: %s", kafkaRetryReason(err))
+	}
+	defer conn.Close()
+
+	partitions, err := conn.ReadPartitions(s.Cfg.KafkaTopic)
+	if err != nil {
+		return nil, fmt.Errorf("kafka partition fallback failed to read metadata for topic %q: %s", s.Cfg.KafkaTopic, kafkaRetryReason(err))
+	}
+	out := make([]int, 0, len(partitions))
+	for _, partition := range partitions {
+		if partition.Topic == s.Cfg.KafkaTopic {
+			out = append(out, partition.ID)
+		}
+	}
+	sort.Ints(out)
+	return uniqueInts(out), nil
+}
+
+type fixedPartitionBalancer struct {
+	partition int
+}
+
+func (b fixedPartitionBalancer) Balance(_ kafka.Message, partitions ...int) int {
+	for _, partition := range partitions {
+		if partition == b.partition {
+			return partition
+		}
+	}
+	if len(partitions) > 0 {
+		return partitions[0]
+	}
+	return b.partition
+}
+
+func uniqueInts(in []int) []int {
+	if len(in) == 0 {
+		return nil
+	}
+	out := in[:0]
+	var last int
+	for i, n := range in {
+		if i == 0 || n != last {
+			out = append(out, n)
+			last = n
+		}
+	}
+	return out
+}
+
+func retryableKafkaFailedMessages(messages []kafka.Message, err error) ([]kafka.Message, bool) {
+	var writeErrs kafka.WriteErrors
+	if errors.As(err, &writeErrs) {
+		if len(writeErrs) != len(messages) {
+			return messages, retryableKafkaWriteError(err)
+		}
+		failed := make([]kafka.Message, 0, writeErrs.Count())
+		retryable := true
+		for i, writeErr := range writeErrs {
+			if writeErr == nil {
+				continue
+			}
+			failed = append(failed, messages[i])
+			if !retryableKafkaWriteError(writeErr) {
+				retryable = false
+			}
+		}
+		return failed, retryable
+	}
+	return messages, retryableKafkaWriteError(err)
+}
+
+func retryableKafkaWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var writeErrs kafka.WriteErrors
+	if errors.As(err, &writeErrs) {
+		if writeErrs.Count() == 0 {
+			return false
+		}
+		for _, writeErr := range writeErrs {
+			if writeErr != nil && !retryableKafkaWriteError(writeErr) {
+				return false
+			}
+		}
+		return true
+	}
+	var tempErr interface{ Temporary() bool }
+	if errors.As(err, &tempErr) && tempErr.Temporary() {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, io.EOF) || isRetryableKafkaErrorText(err.Error())
+}
+
+func isRetryableKafkaErrorText(message string) bool {
+	msg := strings.ToLower(message)
+	return strings.Contains(msg, "not leader for partition") ||
+		strings.Contains(msg, "not the leader for") ||
+		strings.Contains(msg, "partition has no leader") ||
+		strings.Contains(msg, "has no leader") ||
+		strings.Contains(msg, "leader not available") ||
+		strings.Contains(msg, "metadata are likely out of date") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "failed to dial") ||
+		strings.Contains(msg, "failed to open connection") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "temporary failure in name resolution") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "eof")
+}
+
+func kafkaRetryReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "not leader for partition"),
+		strings.Contains(msg, "not the leader for"),
+		strings.Contains(msg, "partition has no leader"),
+		strings.Contains(msg, "has no leader"),
+		strings.Contains(msg, "metadata are likely out of date"):
+		return "leader-metadata-stale"
+	case strings.Contains(msg, "leader not available"):
+		return "leader-not-available"
+	case strings.Contains(msg, "timeout"):
+		return "timeout"
+	case strings.Contains(msg, "eof"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "failed to dial"),
+		strings.Contains(msg, "failed to open connection"),
+		strings.Contains(msg, "no route to host"),
+		strings.Contains(msg, "network is unreachable"),
+		strings.Contains(msg, "temporary failure in name resolution"):
+		return "network"
+	default:
+		return "temporary-kafka-error"
+	}
+}
+
+func shouldUseKafkaPartitionFallback(err error) bool {
+	reason := kafkaRetryReason(err)
+	return reason == "leader-metadata-stale" || reason == "leader-not-available"
+}
+
+func shortKafkaError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.Join(strings.Fields(err.Error()), " ")
+	if len(msg) > 240 {
+		return msg[:240] + "..."
+	}
+	return msg
+}
+
+func kafkaBackoffDuration(attempt int, minDelay, maxDelay time.Duration) time.Duration {
+	if minDelay <= 0 {
+		minDelay = time.Second
+	}
+	if maxDelay <= 0 {
+		maxDelay = 12 * time.Second
+	}
+	if maxDelay < minDelay {
+		maxDelay = minDelay
+	}
+	delay := minDelay
+	for i := 1; i < attempt; i++ {
+		if delay >= maxDelay/2 {
+			return maxDelay
+		}
+		delay *= 2
+	}
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func kafkaEventKey(ev lectureKafkaEvent) string {

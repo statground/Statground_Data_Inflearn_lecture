@@ -56,6 +56,12 @@ type Config struct {
 	KafkaClientID        string
 	KafkaBatchSize       int
 	KafkaBatchTimeout    time.Duration
+	KafkaWriteAttempts      int
+	KafkaWriteBackoffMin    time.Duration
+	KafkaWriteBackoffMax    time.Duration
+	KafkaPartitionFallback  bool
+	KafkaFallbackPartitions []int
+	KafkaFallbackTimeout    time.Duration
 	ProducerSource       string
 	ProducerIP           string
 	StateBackend         string
@@ -171,6 +177,12 @@ func LoadConfig() (Config, error) {
 		KafkaClientID:        envDefault("KAFKA_CLIENT_ID", "statground-inflearn-crawler"),
 		KafkaBatchSize:       parsePositiveInt(envDefault("KAFKA_BATCH_SIZE", "100"), 100),
 		KafkaBatchTimeout:    parseSecondsDefault(envDefault("KAFKA_BATCH_TIMEOUT", "1.0"), time.Second),
+		KafkaWriteAttempts:      parsePositiveInt(envDefault("KAFKA_WRITE_ATTEMPTS", "5"), 5),
+		KafkaWriteBackoffMin:    parseSecondsDefault(envDefault("KAFKA_WRITE_BACKOFF_MIN", envDefault("KAFKA_WRITE_BACKOFF_MIN_SECONDS", "1.0")), time.Second),
+		KafkaWriteBackoffMax:    parseSecondsDefault(envDefault("KAFKA_WRITE_BACKOFF_MAX", envDefault("KAFKA_WRITE_BACKOFF_MAX_SECONDS", "12.0")), 12*time.Second),
+		KafkaPartitionFallback:  parseBool(envDefault("KAFKA_PARTITION_FALLBACK_ENABLED", "true")),
+		KafkaFallbackPartitions: parseIntCSV(envDefault("KAFKA_FALLBACK_PARTITIONS", "")),
+		KafkaFallbackTimeout:    parseSecondsDefault(envDefault("KAFKA_PARTITION_FALLBACK_TIMEOUT_SECONDS", "8.0"), 8*time.Second),
 		ProducerSource:       envDefault("PRODUCER_SOURCE", "github_actions"),
 		ProducerIP:           envDefault("PRODUCER_IP", "::"),
 		StateBackend:         stateBackend,
@@ -210,6 +222,9 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.StateBackend == "clickhouse" && strings.TrimSpace(cfg.CHHost) == "" {
 		return Config{}, fmt.Errorf("missing required env: CH_HOST or CLICKHOUSE_HOST when STATE_BACKEND=clickhouse")
+	}
+	if cfg.KafkaWriteBackoffMax < cfg.KafkaWriteBackoffMin {
+		cfg.KafkaWriteBackoffMax = cfg.KafkaWriteBackoffMin
 	}
 	if len(cfg.KafkaBrokers) == 0 {
 		return Config{}, fmt.Errorf("missing required env: KAFKA_BROKERS")
@@ -286,6 +301,18 @@ func parsePositiveInt(raw string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func parseIntCSV(raw string) []int {
+	parts := strings.Split(raw, ",")
+	out := make([]int, 0, len(parts))
+	for _, part := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(part))
+		if err == nil && n >= 0 {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func parseBool(raw string) bool {
