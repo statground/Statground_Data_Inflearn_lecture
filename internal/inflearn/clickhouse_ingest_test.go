@@ -10,6 +10,9 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	t.Setenv("CH_HOST", "clickhouse.example")
 	t.Setenv("CH_USER", "statground_ch_app")
 	t.Setenv("KAFKA_BROKERS", "")
+	t.Setenv("CH_INSERT_CHUNK_SIZE", "")
+	t.Setenv("CH_INSERT_TIMEOUT_SECONDS", "")
+	t.Setenv("CH_INSERT_DISTRIBUTED_SYNC", "")
 
 	cfg, err := LoadConfig()
 	if err != nil {
