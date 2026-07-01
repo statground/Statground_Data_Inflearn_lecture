@@ -50,6 +50,7 @@ type Config struct {
 	CHInsertChunkSize       int
 	CHInsertTimeout         time.Duration
 	CHInsertDistributedSync bool
+	CHReadOnlyKafkaFallback bool
 	IngestMode              string
 	LectureProvider         string
 	KafkaBrokers            []string
@@ -174,6 +175,7 @@ func LoadConfig() (Config, error) {
 		CHInsertChunkSize:       parsePositiveInt(envDefault("CH_INSERT_CHUNK_SIZE", "100"), 100),
 		CHInsertTimeout:         parseSecondsDefault(envDefault("CH_INSERT_TIMEOUT_SECONDS", "300"), 5*time.Minute),
 		CHInsertDistributedSync: parseBool(envDefault("CH_INSERT_DISTRIBUTED_SYNC", "false")),
+		CHReadOnlyKafkaFallback: parseBool(envDefault("CH_READONLY_KAFKA_FALLBACK", "true")),
 		IngestMode:              strings.ToLower(envDefault("INGEST_MODE", "clickhouse")),
 		LectureProvider:         envDefault("LECTURE_PROVIDER", "inflearn"),
 		KafkaBrokers:            splitCSV(envDefault("KAFKA_BROKERS", "")),
@@ -1349,7 +1351,17 @@ func (r *CourseRows) Reset() {
 
 func (r CourseRows) InsertAll(ctx context.Context, s *Service) error {
 	if s.UseClickHouseIngest() {
-		return s.InsertCourseRowsClickHouse(ctx, r)
+		if err := s.InsertCourseRowsClickHouse(ctx, r); err != nil {
+			if s.shouldFallbackClickHouseWriteToKafka(err) && isClickHouseRawSnapshotInsertError(err) {
+				fmt.Println("[warn] clickhouse direct course insert temporarily unavailable; publishing course rows to Kafka fallback")
+				if fallbackErr := s.PublishCourseRows(ctx, r); fallbackErr != nil {
+					return fmt.Errorf("clickhouse direct course insert failed and kafka fallback failed: %w", fallbackErr)
+				}
+				return nil
+			}
+			return err
+		}
+		return nil
 	}
 	return s.PublishCourseRows(ctx, r)
 }
@@ -1748,7 +1760,7 @@ func (s *Service) fetchSitemapURLs(ctx context.Context, sitemapIndex int) ([]str
 	return nil, false, false, lastErr
 }
 
-func (s *Service) flushCollectBatch(ctx context.Context, batch *CourseRows, cp Checkpoint) error {
+func (s *Service) flushCollectBatch(ctx context.Context, batch *CourseRows, cp Checkpoint, saveCheckpoint bool) error {
 	if err := batch.InsertAll(ctx, s); err != nil {
 		return err
 	}
@@ -1757,8 +1769,10 @@ func (s *Service) flushCollectBatch(ctx context.Context, batch *CourseRows, cp C
 			return err
 		}
 	}
-	if err := s.setCheckpoint(ctx, collectCheckpointSource, cp); err != nil {
-		return err
+	if saveCheckpoint {
+		if err := s.setCheckpoint(ctx, collectCheckpointSource, cp); err != nil {
+			return err
+		}
 	}
 	batch.Reset()
 	return nil
@@ -1842,6 +1856,7 @@ func (s *Service) RunCollectNew(ctx context.Context) error {
 
 	current := cp
 	next := cp
+	lastSavedCP := cp
 	scanned := 0
 	processed := 0
 	batch := &CourseRows{}
@@ -1860,6 +1875,17 @@ func (s *Service) RunCollectNew(ctx context.Context) error {
 	if processed >= s.Cfg.BatchSize {
 		fmt.Printf("[batch] recent-head new-course limit hit processed=%d batch_size=%d\n", processed, s.Cfg.BatchSize)
 		stop = true
+	}
+
+	flushBatch := func(target Checkpoint, forceCheckpoint bool) (bool, error) {
+		saveCheckpoint := forceCheckpoint || target != lastSavedCP
+		if err := s.flushCollectBatch(ctx, batch, target, saveCheckpoint); err != nil {
+			return false, err
+		}
+		if saveCheckpoint {
+			lastSavedCP = target
+		}
+		return saveCheckpoint, nil
 	}
 
 	for !stop {
@@ -1901,7 +1927,7 @@ func (s *Service) RunCollectNew(ctx context.Context) error {
 				}
 				if exists {
 					if flushEvery > 0 && scanned%flushEvery == 0 {
-						if err := s.flushCollectBatch(ctx, batch, next); err != nil {
+						if _, err := flushBatch(next, false); err != nil {
 							return err
 						}
 						fmt.Printf("[checkpoint] flushed sitemap_index=%d url_index=%d scanned=%d processed=%d\n", next.SitemapIndex, next.URLIndex, scanned, processed)
@@ -1915,7 +1941,7 @@ func (s *Service) RunCollectNew(ctx context.Context) error {
 			if err != nil {
 				fmt.Printf("[warn] fetch failed url=%s error=%v\n", rawURL, err)
 				if flushEvery > 0 && scanned%flushEvery == 0 {
-					if err := s.flushCollectBatch(ctx, batch, next); err != nil {
+					if _, err := flushBatch(next, false); err != nil {
 						return err
 					}
 					fmt.Printf("[checkpoint] flushed sitemap_index=%d url_index=%d scanned=%d processed=%d\n", next.SitemapIndex, next.URLIndex, scanned, processed)
@@ -1934,7 +1960,7 @@ func (s *Service) RunCollectNew(ctx context.Context) error {
 			}
 			if exists {
 				if flushEvery > 0 && scanned%flushEvery == 0 {
-					if err := s.flushCollectBatch(ctx, batch, next); err != nil {
+					if _, err := flushBatch(next, false); err != nil {
 						return err
 					}
 					fmt.Printf("[checkpoint] flushed sitemap_index=%d url_index=%d scanned=%d processed=%d\n", next.SitemapIndex, next.URLIndex, scanned, processed)
@@ -1951,7 +1977,7 @@ func (s *Service) RunCollectNew(ctx context.Context) error {
 			}
 
 			if flushEvery > 0 && scanned%flushEvery == 0 {
-				if err := s.flushCollectBatch(ctx, batch, next); err != nil {
+				if _, err := flushBatch(next, false); err != nil {
 					return err
 				}
 				fmt.Printf("[checkpoint] flushed sitemap_index=%d url_index=%d scanned=%d processed=%d\n", next.SitemapIndex, next.URLIndex, scanned, processed)
@@ -1978,11 +2004,14 @@ func (s *Service) RunCollectNew(ctx context.Context) error {
 	if resetAfter {
 		finalCP = Checkpoint{}
 	}
-	if err := s.flushCollectBatch(ctx, batch, finalCP); err != nil {
+	checkpointSaved, err := flushBatch(finalCP, resetAfter)
+	if err != nil {
 		return err
 	}
 	if resetAfter {
 		fmt.Println("[checkpoint] reset to sitemap_index=0 url_index=0")
+	} else if !checkpointSaved {
+		fmt.Printf("[checkpoint] unchanged sitemap_index=%d url_index=%d\n", finalCP.SitemapIndex, finalCP.URLIndex)
 	} else {
 		fmt.Printf("[checkpoint] saved sitemap_index=%d url_index=%d\n", finalCP.SitemapIndex, finalCP.URLIndex)
 	}
