@@ -87,12 +87,6 @@ jobs:
           CH_INSERT_CHUNK_SIZE: "100"
           CH_INSERT_TIMEOUT_SECONDS: "300"
           CH_INSERT_DISTRIBUTED_SYNC: "false"
-          CH_READONLY_KAFKA_FALLBACK: "true"
-          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
-          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
-          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
-          KAFKA_TOPIC: lecture.events
-          KAFKA_CLIENT_ID: statground-inflearn-crawler
           LECTURE_PROVIDER: inflearn
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
@@ -124,12 +118,6 @@ jobs:
           CH_INSERT_CHUNK_SIZE: "100"
           CH_INSERT_TIMEOUT_SECONDS: "300"
           CH_INSERT_DISTRIBUTED_SYNC: "false"
-          CH_READONLY_KAFKA_FALLBACK: "true"
-          KAFKA_BROKERS: ${{ secrets.KAFKA_BROKERS }}
-          KAFKA_USERNAME: ${{ secrets.KAFKA_USERNAME || secrets.KAFKA_EXTERNAL_USER }}
-          KAFKA_PASSWORD: ${{ secrets.KAFKA_PASSWORD || secrets.KAFKA_EXTERNAL_PASSWORD }}
-          KAFKA_TOPIC: lecture.events
-          KAFKA_CLIENT_ID: statground-inflearn-crawler
           LECTURE_PROVIDER: inflearn
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"

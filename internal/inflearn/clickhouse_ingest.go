@@ -93,17 +93,7 @@ func (s *Service) InsertCheckpointClickHouse(ctx context.Context, source string,
 		"sitemap_index": cp.SitemapIndex,
 		"url_index":     cp.URLIndex,
 	}
-	if err := s.insertClickHouseRows(ctx, s.Cfg.CHRawDatabase, "inflearn_crawl_checkpoint", inflearnCrawlCheckpointColumns, []map[string]any{row}); err != nil {
-		if s.shouldFallbackClickHouseWriteToKafka(err) {
-			fmt.Println("[warn] clickhouse checkpoint insert temporarily unavailable; publishing checkpoint to Kafka fallback")
-			if fallbackErr := s.PublishCheckpoint(ctx, source, cp); fallbackErr != nil {
-				return fmt.Errorf("clickhouse checkpoint insert failed and kafka fallback failed: %w", fallbackErr)
-			}
-			return nil
-		}
-		return err
-	}
-	return nil
+	return s.insertClickHouseRows(ctx, s.Cfg.CHRawDatabase, "inflearn_crawl_checkpoint", inflearnCrawlCheckpointColumns, []map[string]any{row})
 }
 
 func (s *Service) InsertCourseRowsClickHouse(ctx context.Context, rows CourseRows) error {
@@ -224,34 +214,4 @@ func normalizeClickHouseRow(row map[string]any, columns []string) map[string]any
 		out[col] = row[col]
 	}
 	return out
-}
-
-func (s *Service) shouldFallbackClickHouseWriteToKafka(err error) bool {
-	if err == nil || !s.Cfg.CHReadOnlyKafkaFallback {
-		return false
-	}
-	if len(s.Cfg.KafkaBrokers) == 0 || strings.TrimSpace(s.Cfg.KafkaTopic) == "" {
-		return false
-	}
-	return isTemporaryClickHouseReplicaWriteError(err)
-}
-
-func isTemporaryClickHouseReplicaWriteError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "table_is_read_only") ||
-		strings.Contains(msg, "readonly mode") ||
-		strings.Contains(msg, "read-only") ||
-		strings.Contains(msg, "keeper_exception") ||
-		strings.Contains(msg, "coordination error") ||
-		strings.Contains(msg, "connection loss")
-}
-
-func isClickHouseRawSnapshotInsertError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), ".inflearn_course_snapshot_raw")
 }

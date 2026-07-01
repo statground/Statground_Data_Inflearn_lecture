@@ -30,9 +30,6 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	if cfg.CHInsertDistributedSync {
 		t.Fatal("CHInsertDistributedSync should default to false")
 	}
-	if !cfg.CHReadOnlyKafkaFallback {
-		t.Fatal("CHReadOnlyKafkaFallback should default to true")
-	}
 }
 
 func TestLoadConfigKafkaIngestStillRequiresBrokers(t *testing.T) {
@@ -70,25 +67,4 @@ func TestBoolToInt(t *testing.T) {
 	if got := boolToInt(true); got != 1 {
 		t.Fatalf("boolToInt(true) = %d, want 1", got)
 	}
-}
-
-func TestTemporaryClickHouseReplicaWriteError(t *testing.T) {
-	cases := []string{
-		"Code: 242. DB::Exception: Table is in readonly mode (TABLE_IS_READ_ONLY)",
-		"Code: 999. Coordination::Exception: Coordination error: Connection loss (KEEPER_EXCEPTION)",
-	}
-	for _, msg := range cases {
-		if !isTemporaryClickHouseReplicaWriteError(fakeError(msg)) {
-			t.Fatalf("isTemporaryClickHouseReplicaWriteError(%q) = false, want true", msg)
-		}
-	}
-	if isTemporaryClickHouseReplicaWriteError(fakeError("Code: 60. Unknown table")) {
-		t.Fatal("unknown table should not be treated as a temporary replica write error")
-	}
-}
-
-type fakeError string
-
-func (e fakeError) Error() string {
-	return string(e)
 }

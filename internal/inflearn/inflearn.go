@@ -50,7 +50,6 @@ type Config struct {
 	CHInsertChunkSize       int
 	CHInsertTimeout         time.Duration
 	CHInsertDistributedSync bool
-	CHReadOnlyKafkaFallback bool
 	IngestMode              string
 	LectureProvider         string
 	KafkaBrokers            []string
@@ -175,7 +174,6 @@ func LoadConfig() (Config, error) {
 		CHInsertChunkSize:       parsePositiveInt(envDefault("CH_INSERT_CHUNK_SIZE", "100"), 100),
 		CHInsertTimeout:         parseSecondsDefault(envDefault("CH_INSERT_TIMEOUT_SECONDS", "300"), 5*time.Minute),
 		CHInsertDistributedSync: parseBool(envDefault("CH_INSERT_DISTRIBUTED_SYNC", "false")),
-		CHReadOnlyKafkaFallback: parseBool(envDefault("CH_READONLY_KAFKA_FALLBACK", "true")),
 		IngestMode:              strings.ToLower(envDefault("INGEST_MODE", "clickhouse")),
 		LectureProvider:         envDefault("LECTURE_PROVIDER", "inflearn"),
 		KafkaBrokers:            splitCSV(envDefault("KAFKA_BROKERS", "")),
@@ -1351,17 +1349,7 @@ func (r *CourseRows) Reset() {
 
 func (r CourseRows) InsertAll(ctx context.Context, s *Service) error {
 	if s.UseClickHouseIngest() {
-		if err := s.InsertCourseRowsClickHouse(ctx, r); err != nil {
-			if s.shouldFallbackClickHouseWriteToKafka(err) && isClickHouseRawSnapshotInsertError(err) {
-				fmt.Println("[warn] clickhouse direct course insert temporarily unavailable; publishing course rows to Kafka fallback")
-				if fallbackErr := s.PublishCourseRows(ctx, r); fallbackErr != nil {
-					return fmt.Errorf("clickhouse direct course insert failed and kafka fallback failed: %w", fallbackErr)
-				}
-				return nil
-			}
-			return err
-		}
-		return nil
+		return s.InsertCourseRowsClickHouse(ctx, r)
 	}
 	return s.PublishCourseRows(ctx, r)
 }
