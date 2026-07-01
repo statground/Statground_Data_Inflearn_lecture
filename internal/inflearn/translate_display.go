@@ -61,6 +61,15 @@ func LoadTranslationConfig() (Config, error) {
 		CHRawDatabase:              envDefault("CH_RAW_DATABASE", "Data_Lecture_Inflearn_Service"),
 		CHServiceDatabase:          envDefault("CH_SERVICE_DATABASE", "Data_Lecture_Inflearn_Service"),
 		CHSecure:                   parseBool(envFirstDefault([]string{"CH_SECURE", "CLICKHOUSE_SECURE"}, "0")),
+		CHCluster:                  envDefault("CH_CLUSTER", "statground_cluster"),
+		CHInsertChunkSize:          parsePositiveInt(envDefault("CH_INSERT_CHUNK_SIZE", "100"), 100),
+		CHInsertTimeout:            parseSecondsDefault(envDefault("CH_INSERT_TIMEOUT_SECONDS", "300"), 5*time.Minute),
+		CHInsertDistributedSync:    parseBool(envDefault("CH_INSERT_DISTRIBUTED_SYNC", "false")),
+		CHDirectReplicaFallback:    parseBool(envDefault("CH_DIRECT_REPLICA_FALLBACK", "true")),
+		CHDirectOutboxFallback:     parseBool(envDefault("CH_DIRECT_OUTBOX_FALLBACK", "true")),
+		CHOutboxDatabase:           envDefault("CH_OUTBOX_DATABASE", "Data_Lecture_Inflearn_Log"),
+		CHOutboxTable:              envDefault("CH_OUTBOX_TABLE", "inflearn_direct_insert_outbox"),
+		CHOutboxReplayLimit:        parsePositiveInt(envDefault("CH_OUTBOX_REPLAY_LIMIT", "50"), 50),
 		UserAgent:                  envDefault("CRAWLER_USER_AGENT", "Mozilla/5.0 (compatible; StatgroundCrawler/2.0; +https://www.statground.net)"),
 		TranslationTargetLanguages: normalizeTranslationTargets(targets),
 		TranslationCourseIDs:       parseTranslationCourseIDs(envDefault("INFLEARN_TRANSLATION_COURSE_IDS", "")),
@@ -98,6 +107,9 @@ func LoadTranslationConfig() (Config, error) {
 func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 	if s == nil {
 		return fmt.Errorf("service is nil")
+	}
+	if err := s.ValidateClickHouseIngest(ctx); err != nil {
+		return err
 	}
 	remaining := s.Cfg.TranslationMaxPerRun
 	totalInserted := 0
@@ -611,36 +623,16 @@ func (s *Service) insertDisplayTranslations(ctx context.Context, rows []map[stri
 	if len(rows) == 0 {
 		return nil
 	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	for _, row := range rows {
-		if err := enc.Encode(row); err != nil {
-			return err
-		}
-	}
-	sql := fmt.Sprintf("INSERT INTO %s FORMAT JSONEachRow", chTablePath(s.Cfg.TranslationTable))
-	insertCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	_, err := s.chPost(insertCtx, sql, buf.Bytes(), "application/x-ndjson")
-	return err
+	database, table := chTablePartsWithDefault(s.Cfg.TranslationTable, "Data_Lecture_Inflearn_Service", "inflearn_course_display_translation")
+	return s.insertClickHouseRows(ctx, database, table, inflearnCourseDisplayTranslationColumns, rows)
 }
 
 func (s *Service) insertCurriculumTranslations(ctx context.Context, rows []map[string]any) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	for _, row := range rows {
-		if err := enc.Encode(row); err != nil {
-			return err
-		}
-	}
-	sql := fmt.Sprintf("INSERT INTO %s FORMAT JSONEachRow", chTablePathWithDefault(s.Cfg.TranslationCurriculumTable, "Data_Lecture_Inflearn_Service", "inflearn_course_curriculum_display_translation"))
-	insertCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	_, err := s.chPost(insertCtx, sql, buf.Bytes(), "application/x-ndjson")
-	return err
+	database, table := chTablePartsWithDefault(s.Cfg.TranslationCurriculumTable, "Data_Lecture_Inflearn_Service", "inflearn_course_curriculum_display_translation")
+	return s.insertClickHouseRows(ctx, database, table, inflearnCourseCurriculumDisplayTranslationColumns, rows)
 }
 
 func normalizeTranslationTargets(targets []string) []string {
@@ -884,11 +876,21 @@ func chTablePath(raw string) string {
 }
 
 func chTablePathWithDefault(raw, defaultDB, defaultTable string) string {
+	db, table := chTablePartsWithDefault(raw, defaultDB, defaultTable)
+	return chIdent(db) + "." + chIdent(table)
+}
+
+func chTablePartsWithDefault(raw, defaultDB, defaultTable string) (string, string) {
 	parts := strings.Split(strings.TrimSpace(raw), ".")
 	if len(parts) != 2 {
-		return chIdent(defaultDB) + "." + chIdent(defaultTable)
+		return defaultDB, defaultTable
 	}
-	return chIdent(parts[0]) + "." + chIdent(parts[1])
+	db := strings.TrimSpace(parts[0])
+	table := strings.TrimSpace(parts[1])
+	if db == "" || table == "" {
+		return defaultDB, defaultTable
+	}
+	return db, table
 }
 
 func extractJSONObject(raw string) string {

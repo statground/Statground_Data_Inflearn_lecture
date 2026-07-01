@@ -47,9 +47,15 @@ type Config struct {
 	CHLogDatabase           string
 	CHMartDatabase          string
 	CHSecure                bool
+	CHCluster               string
 	CHInsertChunkSize       int
 	CHInsertTimeout         time.Duration
 	CHInsertDistributedSync bool
+	CHDirectReplicaFallback bool
+	CHDirectOutboxFallback  bool
+	CHOutboxDatabase        string
+	CHOutboxTable           string
+	CHOutboxReplayLimit     int
 	IngestMode              string
 	LectureProvider         string
 	KafkaBrokers            []string
@@ -171,9 +177,15 @@ func LoadConfig() (Config, error) {
 		CHLogDatabase:           envDefault("CH_LOG_DATABASE", "Data_Lecture_Inflearn_Log"),
 		CHMartDatabase:          envDefault("CH_MART_DATABASE", "Data_Lecture_Inflearn_Mart"),
 		CHSecure:                parseBool(envFirstDefault([]string{"CH_SECURE", "CLICKHOUSE_SECURE"}, "0")),
+		CHCluster:               envDefault("CH_CLUSTER", "statground_cluster"),
 		CHInsertChunkSize:       parsePositiveInt(envDefault("CH_INSERT_CHUNK_SIZE", "100"), 100),
 		CHInsertTimeout:         parseSecondsDefault(envDefault("CH_INSERT_TIMEOUT_SECONDS", "300"), 5*time.Minute),
 		CHInsertDistributedSync: parseBool(envDefault("CH_INSERT_DISTRIBUTED_SYNC", "false")),
+		CHDirectReplicaFallback: parseBool(envDefault("CH_DIRECT_REPLICA_FALLBACK", "true")),
+		CHDirectOutboxFallback:  parseBool(envDefault("CH_DIRECT_OUTBOX_FALLBACK", "true")),
+		CHOutboxDatabase:        envDefault("CH_OUTBOX_DATABASE", "Data_Lecture_Inflearn_Log"),
+		CHOutboxTable:           envDefault("CH_OUTBOX_TABLE", "inflearn_direct_insert_outbox"),
+		CHOutboxReplayLimit:     parsePositiveInt(envDefault("CH_OUTBOX_REPLAY_LIMIT", "50"), 50),
 		IngestMode:              strings.ToLower(envDefault("INGEST_MODE", "clickhouse")),
 		LectureProvider:         envDefault("LECTURE_PROVIDER", "inflearn"),
 		KafkaBrokers:            splitCSV(envDefault("KAFKA_BROKERS", "")),

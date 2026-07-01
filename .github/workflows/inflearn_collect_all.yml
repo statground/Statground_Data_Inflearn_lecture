@@ -83,10 +83,17 @@ jobs:
           CH_PASSWORD: ${{ secrets.CH_PASSWORD || secrets.CLICKHOUSE_PASSWORD }}
           CH_RAW_DATABASE: Data_Lecture_Inflearn_Raw
           CH_SERVICE_DATABASE: Data_Lecture_Inflearn_Service
+          CH_LOG_DATABASE: Data_Lecture_Inflearn_Log
+          CH_CLUSTER: statground_cluster
           INGEST_MODE: clickhouse
           CH_INSERT_CHUNK_SIZE: "100"
           CH_INSERT_TIMEOUT_SECONDS: "300"
           CH_INSERT_DISTRIBUTED_SYNC: "false"
+          CH_DIRECT_REPLICA_FALLBACK: "true"
+          CH_DIRECT_OUTBOX_FALLBACK: "true"
+          CH_OUTBOX_DATABASE: Data_Lecture_Inflearn_Log
+          CH_OUTBOX_TABLE: inflearn_direct_insert_outbox
+          CH_OUTBOX_REPLAY_LIMIT: "50"
           LECTURE_PROVIDER: inflearn
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
@@ -114,10 +121,17 @@ jobs:
           CH_PASSWORD: ${{ secrets.CH_PASSWORD || secrets.CLICKHOUSE_PASSWORD }}
           CH_RAW_DATABASE: Data_Lecture_Inflearn_Raw
           CH_SERVICE_DATABASE: Data_Lecture_Inflearn_Service
+          CH_LOG_DATABASE: Data_Lecture_Inflearn_Log
+          CH_CLUSTER: statground_cluster
           INGEST_MODE: clickhouse
           CH_INSERT_CHUNK_SIZE: "100"
           CH_INSERT_TIMEOUT_SECONDS: "300"
           CH_INSERT_DISTRIBUTED_SYNC: "false"
+          CH_DIRECT_REPLICA_FALLBACK: "true"
+          CH_DIRECT_OUTBOX_FALLBACK: "true"
+          CH_OUTBOX_DATABASE: Data_Lecture_Inflearn_Log
+          CH_OUTBOX_TABLE: inflearn_direct_insert_outbox
+          CH_OUTBOX_REPLAY_LIMIT: "50"
           LECTURE_PROVIDER: inflearn
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
@@ -162,6 +176,16 @@ jobs:
           CH_USER: ${{ secrets.CH_USER || secrets.CLICKHOUSE_USER }}
           CH_PASSWORD: ${{ secrets.CH_PASSWORD || secrets.CLICKHOUSE_PASSWORD }}
           CH_SERVICE_DATABASE: Data_Lecture_Inflearn_Service
+          CH_LOG_DATABASE: Data_Lecture_Inflearn_Log
+          CH_CLUSTER: statground_cluster
+          CH_INSERT_CHUNK_SIZE: "100"
+          CH_INSERT_TIMEOUT_SECONDS: "300"
+          CH_INSERT_DISTRIBUTED_SYNC: "false"
+          CH_DIRECT_REPLICA_FALLBACK: "true"
+          CH_DIRECT_OUTBOX_FALLBACK: "true"
+          CH_OUTBOX_DATABASE: Data_Lecture_Inflearn_Log
+          CH_OUTBOX_TABLE: inflearn_direct_insert_outbox
+          CH_OUTBOX_REPLAY_LIMIT: "50"
           INFLEARN_TRANSLATION_API_KEY: ${{ secrets.INFLEARN_TRANSLATION_API_KEY || secrets.OPENAI_API_KEY || secrets.GH_MODELS_API_KEY || secrets.GITHUB_MODELS_API_KEY }}
           GH_MODELS_API_KEY: ${{ secrets.GH_MODELS_API_KEY || secrets.GITHUB_MODELS_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

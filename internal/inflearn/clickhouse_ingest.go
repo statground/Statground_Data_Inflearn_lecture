@@ -50,6 +50,20 @@ var (
 	inflearnCourseInstructorMapColumns = []string{
 		"fetched_at", "course_id", "instructor_id", "role",
 	}
+	inflearnCourseDisplayTranslationColumns = []string{
+		"course_id", "source_locale", "target_language", "source_hash", "translated_at",
+		"title", "description", "category_main_title", "category_sub_title", "level_code",
+		"keywords", "model", "prompt_hash", "generation_status", "generation_error", "ingested_at",
+	}
+	inflearnCourseCurriculumDisplayTranslationColumns = []string{
+		"course_id", "source_locale", "target_language", "section_id", "unit_id", "source_hash",
+		"translated_at", "section_title", "unit_title", "model", "prompt_hash",
+		"generation_status", "generation_error", "ingested_at",
+	}
+	inflearnDirectInsertOutboxColumns = []string{
+		"outbox_uuid", "created_at", "target_database", "target_table",
+		"target_columns", "rows_json", "row_count", "payload_hash", "source_error",
+	}
 )
 
 func (s *Service) UseClickHouseIngest() bool {
@@ -83,6 +97,14 @@ func (s *Service) ValidateClickHouseIngest(ctx context.Context) error {
 		return fmt.Errorf("clickhouse preflight returned an unexpected response")
 	}
 	fmt.Println("[clickhouse] preflight ok mode=direct")
+	if s.Cfg.CHDirectOutboxFallback {
+		drained, err := s.drainClickHouseDirectOutbox(ctx)
+		if err != nil {
+			fmt.Printf("[warn] clickhouse direct outbox drain skipped: %s\n", s.sanitizeClickHouseError(err))
+		} else if drained > 0 {
+			fmt.Printf("[clickhouse] drained direct outbox chunks=%d\n", drained)
+		}
+	}
 	return nil
 }
 
@@ -173,15 +195,9 @@ func (s *Service) insertClickHouseRows(ctx context.Context, database, table stri
 }
 
 func (s *Service) insertClickHouseRowsChunk(ctx context.Context, database, table string, columns []string, rows []map[string]any) error {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "INSERT INTO %s.%s (%s) SETTINGS insert_distributed_sync = %d FORMAT JSONEachRow\n",
-		chIdent(database), chIdent(table), clickHouseColumnList(columns), boolToInt(s.Cfg.CHInsertDistributedSync))
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	for _, row := range rows {
-		if err := enc.Encode(normalizeClickHouseRow(row, columns)); err != nil {
-			return err
-		}
+	payload, err := encodeClickHouseJSONEachRow(columns, rows)
+	if err != nil {
+		return err
 	}
 	timeout := s.Cfg.CHInsertTimeout
 	if timeout <= 0 {
@@ -189,8 +205,334 @@ func (s *Service) insertClickHouseRowsChunk(ctx context.Context, database, table
 	}
 	insertCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	_, err := s.chPost(insertCtx, strings.TrimSpace(buf.String()), nil, "application/x-ndjson")
+	if err := s.postClickHouseJSONEachRow(insertCtx, database, table, columns, payload); err == nil {
+		return nil
+	} else if !isTemporaryClickHouseWriteError(err) {
+		return err
+	} else {
+		if s.Cfg.CHDirectReplicaFallback {
+			if fbErr := s.insertClickHouseRowsChunkViaWritableReplica(ctx, database, table, columns, payload, len(rows), err); fbErr == nil {
+				return nil
+			} else {
+				fmt.Printf("[warn] clickhouse writable-replica fallback unavailable target=%s.%s rows=%d error=%s\n",
+					database, table, len(rows), s.sanitizeClickHouseError(fbErr))
+			}
+		}
+		if s.Cfg.CHDirectOutboxFallback {
+			if outboxErr := s.enqueueClickHouseDirectOutbox(ctx, database, table, columns, payload, len(rows), err); outboxErr == nil {
+				return nil
+			} else {
+				return fmt.Errorf("%w; clickhouse direct outbox enqueue failed: %s", err, s.sanitizeClickHouseError(outboxErr))
+			}
+		}
+		return err
+	}
+}
+
+func encodeClickHouseJSONEachRow(columns []string, rows []map[string]any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	for _, row := range rows {
+		if err := enc.Encode(normalizeClickHouseRow(row, columns)); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+func (s *Service) postClickHouseJSONEachRow(ctx context.Context, database, table string, columns []string, payload []byte) error {
+	sql := fmt.Sprintf("INSERT INTO %s.%s (%s) SETTINGS insert_distributed_sync = %d FORMAT JSONEachRow",
+		chIdent(database), chIdent(table), clickHouseColumnList(columns), boolToInt(s.Cfg.CHInsertDistributedSync))
+	_, err := s.chPost(ctx, sql, payload, "application/x-ndjson")
 	return err
+}
+
+func (s *Service) insertClickHouseRowsChunkViaWritableReplica(ctx context.Context, database, table string, columns []string, payload []byte, rowCount int, originalErr error) error {
+	hosts, err := s.writableClickHouseReplicaHosts(ctx, database, clickHouseLocalTableName(table))
+	if err != nil {
+		return err
+	}
+	if len(hosts) == 0 {
+		return fmt.Errorf("no writable replica candidates after %s", s.sanitizeClickHouseError(originalErr))
+	}
+	timeout := s.Cfg.CHInsertTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	localTable := clickHouseLocalTableName(table)
+	var lastErr error
+	for _, host := range hosts {
+		insertCtx, cancel := context.WithTimeout(ctx, timeout)
+		sql := fmt.Sprintf("INSERT INTO FUNCTION remote(%s, %s, %s) (%s) FORMAT JSONEachRow",
+			QuoteSQLString(host), QuoteSQLString(database), QuoteSQLString(localTable), clickHouseColumnList(columns))
+		_, lastErr = s.chPost(insertCtx, sql, payload, "application/x-ndjson")
+		cancel()
+		if lastErr == nil {
+			fmt.Printf("[clickhouse] writable-replica fallback inserted target=%s.%s local_table=%s host=%s rows=%d\n",
+				database, table, localTable, host, rowCount)
+			return nil
+		}
+	}
+	return fmt.Errorf("all writable replica candidates failed: %s", s.sanitizeClickHouseError(lastErr))
+}
+
+func (s *Service) writableClickHouseReplicaHosts(ctx context.Context, database, localTable string) ([]string, error) {
+	cluster := strings.TrimSpace(s.Cfg.CHCluster)
+	if cluster == "" {
+		cluster = "statground_cluster"
+	}
+	sql := fmt.Sprintf(`
+        SELECT hostName() AS host
+        FROM clusterAllReplicas(%s, 'system', 'replicas')
+        WHERE database = %s
+          AND table = %s
+          AND is_readonly = 0
+          AND is_session_expired = 0
+        ORDER BY absolute_delay ASC, queue_size ASC, host ASC
+    `, QuoteSQLString(cluster), QuoteSQLString(database), QuoteSQLString(localTable))
+	rows, err := s.CHQueryRows(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]struct{}{}
+	hosts := make([]string, 0, len(rows))
+	for _, row := range rows {
+		host := strings.TrimSpace(asString(row["host"]))
+		if host == "" {
+			continue
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		hosts = append(hosts, host)
+	}
+	return hosts, nil
+}
+
+func (s *Service) enqueueClickHouseDirectOutbox(ctx context.Context, database, table string, columns []string, payload []byte, rowCount int, sourceErr error) error {
+	outboxDB := strings.TrimSpace(s.Cfg.CHOutboxDatabase)
+	if outboxDB == "" {
+		outboxDB = "Data_Lecture_Inflearn_Log"
+	}
+	outboxTable := strings.TrimSpace(s.Cfg.CHOutboxTable)
+	if outboxTable == "" {
+		outboxTable = "inflearn_direct_insert_outbox"
+	}
+	payloadHash := H64(database + "\x1f" + table + "\x1f" + strings.Join(columns, "\x1f") + "\x1f" + string(payload))
+	if exists, err := s.pendingClickHouseDirectOutboxExists(ctx, outboxDB, outboxTable, database, table, payloadHash); err == nil && exists {
+		fmt.Printf("[clickhouse] direct outbox already has pending chunk target=%s.%s rows=%d hash=%d\n", database, table, rowCount, payloadHash)
+		return nil
+	}
+	now := NowDT64()
+	row := map[string]any{
+		"outbox_uuid":    UUIDv7String(now),
+		"created_at":     FormatCHTime(now),
+		"target_database": database,
+		"target_table":    table,
+		"target_columns":  columns,
+		"rows_json":       string(payload),
+		"row_count":       rowCount,
+		"payload_hash":    payloadHash,
+		"source_error":    s.sanitizeClickHouseError(sourceErr),
+	}
+	body, err := encodeClickHouseJSONEachRow(inflearnDirectInsertOutboxColumns, []map[string]any{row})
+	if err != nil {
+		return err
+	}
+	insertCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := s.postClickHouseJSONEachRow(insertCtx, outboxDB, outboxTable, inflearnDirectInsertOutboxColumns, body); err != nil {
+		return err
+	}
+	fmt.Printf("[clickhouse] queued direct outbox target=%s.%s rows=%d hash=%d reason=%s\n",
+		database, table, rowCount, payloadHash, s.sanitizeClickHouseError(sourceErr))
+	return nil
+}
+
+func (s *Service) pendingClickHouseDirectOutboxExists(ctx context.Context, outboxDB, outboxTable, database, table string, payloadHash uint64) (bool, error) {
+	sql := fmt.Sprintf(`
+        SELECT count() AS c
+        FROM %s.%s
+        WHERE target_database = %s
+          AND target_table = %s
+          AND payload_hash = %d
+          AND replayed_at IS NULL
+        LIMIT 1
+    `, chIdent(outboxDB), chIdent(outboxTable), QuoteSQLString(database), QuoteSQLString(table), payloadHash)
+	rows, err := s.CHQueryRows(ctx, sql)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0 && asInt64(rows[0]["c"]) > 0, nil
+}
+
+func (s *Service) drainClickHouseDirectOutbox(ctx context.Context) (int, error) {
+	limit := s.Cfg.CHOutboxReplayLimit
+	if limit <= 0 {
+		return 0, nil
+	}
+	outboxDB := strings.TrimSpace(s.Cfg.CHOutboxDatabase)
+	if outboxDB == "" {
+		outboxDB = "Data_Lecture_Inflearn_Log"
+	}
+	outboxTable := strings.TrimSpace(s.Cfg.CHOutboxTable)
+	if outboxTable == "" {
+		outboxTable = "inflearn_direct_insert_outbox"
+	}
+	sql := fmt.Sprintf(`
+        SELECT outbox_uuid, target_database, target_table, target_columns, rows_json, row_count
+        FROM %s.%s
+        WHERE replayed_at IS NULL
+        ORDER BY created_at ASC, outbox_uuid ASC
+        LIMIT %d
+    `, chIdent(outboxDB), chIdent(outboxTable), limit)
+	rows, err := s.CHQueryRows(ctx, sql)
+	if err != nil {
+		return 0, err
+	}
+	drained := 0
+	for _, row := range rows {
+		outboxUUID := asString(row["outbox_uuid"])
+		database := asString(row["target_database"])
+		table := asString(row["target_table"])
+		columns := asStringSlice(row["target_columns"])
+		payload := []byte(asString(row["rows_json"]))
+		rowCount := asInt(row["row_count"])
+		if outboxUUID == "" || database == "" || table == "" || len(columns) == 0 || len(payload) == 0 {
+			continue
+		}
+		timeout := s.Cfg.CHInsertTimeout
+		if timeout <= 0 {
+			timeout = 5 * time.Minute
+		}
+		insertCtx, cancel := context.WithTimeout(ctx, timeout)
+		insertErr := s.postClickHouseJSONEachRow(insertCtx, database, table, columns, payload)
+		cancel()
+		if insertErr != nil {
+			fmt.Printf("[warn] clickhouse direct outbox replay failed uuid=%s target=%s.%s rows=%d error=%s\n",
+				outboxUUID, database, table, rowCount, s.sanitizeClickHouseError(insertErr))
+			_ = s.markClickHouseDirectOutboxReplay(ctx, outboxDB, outboxTable, outboxUUID, false, insertErr)
+			continue
+		}
+		if err := s.markClickHouseDirectOutboxReplay(ctx, outboxDB, outboxTable, outboxUUID, true, nil); err != nil {
+			fmt.Printf("[warn] clickhouse direct outbox replay mark failed uuid=%s error=%s\n", outboxUUID, s.sanitizeClickHouseError(err))
+		}
+		drained++
+		fmt.Printf("[clickhouse] direct outbox replayed uuid=%s target=%s.%s rows=%d\n", outboxUUID, database, table, rowCount)
+	}
+	return drained, nil
+}
+
+func (s *Service) markClickHouseDirectOutboxReplay(ctx context.Context, outboxDB, outboxTable, outboxUUID string, success bool, replayErr error) error {
+	var sql string
+	if success {
+		sql = fmt.Sprintf(`
+            ALTER TABLE %s.%s
+            UPDATE replay_attempt = replay_attempt + 1,
+                   last_replay_at = now64(3, 'Asia/Seoul'),
+                   replayed_at = now64(3, 'Asia/Seoul'),
+                   replay_error = ''
+            WHERE outbox_uuid = toUUID(%s)
+            SETTINGS mutations_sync = 1
+        `, chIdent(outboxDB), chIdent(outboxTable), QuoteSQLString(outboxUUID))
+	} else {
+		sql = fmt.Sprintf(`
+            ALTER TABLE %s.%s
+            UPDATE replay_attempt = replay_attempt + 1,
+                   last_replay_at = now64(3, 'Asia/Seoul'),
+                   replay_error = %s
+            WHERE outbox_uuid = toUUID(%s)
+            SETTINGS mutations_sync = 1
+        `, chIdent(outboxDB), chIdent(outboxTable), QuoteSQLString(s.sanitizeClickHouseError(replayErr)), QuoteSQLString(outboxUUID))
+	}
+	markCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	_, err := s.chPost(markCtx, strings.TrimSpace(sql), nil, "text/plain; charset=utf-8")
+	return err
+}
+
+func clickHouseLocalTableName(table string) string {
+	table = strings.TrimSpace(table)
+	if strings.HasSuffix(table, "_local") {
+		return table
+	}
+	return table + "_local"
+}
+
+func isTemporaryClickHouseWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	needles := []string{
+		"table_is_read_only",
+		"readonly mode",
+		"read-only",
+		"keeper_exception",
+		"coordination error",
+		"connection loss",
+		"session expired",
+		"zookeeper",
+		"clickhouse keeper",
+		"context deadline exceeded",
+		"timeout",
+		"temporary",
+		"connection reset",
+		"broken pipe",
+		"eof",
+	}
+	for _, needle := range needles {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) sanitizeClickHouseError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.TrimSpace(err.Error())
+	for _, secret := range []string{s.Cfg.CHPassword, s.Cfg.KafkaPassword, s.Cfg.TranslationAPIKey} {
+		secret = strings.TrimSpace(secret)
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "***")
+		}
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 400 {
+		text = text[:400]
+	}
+	return text
+}
+
+func asStringSlice(v any) []string {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case []string:
+		return x
+	case []any:
+		out := make([]string, 0, len(x))
+		for _, item := range x {
+			s := strings.TrimSpace(asString(item))
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case string:
+		parts := splitCSV(x)
+		if len(parts) > 0 {
+			return parts
+		}
+		return nil
+	default:
+		return nil
+	}
 }
 
 func boolToInt(v bool) int {

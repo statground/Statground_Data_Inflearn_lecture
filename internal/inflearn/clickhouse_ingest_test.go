@@ -13,6 +13,10 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	t.Setenv("CH_INSERT_CHUNK_SIZE", "")
 	t.Setenv("CH_INSERT_TIMEOUT_SECONDS", "")
 	t.Setenv("CH_INSERT_DISTRIBUTED_SYNC", "")
+	t.Setenv("CH_DIRECT_REPLICA_FALLBACK", "")
+	t.Setenv("CH_DIRECT_OUTBOX_FALLBACK", "")
+	t.Setenv("CH_OUTBOX_DATABASE", "")
+	t.Setenv("CH_OUTBOX_TABLE", "")
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -29,6 +33,18 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	}
 	if cfg.CHInsertDistributedSync {
 		t.Fatal("CHInsertDistributedSync should default to false")
+	}
+	if !cfg.CHDirectReplicaFallback {
+		t.Fatal("CHDirectReplicaFallback should default to true")
+	}
+	if !cfg.CHDirectOutboxFallback {
+		t.Fatal("CHDirectOutboxFallback should default to true")
+	}
+	if cfg.CHOutboxDatabase != "Data_Lecture_Inflearn_Log" {
+		t.Fatalf("CHOutboxDatabase = %q, want Data_Lecture_Inflearn_Log", cfg.CHOutboxDatabase)
+	}
+	if cfg.CHOutboxTable != "inflearn_direct_insert_outbox" {
+		t.Fatalf("CHOutboxTable = %q, want inflearn_direct_insert_outbox", cfg.CHOutboxTable)
 	}
 }
 
@@ -68,3 +84,33 @@ func TestBoolToInt(t *testing.T) {
 		t.Fatalf("boolToInt(true) = %d, want 1", got)
 	}
 }
+
+func TestClickHouseLocalTableName(t *testing.T) {
+	if got := clickHouseLocalTableName("inflearn_course_snapshot_raw"); got != "inflearn_course_snapshot_raw_local" {
+		t.Fatalf("local table = %q", got)
+	}
+	if got := clickHouseLocalTableName("inflearn_course_snapshot_raw_local"); got != "inflearn_course_snapshot_raw_local" {
+		t.Fatalf("local table should not double suffix, got %q", got)
+	}
+}
+
+func TestIsTemporaryClickHouseWriteError(t *testing.T) {
+	cases := []struct {
+		text string
+		want bool
+	}{
+		{"Code: 242. DB::Exception: Table is in readonly mode (TABLE_IS_READ_ONLY)", true},
+		{"KEEPER_EXCEPTION Coordination error: Connection loss", true},
+		{"Post http://clickhouse:8123/: context deadline exceeded", true},
+		{"Code: 60. DB::Exception: Table does not exist", false},
+	}
+	for _, tc := range cases {
+		if got := isTemporaryClickHouseWriteError(errString(tc.text)); got != tc.want {
+			t.Fatalf("isTemporaryClickHouseWriteError(%q) = %v, want %v", tc.text, got, tc.want)
+		}
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
