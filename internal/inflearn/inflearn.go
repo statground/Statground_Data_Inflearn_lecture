@@ -2116,17 +2116,29 @@ func (s *Service) RunUpdateExisting(ctx context.Context) error {
 	}
 	totalDone, _, err := s.getUpdateProgress(ctx)
 	if err != nil {
+		if isTemporaryClickHouseWriteError(err) {
+			fmt.Printf("[warn] update skipped because ClickHouse checkpoint read is temporarily unavailable: %s\n", s.sanitizeClickHouseError(err))
+			return nil
+		}
 		return err
 	}
 
 	picks, err := s.pickUpdateURLs(ctx, s.Cfg.UpdateBatchSize)
 	if err != nil {
+		if isTemporaryClickHouseWriteError(err) {
+			fmt.Printf("[warn] update skipped because ClickHouse course snapshot read is temporarily unavailable: %s\n", s.sanitizeClickHouseError(err))
+			return nil
+		}
 		return err
 	}
 	fmt.Printf("[update] picked=%d (UPDATE_BATCH_SIZE=%d)\n", len(picks), s.Cfg.UpdateBatchSize)
 	if len(picks) == 0 {
 		if err := s.setUpdateProgress(ctx, totalDone, 0); err != nil {
-			return err
+			if isTemporaryClickHouseWriteError(err) {
+				fmt.Printf("[warn] update empty checkpoint deferred because ClickHouse is temporarily unavailable: %s\n", s.sanitizeClickHouseError(err))
+			} else {
+				return err
+			}
 		}
 		fmt.Println("[update] nothing to do")
 		return nil
@@ -2186,7 +2198,11 @@ func (s *Service) RunUpdateExisting(ctx context.Context) error {
 	}
 	totalDone += len(picks)
 	if err := s.setUpdateProgress(ctx, totalDone, len(picks)); err != nil {
-		return err
+		if isTemporaryClickHouseWriteError(err) {
+			fmt.Printf("[warn] update progress checkpoint deferred because ClickHouse is temporarily unavailable: %s\n", s.sanitizeClickHouseError(err))
+		} else {
+			return err
+		}
 	}
 
 	if failed > 0 {

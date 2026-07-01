@@ -160,7 +160,7 @@ jobs:
           CH_BASE_URL="${CH_PROTOCOL}://${CH_HOST}:${CH_PORT}/${CH_HTTP_URL_PATH}"
           REFRESH_LOG="$(mktemp)"
           if ! curl --fail --silent --show-error --max-time 300 -u "$CH_USER:$CH_PASSWORD" "$CH_BASE_URL" --data-binary "SYSTEM REFRESH VIEW mirtype_content.mv_provider_practice_content_refresh" >"$REFRESH_LOG" 2>&1; then
-            if grep -E "TABLE_IS_READ_ONLY|KEEPER_EXCEPTION|Coordination error|Connection loss" "$REFRESH_LOG" >/dev/null; then
+            if grep -Ei "TABLE_IS_READ_ONLY|NOT_INITIALIZED|not initialized|KEEPER_EXCEPTION|Coordination error|Connection loss|context deadline exceeded|timeout" "$REFRESH_LOG" >/dev/null; then
               echo "Skipping MirType provider practice content refresh because ClickHouse replicated tables are temporarily read-only"
               exit 0
             fi
@@ -208,7 +208,7 @@ jobs:
           export INFLEARN_TRANSLATION_MAX_PER_RUN="${INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT:-80}"
           TRANSLATION_LOG="$(mktemp)"
           if ! go run -mod=mod ./cmd/inflearn-translate-display >"$TRANSLATION_LOG" 2>&1; then
-            if grep -E "TABLE_IS_READ_ONLY|KEEPER_EXCEPTION|Coordination error|Connection loss" "$TRANSLATION_LOG" >/dev/null; then
+            if grep -Ei "TABLE_IS_READ_ONLY|NOT_INITIALIZED|not initialized|KEEPER_EXCEPTION|Coordination error|Connection loss|context deadline exceeded|timeout" "$TRANSLATION_LOG" >/dev/null; then
               echo "Skipping display translation because ClickHouse replicated tables are temporarily read-only"
               exit 0
             fi

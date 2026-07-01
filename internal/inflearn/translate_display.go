@@ -124,6 +124,10 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 		}
 		candidates, err := s.pickDisplayTranslationCandidates(ctx, target, limit)
 		if err != nil {
+			if isTemporaryClickHouseWriteError(err) {
+				fmt.Printf("[warn] translation skipped because ClickHouse candidate read is temporarily unavailable target=%s error=%s\n", target, s.sanitizeClickHouseError(err))
+				return nil
+			}
 			return err
 		}
 		if len(candidates) == 0 {
@@ -182,6 +186,10 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 		}
 		candidates, err := s.pickDisplayCurriculumTranslationCandidates(ctx, target, limit)
 		if err != nil {
+			if isTemporaryClickHouseWriteError(err) {
+				fmt.Printf("[warn] curriculum translation skipped because ClickHouse candidate read is temporarily unavailable target=%s error=%s\n", target, s.sanitizeClickHouseError(err))
+				return nil
+			}
 			return err
 		}
 		if len(candidates) == 0 {

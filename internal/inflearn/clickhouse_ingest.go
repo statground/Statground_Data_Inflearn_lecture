@@ -393,6 +393,7 @@ func (s *Service) drainClickHouseDirectOutbox(ctx context.Context) (int, error) 
 		return 0, err
 	}
 	drained := 0
+	deferredTargets := map[string]struct{}{}
 	for _, row := range rows {
 		outboxUUID := asString(row["outbox_uuid"])
 		database := asString(row["target_database"])
@@ -403,13 +404,38 @@ func (s *Service) drainClickHouseDirectOutbox(ctx context.Context) (int, error) 
 		if outboxUUID == "" || database == "" || table == "" || len(columns) == 0 || len(payload) == 0 {
 			continue
 		}
-		timeout := s.Cfg.CHInsertTimeout
-		if timeout <= 0 {
-			timeout = 5 * time.Minute
+		targetKey := database + "." + table
+		if _, ok := deferredTargets[targetKey]; ok {
+			continue
 		}
-		insertCtx, cancel := context.WithTimeout(ctx, timeout)
-		insertErr := s.postClickHouseJSONEachRow(insertCtx, database, table, columns, payload)
-		cancel()
+		hasWritable, err := s.clickHouseTargetHasWritableReplica(ctx, database, table)
+		if err != nil {
+			if isTemporaryClickHouseWriteError(err) {
+				fmt.Printf("[warn] clickhouse direct outbox replay deferred target=%s rows=%d error=%s\n",
+					targetKey, rowCount, s.sanitizeClickHouseError(err))
+				deferredTargets[targetKey] = struct{}{}
+				continue
+			}
+			return drained, err
+		}
+		if !hasWritable {
+			fmt.Printf("[warn] clickhouse direct outbox replay deferred target=%s rows=%d reason=no-writable-replica\n",
+				targetKey, rowCount)
+			deferredTargets[targetKey] = struct{}{}
+			continue
+		}
+		var insertErr error
+		if s.Cfg.CHDirectReplicaFallback {
+			insertErr = s.insertClickHouseRowsChunkViaWritableReplica(ctx, database, table, columns, payload, rowCount, fmt.Errorf("outbox replay"))
+		} else {
+			timeout := s.Cfg.CHInsertTimeout
+			if timeout <= 0 {
+				timeout = 5 * time.Minute
+			}
+			insertCtx, cancel := context.WithTimeout(ctx, timeout)
+			insertErr = s.postClickHouseJSONEachRow(insertCtx, database, table, columns, payload)
+			cancel()
+		}
 		if insertErr != nil {
 			fmt.Printf("[warn] clickhouse direct outbox replay failed uuid=%s target=%s.%s rows=%d error=%s\n",
 				outboxUUID, database, table, rowCount, s.sanitizeClickHouseError(insertErr))
@@ -423,6 +449,14 @@ func (s *Service) drainClickHouseDirectOutbox(ctx context.Context) (int, error) 
 		fmt.Printf("[clickhouse] direct outbox replayed uuid=%s target=%s.%s rows=%d\n", outboxUUID, database, table, rowCount)
 	}
 	return drained, nil
+}
+
+func (s *Service) clickHouseTargetHasWritableReplica(ctx context.Context, database, table string) (bool, error) {
+	hosts, err := s.writableClickHouseReplicaHosts(ctx, database, clickHouseLocalTableName(table))
+	if err != nil {
+		return false, err
+	}
+	return len(hosts) > 0, nil
 }
 
 func (s *Service) markClickHouseDirectOutboxReplay(ctx context.Context, outboxDB, outboxTable, outboxUUID string, success bool, replayErr error) error {
