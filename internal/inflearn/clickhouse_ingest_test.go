@@ -100,9 +100,13 @@ func TestIsTemporaryClickHouseWriteError(t *testing.T) {
 		want bool
 	}{
 		{"Code: 242. DB::Exception: Table is in readonly mode (TABLE_IS_READ_ONLY)", true},
+		{"Code: 667. DB::Exception: Table is not initialized yet. (NOT_INITIALIZED)", true},
 		{"KEEPER_EXCEPTION Coordination error: Connection loss", true},
+		{"Code: 999. DB::Exception: ClickHouse Keeper: session expired", true},
+		{"Code: 210. DB::NetException: Connection refused", true},
 		{"Post http://clickhouse:8123/: context deadline exceeded", true},
 		{"Code: 60. DB::Exception: Table does not exist", false},
+		{"Code: 497. DB::Exception: Not enough privileges", false},
 	}
 	for _, tc := range cases {
 		if got := isTemporaryClickHouseWriteError(errString(tc.text)); got != tc.want {
