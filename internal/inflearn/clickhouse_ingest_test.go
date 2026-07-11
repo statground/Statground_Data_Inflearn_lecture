@@ -94,6 +94,13 @@ func TestClickHouseLocalTableName(t *testing.T) {
 	}
 }
 
+func TestClickHouseResponseCategoryDoesNotExposeServerDetail(t *testing.T) {
+	message := "Code: 667 DB::Exception: Table Data_Lecture_Inflearn_Raw.secret_local is not initialized yet at 192.168.0.15"
+	if got := clickHouseResponseCategory(message); got != "not_initialized" {
+		t.Fatalf("category = %q, want not_initialized", got)
+	}
+}
+
 func TestIsTemporaryClickHouseWriteError(t *testing.T) {
 	cases := []struct {
 		text string

@@ -89,9 +89,21 @@ func (s *Service) ValidateClickHouseIngest(ctx context.Context) error {
 	if !s.hasClickHouseConfig() {
 		return fmt.Errorf("ClickHouse ingest requires CH_HOST/CLICKHOUSE_HOST and CH_USER/CLICKHOUSE_USER")
 	}
-	rows, err := s.CHQueryRows(ctx, "SELECT 1 AS ok")
-	if err != nil {
-		return fmt.Errorf("clickhouse preflight failed: %w", err)
+	var rows []map[string]any
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		rows, err = s.CHQueryRows(ctx, "SELECT 1 AS ok")
+		if err == nil {
+			break
+		}
+		if !isTemporaryClickHouseWriteError(err) || attempt == 3 {
+			return fmt.Errorf("clickhouse preflight failed after %d attempt(s): %w", attempt, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * 2 * time.Second):
+		}
 	}
 	if len(rows) == 0 || asInt(rows[0]["ok"]) != 1 {
 		return fmt.Errorf("clickhouse preflight returned an unexpected response")
@@ -104,6 +116,7 @@ func (s *Service) ValidateClickHouseIngest(ctx context.Context) error {
 		} else if drained > 0 {
 			fmt.Printf("[clickhouse] drained direct outbox chunks=%d\n", drained)
 		}
+		s.logClickHouseDirectOutboxHealth(ctx)
 	}
 	return nil
 }
@@ -242,8 +255,9 @@ func encodeClickHouseJSONEachRow(columns []string, rows []map[string]any) ([]byt
 }
 
 func (s *Service) postClickHouseJSONEachRow(ctx context.Context, database, table string, columns []string, payload []byte) error {
-	sql := fmt.Sprintf("INSERT INTO %s.%s (%s) SETTINGS insert_distributed_sync = %d FORMAT JSONEachRow",
-		chIdent(database), chIdent(table), clickHouseColumnList(columns), boolToInt(s.Cfg.CHInsertDistributedSync))
+	token := fmt.Sprintf("%016x", H64(database+"\x1f"+table+"\x1f"+strings.Join(columns, "\x1f")+"\x1f"+string(payload)))
+	sql := fmt.Sprintf("INSERT INTO %s.%s (%s) SETTINGS insert_distributed_sync = %d, insert_deduplicate = 1, insert_deduplication_token = %s FORMAT JSONEachRow",
+		chIdent(database), chIdent(table), clickHouseColumnList(columns), boolToInt(s.Cfg.CHInsertDistributedSync), QuoteSQLString(token))
 	_, err := s.chPost(ctx, sql, payload, "application/x-ndjson")
 	return err
 }
@@ -269,12 +283,39 @@ func (s *Service) insertClickHouseRowsChunkViaWritableReplica(ctx context.Contex
 		_, lastErr = s.chPost(insertCtx, sql, payload, "application/x-ndjson")
 		cancel()
 		if lastErr == nil {
-			fmt.Printf("[clickhouse] writable-replica fallback inserted target=%s.%s local_table=%s host=%s rows=%d\n",
-				database, table, localTable, host, rowCount)
+			fmt.Printf("[clickhouse] writable-replica fallback inserted target=%s.%s local_table=%s host_id=%016x rows=%d\n",
+				database, table, localTable, H64(host), rowCount)
 			return nil
 		}
 	}
 	return fmt.Errorf("all writable replica candidates failed: %s", s.sanitizeClickHouseError(lastErr))
+}
+
+func (s *Service) logClickHouseDirectOutboxHealth(ctx context.Context) {
+	outboxDB := strings.TrimSpace(s.Cfg.CHOutboxDatabase)
+	if outboxDB == "" {
+		outboxDB = "Data_Lecture_Inflearn_Log"
+	}
+	outboxTable := strings.TrimSpace(s.Cfg.CHOutboxTable)
+	if outboxTable == "" {
+		outboxTable = "inflearn_direct_insert_outbox"
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	rows, err := s.CHQueryRows(queryCtx, fmt.Sprintf(`
+        SELECT count() AS pending,
+               if(count() = 0, 0, dateDiff('hour', min(created_at), now64(3, 'Asia/Seoul'))) AS oldest_hours
+        FROM %s.%s
+        WHERE replayed_at IS NULL
+    `, chIdent(outboxDB), chIdent(outboxTable)))
+	if err != nil || len(rows) == 0 {
+		return
+	}
+	pending := asInt(rows[0]["pending"])
+	oldestHours := asInt(rows[0]["oldest_hours"])
+	if pending > 0 {
+		fmt.Printf("[warn] clickhouse direct outbox pending=%d oldest_hours=%d\n", pending, oldestHours)
+	}
 }
 
 func (s *Service) writableClickHouseReplicaHosts(ctx context.Context, database, localTable string) ([]string, error) {
@@ -327,8 +368,8 @@ func (s *Service) enqueueClickHouseDirectOutbox(ctx context.Context, database, t
 	}
 	now := NowDT64()
 	row := map[string]any{
-		"outbox_uuid":    UUIDv7String(now),
-		"created_at":     FormatCHTime(now),
+		"outbox_uuid":     UUIDv7String(now),
+		"created_at":      FormatCHTime(now),
 		"target_database": database,
 		"target_table":    table,
 		"target_columns":  columns,

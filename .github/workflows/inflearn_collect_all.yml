@@ -29,6 +29,8 @@ jobs:
   collect_all:
     runs-on: ubuntu-latest
     timeout-minutes: 100
+    env:
+      CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -44,10 +46,14 @@ jobs:
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
           CH_USER: ${{ secrets.CH_USER || secrets.CLICKHOUSE_USER }}
           CH_PASSWORD: ${{ secrets.CH_PASSWORD || secrets.CLICKHOUSE_PASSWORD }}
+          CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
         run: |
           test -n "$CH_HOST" || { echo "CH_HOST or CLICKHOUSE_HOST secret is required"; exit 1; }
           test -n "$CH_USER" || { echo "CH_USER or CLICKHOUSE_USER secret is required"; exit 1; }
           test -n "$CH_PASSWORD" || { echo "CH_PASSWORD or CLICKHOUSE_PASSWORD secret is required"; exit 1; }
+          if [[ "${CH_SECURE,,}" != "true" && "$CH_SECURE" != "1" ]]; then
+            echo "::warning::ClickHouse transport is not TLS-protected; provision a verified HTTPS endpoint and set CH_SECURE=true"
+          fi
           python3 - <<'PY'
           import hashlib
           import os

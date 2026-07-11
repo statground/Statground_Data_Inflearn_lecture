@@ -927,9 +927,32 @@ func (s *Service) chPost(ctx context.Context, sql string, data []byte, contentTy
 		if len(snippet) > 500 {
 			snippet = snippet[:500]
 		}
-		return nil, fmt.Errorf("clickhouse http %d: %s", resp.StatusCode, snippet)
+		return nil, fmt.Errorf("clickhouse http status=%d category=%s", resp.StatusCode, clickHouseResponseCategory(snippet))
 	}
 	return out, nil
+}
+
+func clickHouseResponseCategory(message string) string {
+	lower := strings.ToLower(message)
+	checks := []struct {
+		category string
+		markers  []string
+	}{
+		{"permission", []string{"access_denied", "not enough privileges"}},
+		{"schema", []string{"unknown_table", "unknown identifier", "unknown column"}},
+		{"not_initialized", []string{"not_initialized", "not initialized"}},
+		{"table_is_read_only", []string{"table_is_read_only", "readonly", "read-only"}},
+		{"keeper_exception", []string{"keeper_exception", "coordination", "connection loss"}},
+		{"timeout", []string{"timeout", "deadline exceeded"}},
+	}
+	for _, check := range checks {
+		for _, marker := range check.markers {
+			if strings.Contains(lower, marker) {
+				return check.category
+			}
+		}
+	}
+	return "request_failed"
 }
 
 func (s *Service) CHQueryRows(ctx context.Context, sql string) ([]map[string]any, error) {
