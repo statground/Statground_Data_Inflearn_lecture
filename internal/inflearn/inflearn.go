@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,7 +29,9 @@ var (
 		regexp.MustCompile(`(?s)<script[^>]+id=["']__NEXT_DATA__["'][^>]*>(.*?)</script>`),
 		regexp.MustCompile(`(?s)window\.__NEXT_DATA__\s*=\s*(\{.*?\})\s*;</script>`),
 	}
-	courseInfoRe = regexp.MustCompile(`/client/api/v1/course/(\d+)/online/info`)
+	courseInfoRe          = regexp.MustCompile(`/client/api/v1/course/(\d+)/online/info`)
+	clickHouseCodePattern = regexp.MustCompile(`(?i)\bcode:\s*([0-9]+)\b`)
+	httpEndpointPattern   = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
 )
 
 const (
@@ -906,7 +909,7 @@ func (s *Service) chPost(ctx context.Context, sql string, data []byte, contentTy
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("clickhouse request category=invalid_endpoint")
 	}
 	req.SetBasicAuth(s.Cfg.CHUser, s.Cfg.CHPassword)
 	req.Header.Set("User-Agent", s.Cfg.UserAgent)
@@ -915,12 +918,12 @@ func (s *Service) chPost(ctx context.Context, sql string, data []byte, contentTy
 	}
 	resp, err := s.HTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("clickhouse transport category=%s", clickHouseTransportCategory(err))
 	}
 	defer resp.Body.Close()
 	out, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("clickhouse response category=%s", clickHouseTransportCategory(err))
 	}
 	if resp.StatusCode != http.StatusOK {
 		snippet := strings.TrimSpace(string(out))
@@ -933,17 +936,57 @@ func (s *Service) chPost(ctx context.Context, sql string, data []byte, contentTy
 }
 
 func clickHouseResponseCategory(message string) string {
-	lower := strings.ToLower(message)
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if matches := clickHouseCodePattern.FindStringSubmatch(lower); len(matches) == 2 {
+		code, _ := strconv.Atoi(matches[1])
+		switch code {
+		case 6, 27, 62:
+			return "parse"
+		case 47, 60, 81:
+			return "schema"
+		case 159, 209:
+			return "timeout"
+		case 202:
+			return "too_many_simultaneous_queries"
+		case 210:
+			return "temporary_network"
+		case 241:
+			return "memory_limit_exceeded"
+		case 242:
+			return "table_is_read_only"
+		case 252:
+			return "too_many_parts"
+		case 394:
+			return "query_cancelled"
+		case 497:
+			return "permission"
+		case 516:
+			return "authentication"
+		case 667:
+			return "not_initialized"
+		case 999:
+			return "keeper_exception"
+		}
+	}
 	checks := []struct {
 		category string
 		markers  []string
 	}{
-		{"permission", []string{"access_denied", "not enough privileges"}},
-		{"schema", []string{"unknown_table", "unknown identifier", "unknown column"}},
-		{"not_initialized", []string{"not_initialized", "not initialized"}},
+		{"authentication", []string{"authentication_failed", "authentication failed", "wrong password", "invalid credentials", "unknown user"}},
+		{"permission", []string{"access_denied", "access denied", "not enough privileges", "permission denied"}},
+		{"schema", []string{"unknown_table", "unknown table", "unknown database", "unknown identifier", "unknown column", "does not exist", "doesn't exist"}},
+		{"parse", []string{"syntax_error", "syntax error", "cannot_parse", "cannot parse", "parsing exception", "type_mismatch", "type mismatch"}},
+		{"not_initialized", []string{"not_initialized", "not initialized", "replica is not initialized"}},
 		{"table_is_read_only", []string{"table_is_read_only", "readonly", "read-only"}},
-		{"keeper_exception", []string{"keeper_exception", "coordination", "connection loss"}},
-		{"timeout", []string{"timeout", "deadline exceeded"}},
+		{"keeper_exception", []string{"keeper_exception", "coordination", "connection loss", "session expired", "zookeeper", "clickhouse keeper"}},
+		{"query_cancelled", []string{"query_was_cancelled", "query was cancelled", "query was canceled", "category=query_cancelled"}},
+		{"too_many_simultaneous_queries", []string{"too_many_simultaneous_queries", "too many simultaneous queries"}},
+		{"too_many_pending_queries", []string{"too_many_pending_queries", "too many pending queries"}},
+		{"memory_limit_exceeded", []string{"memory_limit_exceeded", "memory limit exceeded"}},
+		{"too_many_parts", []string{"too_many_parts", "too many parts"}},
+		{"temporary_unavailable", []string{"category=temporary_unavailable", "temporarily unavailable", "temporary unavailable", "service unavailable", "server is overloaded", "server overloaded", "server is busy", "try again later", "replica is not active", "replica is not ready"}},
+		{"temporary_network", []string{"category=temporary_network", "network_error", "connection reset", "connection refused", "connection aborted", "broken pipe", "no route to host", "network is unreachable", "all connection tries failed", "unexpected eof", "eof"}},
+		{"timeout", []string{"socket_timeout", "timeout_exceeded", "timeout", "deadline exceeded"}},
 	}
 	for _, check := range checks {
 		for _, marker := range check.markers {
@@ -953,6 +996,35 @@ func clickHouseResponseCategory(message string) string {
 		}
 	}
 	return "request_failed"
+}
+
+func clickHouseTransportCategory(err error) string {
+	if err == nil {
+		return "transport_failed"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "request_cancelled"
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "temporary_network"
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		if networkErr.Timeout() {
+			return "timeout"
+		}
+		if networkErr.Temporary() {
+			return "temporary_network"
+		}
+	}
+	category := clickHouseResponseCategory(err.Error())
+	if category == "temporary_network" || category == "timeout" {
+		return category
+	}
+	return "transport_failed"
 }
 
 func (s *Service) CHQueryRows(ctx context.Context, sql string) ([]map[string]any, error) {

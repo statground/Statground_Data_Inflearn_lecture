@@ -3,6 +3,9 @@ name: Inflearn - Collect and Translate
 on:
   schedule:
     - cron: "5 */12 * * *"
+  push:
+    tags:
+      - "inflearn-runtime-check-*"
   workflow_dispatch:
     inputs:
       languages:

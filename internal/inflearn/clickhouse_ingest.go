@@ -540,46 +540,23 @@ func isTemporaryClickHouseWriteError(err error) bool {
 	if err == nil {
 		return false
 	}
-	text := strings.ToLower(err.Error())
-	needles := []string{
-		"code: 242",
-		"code: 667",
-		"code: 999",
+	category := clickHouseResponseCategory(err.Error())
+	switch category {
+	case "not_initialized",
 		"table_is_read_only",
-		"not_initialized",
-		"not initialized",
-		"not initialized yet",
-		"readonly mode",
-		"read-only",
 		"keeper_exception",
-		"coordination error",
-		"connection loss",
-		"session expired",
-		"replica is not active",
-		"replica is not ready",
-		"replica is not initialized",
-		"zookeeper",
-		"clickhouse keeper",
-		"network_error",
-		"socket_timeout",
-		"timeout_exceeded",
-		"all connection tries failed",
-		"context deadline exceeded",
-		"i/o timeout",
-		"no route to host",
-		"connection refused",
-		"timeout",
-		"temporary",
-		"connection reset",
-		"broken pipe",
-		"eof",
+		"query_cancelled",
+		"too_many_simultaneous_queries",
+		"too_many_pending_queries",
+		"memory_limit_exceeded",
+		"too_many_parts",
+		"temporary_unavailable",
+		"temporary_network",
+		"timeout":
+		return true
+	default:
+		return false
 	}
-	for _, needle := range needles {
-		if strings.Contains(text, needle) {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Service) sanitizeClickHouseError(err error) string {
@@ -592,6 +569,10 @@ func (s *Service) sanitizeClickHouseError(err error) string {
 		if secret != "" {
 			text = strings.ReplaceAll(text, secret, "***")
 		}
+	}
+	text = httpEndpointPattern.ReplaceAllString(text, "[endpoint]")
+	if host := strings.TrimSpace(s.Cfg.CHHost); host != "" {
+		text = strings.ReplaceAll(text, host, "[host]")
 	}
 	text = strings.Join(strings.Fields(text), " ")
 	if len(text) > 400 {
