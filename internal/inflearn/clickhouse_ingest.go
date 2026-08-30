@@ -89,21 +89,20 @@ func (s *Service) ValidateClickHouseIngest(ctx context.Context) error {
 	if !s.hasClickHouseConfig() {
 		return fmt.Errorf("ClickHouse ingest requires CH_HOST/CLICKHOUSE_HOST and CH_USER/CLICKHOUSE_USER")
 	}
+	budget, backoff := clickHousePreflightRetryConfig(s.Cfg)
+	retryCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
 	var rows []map[string]any
-	var err error
-	for attempt := 1; attempt <= 3; attempt++ {
-		rows, err = s.CHQueryRows(ctx, "SELECT 1 AS ok")
-		if err == nil {
-			break
-		}
-		if !isTemporaryClickHouseWriteError(err) || attempt == 3 {
-			return fmt.Errorf("clickhouse preflight failed after %d attempt(s): %w", attempt, err)
-		}
-		select {
-		case <-ctx.Done():
+	attempts, err := retryClickHousePreflight(retryCtx, backoff, func(attemptCtx context.Context) error {
+		var queryErr error
+		rows, queryErr = s.CHQueryRows(attemptCtx, "SELECT 1 AS ok")
+		return queryErr
+	})
+	if err != nil {
+		if ctx.Err() != nil {
 			return ctx.Err()
-		case <-time.After(time.Duration(attempt) * 2 * time.Second):
 		}
+		return fmt.Errorf("clickhouse preflight failed after %d attempt(s): %w", attempts, err)
 	}
 	if len(rows) == 0 || asInt(rows[0]["ok"]) != 1 {
 		return fmt.Errorf("clickhouse preflight returned an unexpected response")
@@ -119,6 +118,52 @@ func (s *Service) ValidateClickHouseIngest(ctx context.Context) error {
 		s.logClickHouseDirectOutboxHealth(ctx)
 	}
 	return nil
+}
+
+func clickHousePreflightRetryConfig(cfg Config) (time.Duration, time.Duration) {
+	budget := cfg.CHPreflightRetryBudget
+	if budget <= 0 || budget > 10*time.Minute {
+		budget = 90 * time.Second
+	}
+	backoff := cfg.CHPreflightRetryBackoff
+	if backoff <= 0 || backoff > 30*time.Second {
+		backoff = 5 * time.Second
+	}
+	if backoff > budget {
+		backoff = budget
+	}
+	return budget, backoff
+}
+
+func retryClickHousePreflight(ctx context.Context, backoff time.Duration, operation func(context.Context) error) (int, error) {
+	if backoff <= 0 {
+		backoff = 5 * time.Second
+	}
+	attempts := 0
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return attempts, lastErr
+			}
+			return attempts, err
+		}
+		attempts++
+		lastErr = operation(ctx)
+		if lastErr == nil {
+			return attempts, nil
+		}
+		if !isTemporaryClickHouseWriteError(lastErr) {
+			return attempts, lastErr
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return attempts, lastErr
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *Service) InsertCheckpointClickHouse(ctx context.Context, source string, cp Checkpoint) error {

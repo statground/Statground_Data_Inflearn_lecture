@@ -53,6 +53,8 @@ type Config struct {
 	CHCluster               string
 	CHInsertChunkSize       int
 	CHInsertTimeout         time.Duration
+	CHPreflightRetryBudget  time.Duration
+	CHPreflightRetryBackoff time.Duration
 	CHInsertDistributedSync bool
 	CHDirectReplicaFallback bool
 	CHDirectOutboxFallback  bool
@@ -183,6 +185,8 @@ func LoadConfig() (Config, error) {
 		CHCluster:               envDefault("CH_CLUSTER", "statground_cluster"),
 		CHInsertChunkSize:       parsePositiveInt(envDefault("CH_INSERT_CHUNK_SIZE", "100"), 100),
 		CHInsertTimeout:         parseSecondsDefault(envDefault("CH_INSERT_TIMEOUT_SECONDS", "300"), 5*time.Minute),
+		CHPreflightRetryBudget:  parseSecondsDefault(envFirstDefault([]string{"CH_PREFLIGHT_RETRY_BUDGET_SECONDS", "CLICKHOUSE_PREFLIGHT_RETRY_BUDGET_SECONDS"}, "90"), 90*time.Second),
+		CHPreflightRetryBackoff: parseSecondsDefault(envFirstDefault([]string{"CH_PREFLIGHT_RETRY_BACKOFF_SECONDS", "CLICKHOUSE_PREFLIGHT_RETRY_BACKOFF_SECONDS"}, "5"), 5*time.Second),
 		CHInsertDistributedSync: parseBool(envDefault("CH_INSERT_DISTRIBUTED_SYNC", "false")),
 		CHDirectReplicaFallback: parseBool(envDefault("CH_DIRECT_REPLICA_FALLBACK", "true")),
 		CHDirectOutboxFallback:  parseBool(envDefault("CH_DIRECT_OUTBOX_FALLBACK", "true")),

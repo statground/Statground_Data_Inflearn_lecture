@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,6 +21,10 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	t.Setenv("KAFKA_BROKERS", "")
 	t.Setenv("CH_INSERT_CHUNK_SIZE", "")
 	t.Setenv("CH_INSERT_TIMEOUT_SECONDS", "")
+	t.Setenv("CH_PREFLIGHT_RETRY_BUDGET_SECONDS", "")
+	t.Setenv("CLICKHOUSE_PREFLIGHT_RETRY_BUDGET_SECONDS", "")
+	t.Setenv("CH_PREFLIGHT_RETRY_BACKOFF_SECONDS", "")
+	t.Setenv("CLICKHOUSE_PREFLIGHT_RETRY_BACKOFF_SECONDS", "")
 	t.Setenv("CH_INSERT_DISTRIBUTED_SYNC", "")
 	t.Setenv("CH_DIRECT_REPLICA_FALLBACK", "")
 	t.Setenv("CH_DIRECT_OUTBOX_FALLBACK", "")
@@ -38,6 +43,9 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	}
 	if cfg.CHInsertTimeout != 5*time.Minute {
 		t.Fatalf("CHInsertTimeout = %s, want 5m", cfg.CHInsertTimeout)
+	}
+	if cfg.CHPreflightRetryBudget != 90*time.Second || cfg.CHPreflightRetryBackoff != 5*time.Second {
+		t.Fatalf("preflight retry config = %s/%s, want 90s/5s", cfg.CHPreflightRetryBudget, cfg.CHPreflightRetryBackoff)
 	}
 	if cfg.CHInsertDistributedSync {
 		t.Fatal("CHInsertDistributedSync should default to false")
@@ -274,6 +282,68 @@ func TestIsTemporaryClickHouseWriteError(t *testing.T) {
 		if got := isTemporaryClickHouseWriteError(errString(tc.text)); got != tc.want {
 			t.Fatalf("isTemporaryClickHouseWriteError(%q) = %v, want %v", tc.text, got, tc.want)
 		}
+	}
+}
+
+func TestRetryClickHousePreflightRecoversWithinBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	calls := 0
+	attempts, err := retryClickHousePreflight(ctx, time.Millisecond, func(context.Context) error {
+		calls++
+		if calls < 3 {
+			return errString("connection refused")
+		}
+		return nil
+	})
+	if err != nil || attempts != 3 {
+		t.Fatalf("attempts=%d error=%v, want three attempts and success", attempts, err)
+	}
+}
+
+func TestRetryClickHousePreflightStopsAtBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	attempts, err := retryClickHousePreflight(ctx, 5*time.Millisecond, func(context.Context) error {
+		return errString("connection refused")
+	})
+	if err == nil || attempts < 2 || time.Since(started) > 250*time.Millisecond {
+		t.Fatalf("attempts=%d elapsed=%s error=%v, want bounded transient retries", attempts, time.Since(started), err)
+	}
+}
+
+func TestRetryClickHousePreflightFailsContractImmediately(t *testing.T) {
+	calls := 0
+	attempts, err := retryClickHousePreflight(context.Background(), time.Millisecond, func(context.Context) error {
+		calls++
+		return errString("Code: 60. DB::Exception: Table does not exist")
+	})
+	if err == nil || attempts != 1 || calls != 1 {
+		t.Fatalf("attempts=%d calls=%d error=%v, want immediate contract failure", attempts, calls, err)
+	}
+}
+
+func TestValidateClickHousePreflightHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	svc := &Service{Cfg: Config{CHHost: "clickhouse.invalid", CHPort: 8123, CHUser: "test"}}
+	if err := svc.ValidateClickHouseIngest(ctx); err != context.Canceled {
+		t.Fatalf("error=%v, want context.Canceled", err)
+	}
+}
+
+func TestInflearnWorkflowPinsBoundedPreflightRetry(t *testing.T) {
+	source, err := os.ReadFile("../../.github/workflows/inflearn_collect_all.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(source)
+	if got := strings.Count(workflow, `CLICKHOUSE_PREFLIGHT_RETRY_BUDGET_SECONDS: "90"`); got != 3 {
+		t.Fatalf("preflight retry budget count=%d, want 3", got)
+	}
+	if got := strings.Count(workflow, `CLICKHOUSE_PREFLIGHT_RETRY_BACKOFF_SECONDS: "5"`); got != 3 {
+		t.Fatalf("preflight retry backoff count=%d, want 3", got)
 	}
 }
 
