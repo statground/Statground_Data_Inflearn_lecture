@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import ssl
 import sys
 import urllib.error
@@ -14,11 +15,51 @@ import urllib.request
 from collections.abc import Mapping
 
 
-PRESSURE_QUERY = """
+TARGET_ENV = "CLICKHOUSE_PRESSURE_GATE_TARGETS"
+TARGET_RE = re.compile(
+    r"^(replica|local):([A-Za-z_][A-Za-z0-9_]{0,127})\.([A-Za-z_][A-Za-z0-9_]{0,127})$"
+)
+MAX_TARGETS = 128
+
+
+def load_targets(env: Mapping[str, str]) -> tuple[tuple[str, str, str], ...]:
+    raw = str(env.get(TARGET_ENV, "")).strip()
+    if not raw:
+        raise ValueError(f"{TARGET_ENV} is required")
+    tokens = [token.strip() for token in raw.split(",")]
+    if not tokens or any(not token for token in tokens) or len(tokens) > MAX_TARGETS:
+        raise ValueError(f"invalid {TARGET_ENV} target count")
+    targets: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for token in tokens:
+        match = TARGET_RE.fullmatch(token)
+        if not match:
+            raise ValueError(f"invalid {TARGET_ENV} target")
+        target = (match.group(1), match.group(2), match.group(3))
+        if target in seen:
+            raise ValueError(f"duplicate {TARGET_ENV} target")
+        seen.add(target)
+        targets.append(target)
+    return tuple(targets)
+
+
+def _target_predicate(
+    targets: tuple[tuple[str, str, str], ...], target_type: str, table_column: str
+) -> str:
+    selected = [(database, table) for kind, database, table in targets if kind == target_type]
+    if not selected:
+        return "0"
+    tuples = ", ".join(f"('{database}', '{table}')" for database, table in selected)
+    return f"(database, {table_column}) IN ({tuples})"
+
+
+def build_pressure_query(targets: tuple[tuple[str, str, str], ...]) -> str:
+    replica_predicate = _target_predicate(targets, "replica", "table")
+    local_predicate = _target_predicate(targets, "local", "name")
+    return f"""
 SELECT
     toUInt64((SELECT sum(value) FROM system.metrics WHERE metric = 'DistributedFilesToInsert')) AS distributed_files,
     toUInt64((SELECT sum(value) FROM system.metrics WHERE metric = 'BrokenDistributedFilesToInsert')) AS broken_distributed_files,
-    toUInt64((SELECT sum(value) FROM system.metrics WHERE metric = 'ReadonlyReplica')) AS readonly_metric,
     toUInt64((SELECT count() FROM system.disks WHERE name = 'default')) AS available_samples,
     toUInt64((SELECT sum(free_space) FROM system.disks WHERE name = 'default')) AS available_bytes,
     toUInt64((SELECT count() FROM system.disks WHERE name = 'default')) AS total_samples,
@@ -29,10 +70,13 @@ SELECT
     toUInt64((SELECT sum(value) FROM system.asynchronous_metrics WHERE metric = 'FilesystemMainPathTotalINodes')) AS total_inodes,
     toUInt64((SELECT count() FROM system.asynchronous_metrics WHERE metric = 'OSIOWaitTimeNormalized')) AS iowait_samples,
     toFloat64((SELECT max(value) FROM system.asynchronous_metrics WHERE metric = 'OSIOWaitTimeNormalized')) AS iowait_normalized,
-    toUInt64((SELECT countIf(is_readonly != 0 OR is_session_expired != 0) FROM system.replicas)) AS unhealthy_replicas,
-    toUInt64((SELECT max(queue_size) FROM system.replicas)) AS max_replica_queue,
-    toUInt64((SELECT maxIf(absolute_delay, queue_size > 0) FROM system.replicas)) AS max_replica_delay_seconds,
-    toUInt64((SELECT max(parts_to_check) FROM system.replicas)) AS max_parts_to_check
+    toUInt64((SELECT uniqExact(tuple(database, table)) FROM system.replicas WHERE {replica_predicate})) AS replica_target_count,
+    toUInt64((SELECT countIf(is_readonly != 0 OR is_session_expired != 0) FROM system.replicas WHERE {replica_predicate})) AS unhealthy_replicas,
+    toUInt64((SELECT max(queue_size) FROM system.replicas WHERE {replica_predicate})) AS max_replica_queue,
+    toUInt64((SELECT maxIf(absolute_delay, queue_size > 0) FROM system.replicas WHERE {replica_predicate})) AS max_replica_delay_seconds,
+    toUInt64((SELECT max(parts_to_check) FROM system.replicas WHERE {replica_predicate})) AS max_parts_to_check,
+    toUInt64((SELECT uniqExact(tuple(database, name)) FROM system.tables WHERE is_temporary = 0 AND {local_predicate})) AS local_target_count,
+    toUInt64((SELECT countIf(NOT endsWith(engine, 'MergeTree') OR startsWith(engine, 'Replicated')) FROM system.tables WHERE is_temporary = 0 AND {local_predicate})) AS invalid_local_target_engines
 SETTINGS max_threads = 1, max_execution_time = 10
 FORMAT JSONEachRow
 """.strip()
@@ -76,7 +120,6 @@ def clickhouse_url(env: Mapping[str, str]) -> str:
 
 def load_thresholds(env: Mapping[str, str]) -> dict[str, float | int]:
     values: dict[str, float | int] = {
-        "max_distributed_files": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES", "10000")),
         "min_available_bytes": int(env.get("CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_BYTES", str(100 * 1024**3))),
         "max_used_ratio": float(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_USED_RATIO", "0.90")),
         "min_available_inodes": int(env.get("CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_INODES", "1000000")),
@@ -98,9 +141,6 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
     integer = lambda name: int(float(snapshot.get(name, 0) or 0))
     decimal = lambda name: float(snapshot.get(name, 0) or 0)
     reasons: list[str] = []
-    distributed = integer("distributed_files")
-    broken_distributed = integer("broken_distributed_files")
-    readonly = integer("readonly_metric")
     unhealthy = integer("unhealthy_replicas")
     queue = integer("max_replica_queue")
     delay = integer("max_replica_delay_seconds")
@@ -109,12 +149,23 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
     available_inodes = integer("available_inodes")
     total_inodes = integer("total_inodes")
 
-    if distributed > int(thresholds["max_distributed_files"]):
-        reasons.append(f"distributed_files={distributed}")
-    if broken_distributed > 0:
-        reasons.append(f"broken_distributed_files={broken_distributed}")
-    if readonly > 0 or unhealthy > 0:
-        reasons.append(f"readonly_replicas={max(readonly, unhealthy)}")
+    expected_replica_targets = integer("expected_replica_target_count")
+    expected_local_targets = integer("expected_local_target_count")
+    replica_targets = integer("replica_target_count")
+    local_targets = integer("local_target_count")
+
+    if expected_replica_targets + expected_local_targets <= 0:
+        reasons.append("writer_targets_unavailable")
+    if replica_targets != expected_replica_targets:
+        reasons.append(f"replica_targets={replica_targets}/{expected_replica_targets}")
+    if local_targets != expected_local_targets:
+        reasons.append(f"local_targets={local_targets}/{expected_local_targets}")
+    if integer("invalid_local_target_engines") > 0:
+        reasons.append(f"invalid_local_target_engines={integer('invalid_local_target_engines')}")
+    # Global Distributed queue counters are observability only. They include
+    # unrelated legacy queues and cannot safely block a target-scoped writer.
+    if unhealthy > 0:
+        reasons.append(f"readonly_replicas={unhealthy}")
     if queue > int(thresholds["max_replica_queue"]):
         reasons.append(f"replica_queue={queue}")
     if queue > 0 and delay > int(thresholds["max_replica_delay_seconds"]):
@@ -137,7 +188,9 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
             reasons.append(f"available_inodes={available_inodes}")
         if used_inode_ratio > float(thresholds["max_used_inode_ratio"]):
             reasons.append(f"used_inode_ratio={used_inode_ratio:.3f}")
-    if integer("iowait_samples") > 0:
+    if integer("iowait_samples") == 0:
+        reasons.append("iowait_metrics_unavailable")
+    else:
         iowait = decimal("iowait_normalized")
         if iowait > float(thresholds["max_iowait_normalized"]):
             reasons.append(f"iowait_normalized={iowait:.3f}")
@@ -145,12 +198,14 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
 
 
 def fetch_snapshot(env: Mapping[str, str]) -> dict[str, object]:
+    targets = load_targets(env)
     user = _first(env, "CH_USER", "CLICKHOUSE_USER")
     password = _first(env, "CH_PASSWORD", "CLICKHOUSE_PASSWORD")
     if not user or not password:
         raise ValueError("CH_USER/CH_PASSWORD or CLICKHOUSE_USER/CLICKHOUSE_PASSWORD is required")
     timeout = float(env.get("CLICKHOUSE_PRESSURE_GATE_TIMEOUT_SECONDS", "15"))
-    request = urllib.request.Request(clickhouse_url(env), data=PRESSURE_QUERY.encode(), method="POST")
+    query = build_pressure_query(targets)
+    request = urllib.request.Request(clickhouse_url(env), data=query.encode(), method="POST")
     auth = base64.b64encode(f"{user}:{password}".encode()).decode()
     request.add_header("Authorization", "Basic " + auth)
     request.add_header("Content-Type", "text/plain; charset=utf-8")
@@ -165,7 +220,12 @@ def fetch_snapshot(env: Mapping[str, str]) -> dict[str, object]:
     lines = [line for line in raw.decode("utf-8").splitlines() if line.strip()]
     if len(lines) != 1:
         raise RuntimeError("ClickHouse pressure query returned an unexpected row count")
-    return json.loads(lines[0])
+    snapshot = json.loads(lines[0])
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("ClickHouse pressure query returned an unexpected payload")
+    snapshot["expected_replica_target_count"] = sum(1 for kind, _, _ in targets if kind == "replica")
+    snapshot["expected_local_target_count"] = sum(1 for kind, _, _ in targets if kind == "local")
+    return snapshot
 
 
 def main() -> int:
@@ -183,6 +243,8 @@ def main() -> int:
         "ClickHouse write pressure gate ok "
         f"distributed_files={int(float(snapshot.get('distributed_files', 0) or 0))} "
         f"max_replica_queue={int(float(snapshot.get('max_replica_queue', 0) or 0))} "
+        f"replica_targets={int(float(snapshot.get('replica_target_count', 0) or 0))} "
+        f"local_targets={int(float(snapshot.get('local_target_count', 0) or 0))} "
         f"available_bytes={int(float(snapshot.get('available_bytes', 0) or 0))}"
     )
     return 0

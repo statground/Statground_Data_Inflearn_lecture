@@ -38,7 +38,6 @@ jobs:
     timeout-minutes: 100
     env:
       CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
-      CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES: "10000"
       CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_BYTES: "107374182400"
       CLICKHOUSE_PRESSURE_GATE_MAX_USED_RATIO: "0.90"
       CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_INODES: "1000000"
@@ -47,6 +46,20 @@ jobs:
       CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_DELAY_SECONDS: "900"
       CLICKHOUSE_PRESSURE_GATE_MAX_IOWAIT_NORMALIZED: "0.50"
       CLICKHOUSE_PRESSURE_GATE_TIMEOUT_SECONDS: "15"
+      CLICKHOUSE_PRESSURE_GATE_TARGETS: >-
+        replica:Data_Lecture_Inflearn_Raw.inflearn_course_snapshot_raw_local,
+        replica:Data_Lecture_Inflearn_Raw.inflearn_crawl_checkpoint_local,
+        replica:Data_Lecture_Inflearn_Service.inflearn_course_dim_local,
+        replica:Data_Lecture_Inflearn_Service.inflearn_course_metric_fact_local,
+        replica:Data_Lecture_Inflearn_Service.inflearn_course_price_fact_local,
+        replica:Data_Lecture_Inflearn_Service.inflearn_course_curriculum_unit_local,
+        replica:Data_Lecture_Inflearn_Service.inflearn_instructor_dim_local,
+        replica:Data_Lecture_Inflearn_Service.inflearn_course_instructor_map_local,
+        replica:Data_Lecture_Inflearn_Service.inflearn_course_display_translation_local,
+        replica:Data_Lecture_Inflearn_Service.inflearn_course_curriculum_display_translation_local,
+        replica:mirtype_content.provider_practice_content_local,
+        replica:mirtype_content.provider_practice_content_serving_local,
+        local:Data_Lecture_Inflearn_Log.inflearn_direct_insert_outbox
     steps:
       - name: Checkout
         uses: actions/checkout@v6
