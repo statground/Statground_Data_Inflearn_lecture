@@ -71,7 +71,7 @@ func LoadTranslationConfig() (Config, error) {
 		CHDirectOutboxFallback:     parseBool(envDefault("CH_DIRECT_OUTBOX_FALLBACK", "true")),
 		CHOutboxDatabase:           envDefault("CH_OUTBOX_DATABASE", "Data_Lecture_Inflearn_Log"),
 		CHOutboxTable:              envDefault("CH_OUTBOX_TABLE", "inflearn_direct_insert_outbox"),
-		CHOutboxReplayLimit:        parsePositiveInt(envDefault("CH_OUTBOX_REPLAY_LIMIT", "50"), 50),
+		CHOutboxReplayLimit:        parseBoundedNonNegativeInt(envDefault("CH_OUTBOX_REPLAY_LIMIT", "0"), 0, 50),
 		UserAgent:                  envDefault("CRAWLER_USER_AGENT", "Mozilla/5.0 (compatible; StatgroundCrawler/2.0; +https://www.statground.net)"),
 		TranslationTargetLanguages: normalizeTranslationTargets(targets),
 		TranslationCourseIDs:       parseTranslationCourseIDs(envDefault("INFLEARN_TRANSLATION_COURSE_IDS", "")),

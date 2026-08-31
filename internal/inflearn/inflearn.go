@@ -192,7 +192,7 @@ func LoadConfig() (Config, error) {
 		CHDirectOutboxFallback:  parseBool(envDefault("CH_DIRECT_OUTBOX_FALLBACK", "true")),
 		CHOutboxDatabase:        envDefault("CH_OUTBOX_DATABASE", "Data_Lecture_Inflearn_Log"),
 		CHOutboxTable:           envDefault("CH_OUTBOX_TABLE", "inflearn_direct_insert_outbox"),
-		CHOutboxReplayLimit:     parsePositiveInt(envDefault("CH_OUTBOX_REPLAY_LIMIT", "50"), 50),
+		CHOutboxReplayLimit:     parseBoundedNonNegativeInt(envDefault("CH_OUTBOX_REPLAY_LIMIT", "0"), 0, 50),
 		IngestMode:              strings.ToLower(envDefault("INGEST_MODE", "clickhouse")),
 		LectureProvider:         envDefault("LECTURE_PROVIDER", "inflearn"),
 		KafkaBrokers:            splitCSV(envDefault("KAFKA_BROKERS", "")),
@@ -331,6 +331,17 @@ func parsePositiveInt(raw string, fallback int) int {
 	n, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil || n <= 0 {
 		return fallback
+	}
+	return n
+}
+
+func parseBoundedNonNegativeInt(raw string, fallback, upper int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 0 {
+		return fallback
+	}
+	if upper > 0 && n > upper {
+		return upper
 	}
 	return n
 }

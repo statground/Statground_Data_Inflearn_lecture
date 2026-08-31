@@ -30,6 +30,7 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	t.Setenv("CH_DIRECT_OUTBOX_FALLBACK", "")
 	t.Setenv("CH_OUTBOX_DATABASE", "")
 	t.Setenv("CH_OUTBOX_TABLE", "")
+	t.Setenv("CH_OUTBOX_REPLAY_LIMIT", "")
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -61,6 +62,17 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	}
 	if cfg.CHOutboxTable != "inflearn_direct_insert_outbox" {
 		t.Fatalf("CHOutboxTable = %q, want inflearn_direct_insert_outbox", cfg.CHOutboxTable)
+	}
+	if cfg.CHOutboxReplayLimit != 0 {
+		t.Fatalf("CHOutboxReplayLimit = %d, want scheduled-safe default 0", cfg.CHOutboxReplayLimit)
+	}
+	t.Setenv("CH_OUTBOX_REPLAY_LIMIT", "500")
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig with replay override returned error: %v", err)
+	}
+	if cfg.CHOutboxReplayLimit != 50 {
+		t.Fatalf("CHOutboxReplayLimit = %d, want hard cap 50", cfg.CHOutboxReplayLimit)
 	}
 }
 
@@ -344,6 +356,12 @@ func TestInflearnWorkflowPinsBoundedPreflightRetry(t *testing.T) {
 	}
 	if got := strings.Count(workflow, `CLICKHOUSE_PREFLIGHT_RETRY_BACKOFF_SECONDS: "5"`); got != 3 {
 		t.Fatalf("preflight retry backoff count=%d, want 3", got)
+	}
+	if got := strings.Count(workflow, `CH_OUTBOX_REPLAY_LIMIT: "0"`); got != 2 {
+		t.Fatalf("scheduled-safe replay limit count=%d, want update and translation", got)
+	}
+	if !strings.Contains(workflow, `github.event_name == 'workflow_dispatch' && github.event.inputs.outbox_replay_limit || '0'`) {
+		t.Fatal("collect-new must allow only explicit manual outbox replay")
 	}
 }
 

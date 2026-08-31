@@ -20,6 +20,10 @@ on:
         description: "Optional comma-separated Inflearn course IDs for a narrow backfill"
         required: false
         default: ""
+      outbox_replay_limit:
+        description: "Manual-only pending outbox chunks to replay once before collection; values above 50 are clamped"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -34,6 +38,15 @@ jobs:
     timeout-minutes: 100
     env:
       CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
+      CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES: "10000"
+      CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_BYTES: "107374182400"
+      CLICKHOUSE_PRESSURE_GATE_MAX_USED_RATIO: "0.90"
+      CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_INODES: "1000000"
+      CLICKHOUSE_PRESSURE_GATE_MAX_USED_INODE_RATIO: "0.95"
+      CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_QUEUE: "2000"
+      CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_DELAY_SECONDS: "900"
+      CLICKHOUSE_PRESSURE_GATE_MAX_IOWAIT_NORMALIZED: "0.50"
+      CLICKHOUSE_PRESSURE_GATE_TIMEOUT_SECONDS: "15"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -83,6 +96,15 @@ jobs:
           GOPROXY: https://proxy.golang.org,direct
         run: go test -mod=mod ./...
 
+      - name: Gate ClickHouse writes on storage pressure
+        env:
+          CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
+          CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
+          CH_USER: ${{ secrets.CH_USER || secrets.CLICKHOUSE_USER }}
+          CH_PASSWORD: ${{ secrets.CH_PASSWORD || secrets.CLICKHOUSE_PASSWORD }}
+          CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
+        run: python3 scripts/clickhouse_pressure_gate.py
+
       - name: Collect new Inflearn courses into ClickHouse
         env:
           STATE_BACKEND: clickhouse
@@ -104,7 +126,7 @@ jobs:
           CH_DIRECT_OUTBOX_FALLBACK: "true"
           CH_OUTBOX_DATABASE: Data_Lecture_Inflearn_Log
           CH_OUTBOX_TABLE: inflearn_direct_insert_outbox
-          CH_OUTBOX_REPLAY_LIMIT: "50"
+          CH_OUTBOX_REPLAY_LIMIT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.outbox_replay_limit || '0' }}
           LECTURE_PROVIDER: inflearn
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
@@ -144,7 +166,7 @@ jobs:
           CH_DIRECT_OUTBOX_FALLBACK: "true"
           CH_OUTBOX_DATABASE: Data_Lecture_Inflearn_Log
           CH_OUTBOX_TABLE: inflearn_direct_insert_outbox
-          CH_OUTBOX_REPLAY_LIMIT: "50"
+          CH_OUTBOX_REPLAY_LIMIT: "0"
           LECTURE_PROVIDER: inflearn
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
@@ -200,7 +222,7 @@ jobs:
           CH_DIRECT_OUTBOX_FALLBACK: "true"
           CH_OUTBOX_DATABASE: Data_Lecture_Inflearn_Log
           CH_OUTBOX_TABLE: inflearn_direct_insert_outbox
-          CH_OUTBOX_REPLAY_LIMIT: "50"
+          CH_OUTBOX_REPLAY_LIMIT: "0"
           INFLEARN_TRANSLATION_API_KEY: ${{ secrets.INFLEARN_TRANSLATION_API_KEY || secrets.OPENAI_API_KEY || secrets.GH_MODELS_API_KEY || secrets.GITHUB_MODELS_API_KEY }}
           GH_MODELS_API_KEY: ${{ secrets.GH_MODELS_API_KEY || secrets.GITHUB_MODELS_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
