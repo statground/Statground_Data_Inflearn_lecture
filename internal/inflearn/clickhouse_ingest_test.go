@@ -47,8 +47,8 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	if cfg.CHPreflightRetryBudget != 90*time.Second || cfg.CHPreflightRetryBackoff != 5*time.Second {
 		t.Fatalf("preflight retry config = %s/%s, want 90s/5s", cfg.CHPreflightRetryBudget, cfg.CHPreflightRetryBackoff)
 	}
-	if cfg.CHInsertDistributedSync {
-		t.Fatal("CHInsertDistributedSync should default to false")
+	if !cfg.CHInsertDistributedSync {
+		t.Fatal("CHInsertDistributedSync should default to true")
 	}
 	if !cfg.CHDirectReplicaFallback {
 		t.Fatal("CHDirectReplicaFallback should default to true")
