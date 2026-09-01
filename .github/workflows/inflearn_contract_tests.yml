@@ -41,5 +41,11 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python3 -m unittest scripts/test_clickhouse_pressure_gate.py
 
+      - name: Set up Go for actionlint
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+
       - name: Validate workflow syntax
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11 -format '{{json .}}' .github/workflows/*.yml
