@@ -16,9 +16,11 @@ from collections.abc import Mapping
 
 
 TARGET_ENV = "CLICKHOUSE_PRESSURE_GATE_TARGETS"
+ENDPOINT_ENV = "CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME"
 TARGET_RE = re.compile(
     r"^(replica|local):([A-Za-z_][A-Za-z0-9_]{0,127})\.([A-Za-z_][A-Za-z0-9_]{0,127})$"
 )
+ENDPOINT_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
 MAX_TARGETS = 128
 
 
@@ -43,6 +45,18 @@ def load_targets(env: Mapping[str, str]) -> tuple[tuple[str, str, str], ...]:
     return tuple(targets)
 
 
+def load_expected_endpoint_hostname(env: Mapping[str, str]) -> str:
+    expected = str(env.get(ENDPOINT_ENV, ""))
+    if (
+        not expected
+        or expected != expected.strip()
+        or not ENDPOINT_RE.fullmatch(expected)
+        or "gateway" in expected.lower()
+    ):
+        raise ValueError(f"{ENDPOINT_ENV} must identify one physical ClickHouse node")
+    return expected
+
+
 def _target_predicate(
     targets: tuple[tuple[str, str, str], ...], target_type: str, table_column: str
 ) -> str:
@@ -58,6 +72,7 @@ def build_pressure_query(targets: tuple[tuple[str, str, str], ...]) -> str:
     local_predicate = _target_predicate(targets, "local", "name")
     return f"""
 SELECT
+    hostName() AS endpoint_hostname,
     toUInt64((SELECT sum(value) FROM system.metrics WHERE metric = 'DistributedFilesToInsert')) AS distributed_files,
     toUInt64((SELECT sum(value) FROM system.metrics WHERE metric = 'BrokenDistributedFilesToInsert')) AS broken_distributed_files,
     toUInt64((SELECT count() FROM system.disks WHERE name = 'default')) AS available_samples,
@@ -153,7 +168,11 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
     expected_local_targets = integer("expected_local_target_count")
     replica_targets = integer("replica_target_count")
     local_targets = integer("local_target_count")
+    expected_endpoint = str(snapshot.get("expected_endpoint_hostname", "") or "")
+    actual_endpoint = str(snapshot.get("endpoint_hostname", "") or "")
 
+    if not expected_endpoint or actual_endpoint != expected_endpoint:
+        reasons.append("endpoint_hostname_mismatch")
     if expected_replica_targets + expected_local_targets <= 0:
         reasons.append("writer_targets_unavailable")
     if replica_targets != expected_replica_targets:
@@ -199,6 +218,7 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
 
 def fetch_snapshot(env: Mapping[str, str]) -> dict[str, object]:
     targets = load_targets(env)
+    expected_endpoint = load_expected_endpoint_hostname(env)
     user = _first(env, "CH_USER", "CLICKHOUSE_USER")
     password = _first(env, "CH_PASSWORD", "CLICKHOUSE_PASSWORD")
     if not user or not password:
@@ -225,6 +245,7 @@ def fetch_snapshot(env: Mapping[str, str]) -> dict[str, object]:
         raise RuntimeError("ClickHouse pressure query returned an unexpected payload")
     snapshot["expected_replica_target_count"] = sum(1 for kind, _, _ in targets if kind == "replica")
     snapshot["expected_local_target_count"] = sum(1 for kind, _, _ in targets if kind == "local")
+    snapshot["expected_endpoint_hostname"] = expected_endpoint
     return snapshot
 
 
