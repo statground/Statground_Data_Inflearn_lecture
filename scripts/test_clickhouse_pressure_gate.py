@@ -155,10 +155,12 @@ class ClickHousePressureGateTest(unittest.TestCase):
         self.assertLess(workflow.index(gate_step), workflow.index("go run -mod=mod ./cmd/inflearn-collect-new"))
         self.assertEqual(
             workflow.count(
-                "CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME: ${{ vars.CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME || secrets.CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME }}"
+                "CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME: clickhouse-s1-r1"
             ),
             1,
         )
+        self.assertNotIn("secrets.CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME", workflow)
+        self.assertNotIn("vars.CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME", workflow)
         self.assertIn('CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_BYTES: "107374182400"', workflow)
         self.assertIn("CLICKHOUSE_PRESSURE_GATE_TARGETS: >-", workflow)
         self.assertIn("replica:Data_Lecture_Inflearn_Raw.inflearn_course_snapshot_raw_local", workflow)
