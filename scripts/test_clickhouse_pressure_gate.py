@@ -42,6 +42,14 @@ class ClickHousePressureGateTest(unittest.TestCase):
     def test_healthy_snapshot_passes(self):
         self.assertEqual(gate.evaluate(self.healthy, self.thresholds), [])
 
+    def test_distributed_threshold_is_configurable_and_validated(self):
+        self.assertEqual(self.thresholds["max_distributed_files"], 10_000)
+        custom = gate.load_thresholds({"CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES": "123"})
+        self.assertEqual(custom["max_distributed_files"], 123)
+        for raw in ("-1", "not-a-number"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                gate.load_thresholds({"CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES": raw})
+
     def test_expected_endpoint_contract_is_strict_and_fail_closed(self):
         self.assertEqual(
             gate.load_expected_endpoint_hostname({gate.ENDPOINT_ENV: "Clickhouse_S1_R1"}),
@@ -69,9 +77,13 @@ class ClickHousePressureGateTest(unittest.TestCase):
                 snapshot = dict(self.healthy, **{key: value})
                 self.assertTrue(gate.evaluate(snapshot, self.thresholds))
 
-    def test_unrelated_global_distributed_backlog_is_observability_only(self):
-        snapshot = dict(self.healthy, distributed_files=606_448, broken_distributed_files=7)
-        self.assertEqual(gate.evaluate(snapshot, self.thresholds), [])
+    def test_distributed_backlog_and_broken_files_fail_closed(self):
+        at_limit = dict(self.healthy, distributed_files=10_000)
+        self.assertEqual(gate.evaluate(at_limit, self.thresholds), [])
+        over_limit = dict(self.healthy, distributed_files=606_448)
+        self.assertIn("distributed_files=606448", gate.evaluate(over_limit, self.thresholds))
+        broken = dict(self.healthy, broken_distributed_files=7)
+        self.assertIn("broken_distributed_files=7", gate.evaluate(broken, self.thresholds))
 
     def test_missing_filesystem_metrics_fails_closed(self):
         snapshot = dict(self.healthy, available_samples=0)
@@ -162,12 +174,41 @@ class ClickHousePressureGateTest(unittest.TestCase):
         self.assertNotIn("secrets.CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME", workflow)
         self.assertNotIn("vars.CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME", workflow)
         self.assertIn('CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_BYTES: "107374182400"', workflow)
+        self.assertIn('CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES: "10000"', workflow)
         self.assertIn("CLICKHOUSE_PRESSURE_GATE_TARGETS: >-", workflow)
         self.assertIn("replica:Data_Lecture_Inflearn_Raw.inflearn_course_snapshot_raw_local", workflow)
         self.assertIn("replica:Data_Lecture_Inflearn_Service.inflearn_course_display_translation_local", workflow)
         self.assertIn("replica:mirtype_content.provider_practice_content_serving_local", workflow)
         self.assertNotIn("Data_Lecture_Inflearn_Mart.inflearn_raw_snapshot_daily_rollup_local", workflow)
         self.assertIn("local:Data_Lecture_Inflearn_Log.inflearn_direct_insert_outbox", workflow)
+
+    def test_runtime_check_tag_has_hard_work_bounds(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_collect_all.yml").read_text()
+        tag_guard = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-')"
+        expected = {
+            "MAX_URLS_PER_RUN": ("20", "1500"),
+            "INFLEARN_RECENT_HEAD_PAGES": ("1", "5"),
+            "INFLEARN_RECENT_HEAD_PAGE_SIZE": ("20", "100"),
+            "UPDATE_BATCH_SIZE": ("10", "100"),
+            "INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT": ("5", "github.event.inputs.max_per_run"),
+        }
+        for name, (tag_value, default_value) in expected.items():
+            with self.subTest(name=name):
+                self.assertIn(
+                    f"{name}: ${{{{ {tag_guard} && '{tag_value}' || {repr(default_value) if default_value.isdigit() else default_value} }}}}",
+                    workflow,
+                )
+
+    def test_contract_workflow_is_secret_free_and_read_only(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_contract_tests.yml").read_text()
+        self.assertIn("push:\n    branches: [main]", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("go test -mod=mod ./...", workflow)
+        self.assertIn("python3 -m unittest scripts/test_clickhouse_pressure_gate.py", workflow)
+        self.assertIn("github.com/rhysd/actionlint/cmd/actionlint@v1.7.11", workflow)
+        self.assertNotIn("secrets.", workflow)
+        self.assertNotIn("run: python3 scripts/clickhouse_pressure_gate.py", workflow)
+        self.assertNotIn("go run -mod=mod ./cmd/inflearn-", workflow)
 
 
 if __name__ == "__main__":

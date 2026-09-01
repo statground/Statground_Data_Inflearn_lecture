@@ -44,6 +44,7 @@ jobs:
       CLICKHOUSE_PRESSURE_GATE_MAX_USED_RATIO: "0.90"
       CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_INODES: "1000000"
       CLICKHOUSE_PRESSURE_GATE_MAX_USED_INODE_RATIO: "0.95"
+      CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES: "10000"
       CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_QUEUE: "2000"
       CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_DELAY_SECONDS: "900"
       CLICKHOUSE_PRESSURE_GATE_MAX_IOWAIT_NORMALIZED: "0.50"
@@ -146,11 +147,11 @@ jobs:
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
           BATCH_SIZE: "100"
-          MAX_URLS_PER_RUN: "1500"
+          MAX_URLS_PER_RUN: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '20' || '1500' }}
           CHECKPOINT_FLUSH_EVERY: "200"
           INFLEARN_RECENT_HEAD_ENABLED: "true"
-          INFLEARN_RECENT_HEAD_PAGES: "5"
-          INFLEARN_RECENT_HEAD_PAGE_SIZE: "100"
+          INFLEARN_RECENT_HEAD_PAGES: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '1' || '5' }}
+          INFLEARN_RECENT_HEAD_PAGE_SIZE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '20' || '100' }}
           INFLEARN_RECENT_HEAD_SORT: RECENT
           INFLEARN_RECENT_HEAD_TYPES: ONLINE
           INFLEARN_RECENT_SEARCH_BASE_URL: https://course-api.inflearn.com
@@ -185,7 +186,7 @@ jobs:
           LECTURE_PROVIDER: inflearn
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
-          UPDATE_BATCH_SIZE: "100"
+          UPDATE_BATCH_SIZE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '10' || '100' }}
           WORKERS: "8"
           REQUEST_SLEEP_MIN: "0.2"
           REQUEST_SLEEP_MAX: "0.6"
@@ -244,7 +245,7 @@ jobs:
           INFLEARN_TRANSLATION_PROVIDER: ${{ vars.INFLEARN_TRANSLATION_PROVIDER }}
           INFLEARN_TRANSLATION_MODEL: ${{ vars.INFLEARN_TRANSLATION_MODEL }}
           INFLEARN_TRANSLATION_TARGET_LANGS_INPUT: ${{ github.event.inputs.languages }}
-          INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT: ${{ github.event.inputs.max_per_run }}
+          INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '5' || github.event.inputs.max_per_run }}
           INFLEARN_TRANSLATION_COURSE_IDS: ${{ github.event.inputs.course_ids }}
           INFLEARN_TRANSLATION_BATCH_SIZE: "12"
         run: |

@@ -139,6 +139,7 @@ def load_thresholds(env: Mapping[str, str]) -> dict[str, float | int]:
         "max_used_ratio": float(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_USED_RATIO", "0.90")),
         "min_available_inodes": int(env.get("CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_INODES", "1000000")),
         "max_used_inode_ratio": float(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_USED_INODE_RATIO", "0.95")),
+        "max_distributed_files": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES", "10000")),
         "max_replica_queue": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_QUEUE", "2000")),
         "max_replica_delay_seconds": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_DELAY_SECONDS", "900")),
         "max_iowait_normalized": float(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_IOWAIT_NORMALIZED", "0.50")),
@@ -157,6 +158,8 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
     decimal = lambda name: float(snapshot.get(name, 0) or 0)
     reasons: list[str] = []
     unhealthy = integer("unhealthy_replicas")
+    distributed_files = integer("distributed_files")
+    broken_distributed_files = integer("broken_distributed_files")
     queue = integer("max_replica_queue")
     delay = integer("max_replica_delay_seconds")
     available = integer("available_bytes")
@@ -181,8 +184,13 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
         reasons.append(f"local_targets={local_targets}/{expected_local_targets}")
     if integer("invalid_local_target_engines") > 0:
         reasons.append(f"invalid_local_target_engines={integer('invalid_local_target_engines')}")
-    # Global Distributed queue counters are observability only. They include
-    # unrelated legacy queues and cannot safely block a target-scoped writer.
+    # Stop all writers while the shared Distributed queue is under abnormal
+    # pressure. A configurable ceiling lets schedules resume automatically
+    # after the backlog drains without requiring a deployment.
+    if distributed_files > int(thresholds["max_distributed_files"]):
+        reasons.append(f"distributed_files={distributed_files}")
+    if broken_distributed_files > 0:
+        reasons.append(f"broken_distributed_files={broken_distributed_files}")
     if unhealthy > 0:
         reasons.append(f"readonly_replicas={unhealthy}")
     if queue > int(thresholds["max_replica_queue"]):
@@ -263,6 +271,7 @@ def main() -> int:
     print(
         "ClickHouse write pressure gate ok "
         f"distributed_files={int(float(snapshot.get('distributed_files', 0) or 0))} "
+        f"broken_distributed_files={int(float(snapshot.get('broken_distributed_files', 0) or 0))} "
         f"max_replica_queue={int(float(snapshot.get('max_replica_queue', 0) or 0))} "
         f"replica_targets={int(float(snapshot.get('replica_target_count', 0) or 0))} "
         f"local_targets={int(float(snapshot.get('local_target_count', 0) or 0))} "
