@@ -18,6 +18,8 @@ class ClickHousePressureGateTest(unittest.TestCase):
             "expected_endpoint_hostname": "Clickhouse_S1_R1",
             "distributed_files": 20,
             "broken_distributed_files": 0,
+            "distributed_bytes": 32 * 1024**2,
+            "broken_distributed_bytes": 0,
             "available_samples": 1,
             "available_bytes": 500 * 1024**3,
             "total_samples": 1,
@@ -44,11 +46,22 @@ class ClickHousePressureGateTest(unittest.TestCase):
 
     def test_distributed_threshold_is_configurable_and_validated(self):
         self.assertEqual(self.thresholds["max_distributed_files"], 10_000)
-        custom = gate.load_thresholds({"CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES": "123"})
+        self.assertEqual(self.thresholds["max_distributed_bytes"], 512 * 1024**2)
+        custom = gate.load_thresholds(
+            {
+                "CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES": "123",
+                "CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_BYTES": "456",
+            }
+        )
         self.assertEqual(custom["max_distributed_files"], 123)
-        for raw in ("-1", "not-a-number"):
-            with self.subTest(raw=raw), self.assertRaises(ValueError):
-                gate.load_thresholds({"CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES": raw})
+        self.assertEqual(custom["max_distributed_bytes"], 456)
+        for name in (
+            "CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES",
+            "CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_BYTES",
+        ):
+            for raw in ("-1", "not-a-number"):
+                with self.subTest(name=name, raw=raw), self.assertRaises(ValueError):
+                    gate.load_thresholds({name: raw})
 
     def test_expected_endpoint_contract_is_strict_and_fail_closed(self):
         self.assertEqual(
@@ -84,6 +97,22 @@ class ClickHousePressureGateTest(unittest.TestCase):
         self.assertIn("distributed_files=606448", gate.evaluate(over_limit, self.thresholds))
         broken = dict(self.healthy, broken_distributed_files=7)
         self.assertIn("broken_distributed_files=7", gate.evaluate(broken, self.thresholds))
+
+    def test_few_large_files_and_broken_bytes_fail_closed(self):
+        limit = 512 * 1024**2
+        at_limit = dict(self.healthy, distributed_files=2, distributed_bytes=limit)
+        self.assertEqual(gate.evaluate(at_limit, self.thresholds), [])
+        over_limit = dict(self.healthy, distributed_files=2, distributed_bytes=str(limit + 1))
+        self.assertIn(f"distributed_bytes={limit + 1}", gate.evaluate(over_limit, self.thresholds))
+        exact = dict(self.healthy, distributed_bytes="9007199254740993")
+        self.assertIn("distributed_bytes=9007199254740993", gate.evaluate(exact, self.thresholds))
+        broken = dict(self.healthy, broken_distributed_bytes="7")
+        self.assertIn("broken_distributed_bytes=7", gate.evaluate(broken, self.thresholds))
+
+    def test_invalid_unsigned_metrics_fail_closed(self):
+        for raw in (None, True, -1, 1.5, "1.0", ""):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                gate.evaluate(dict(self.healthy, distributed_bytes=raw), self.thresholds)
 
     def test_missing_filesystem_metrics_fails_closed(self):
         snapshot = dict(self.healthy, available_samples=0)
@@ -141,6 +170,8 @@ class ClickHousePressureGateTest(unittest.TestCase):
         query = gate.build_pressure_query(targets)
         self.assertIn("hostName() AS endpoint_hostname", query)
         self.assertIn("system.metrics", query)
+        self.assertIn("'DistributedBytesToInsert'", query)
+        self.assertIn("'BrokenDistributedBytesToInsert'", query)
         self.assertIn("system.asynchronous_metrics", query)
         self.assertIn("system.disks", query)
         self.assertIn("system.replicas", query)

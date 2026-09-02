@@ -22,6 +22,7 @@ TARGET_RE = re.compile(
 )
 ENDPOINT_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
 MAX_TARGETS = 128
+UNSIGNED_INTEGER_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 
 
 def load_targets(env: Mapping[str, str]) -> tuple[tuple[str, str, str], ...]:
@@ -75,6 +76,8 @@ SELECT
     hostName() AS endpoint_hostname,
     toUInt64((SELECT sum(value) FROM system.metrics WHERE metric = 'DistributedFilesToInsert')) AS distributed_files,
     toUInt64((SELECT sum(value) FROM system.metrics WHERE metric = 'BrokenDistributedFilesToInsert')) AS broken_distributed_files,
+    toUInt64((SELECT sum(value) FROM system.metrics WHERE metric = 'DistributedBytesToInsert')) AS distributed_bytes,
+    toUInt64((SELECT sum(value) FROM system.metrics WHERE metric = 'BrokenDistributedBytesToInsert')) AS broken_distributed_bytes,
     toUInt64((SELECT count() FROM system.disks WHERE name = 'default')) AS available_samples,
     toUInt64((SELECT sum(free_space) FROM system.disks WHERE name = 'default')) AS available_bytes,
     toUInt64((SELECT count() FROM system.disks WHERE name = 'default')) AS total_samples,
@@ -140,6 +143,7 @@ def load_thresholds(env: Mapping[str, str]) -> dict[str, float | int]:
         "min_available_inodes": int(env.get("CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_INODES", "1000000")),
         "max_used_inode_ratio": float(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_USED_INODE_RATIO", "0.95")),
         "max_distributed_files": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES", "10000")),
+        "max_distributed_bytes": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_BYTES", str(512 * 1024**2))),
         "max_replica_queue": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_QUEUE", "2000")),
         "max_replica_delay_seconds": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_DELAY_SECONDS", "900")),
         "max_iowait_normalized": float(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_IOWAIT_NORMALIZED", "0.50")),
@@ -153,13 +157,30 @@ def load_thresholds(env: Mapping[str, str]) -> dict[str, float | int]:
     return values
 
 
+def _snapshot_uint(snapshot: Mapping[str, object], name: str) -> int:
+    if name not in snapshot:
+        raise ValueError(f"missing ClickHouse pressure metric: {name}")
+    raw = snapshot[name]
+    if type(raw) is int:
+        value = raw
+    elif isinstance(raw, str) and UNSIGNED_INTEGER_RE.fullmatch(raw):
+        value = int(raw)
+    else:
+        raise ValueError(f"invalid ClickHouse pressure metric: {name}")
+    if value < 0:
+        raise ValueError(f"invalid ClickHouse pressure metric: {name}")
+    return value
+
+
 def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | int]) -> list[str]:
-    integer = lambda name: int(float(snapshot.get(name, 0) or 0))
+    integer = lambda name: _snapshot_uint(snapshot, name)
     decimal = lambda name: float(snapshot.get(name, 0) or 0)
     reasons: list[str] = []
     unhealthy = integer("unhealthy_replicas")
     distributed_files = integer("distributed_files")
     broken_distributed_files = integer("broken_distributed_files")
+    distributed_bytes = integer("distributed_bytes")
+    broken_distributed_bytes = integer("broken_distributed_bytes")
     queue = integer("max_replica_queue")
     delay = integer("max_replica_delay_seconds")
     available = integer("available_bytes")
@@ -185,12 +206,16 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
     if integer("invalid_local_target_engines") > 0:
         reasons.append(f"invalid_local_target_engines={integer('invalid_local_target_engines')}")
     # Stop all writers while the shared Distributed queue is under abnormal
-    # pressure. A configurable ceiling lets schedules resume automatically
+    # pressure. Configurable ceilings let schedules resume automatically
     # after the backlog drains without requiring a deployment.
     if distributed_files > int(thresholds["max_distributed_files"]):
         reasons.append(f"distributed_files={distributed_files}")
     if broken_distributed_files > 0:
         reasons.append(f"broken_distributed_files={broken_distributed_files}")
+    if distributed_bytes > int(thresholds["max_distributed_bytes"]):
+        reasons.append(f"distributed_bytes={distributed_bytes}")
+    if broken_distributed_bytes > 0:
+        reasons.append(f"broken_distributed_bytes={broken_distributed_bytes}")
     if unhealthy > 0:
         reasons.append(f"readonly_replicas={unhealthy}")
     if queue > int(thresholds["max_replica_queue"]):
@@ -270,12 +295,14 @@ def main() -> int:
         return 1
     print(
         "ClickHouse write pressure gate ok "
-        f"distributed_files={int(float(snapshot.get('distributed_files', 0) or 0))} "
-        f"broken_distributed_files={int(float(snapshot.get('broken_distributed_files', 0) or 0))} "
-        f"max_replica_queue={int(float(snapshot.get('max_replica_queue', 0) or 0))} "
-        f"replica_targets={int(float(snapshot.get('replica_target_count', 0) or 0))} "
-        f"local_targets={int(float(snapshot.get('local_target_count', 0) or 0))} "
-        f"available_bytes={int(float(snapshot.get('available_bytes', 0) or 0))}"
+        f"distributed_files={_snapshot_uint(snapshot, 'distributed_files')} "
+        f"broken_distributed_files={_snapshot_uint(snapshot, 'broken_distributed_files')} "
+        f"distributed_bytes={_snapshot_uint(snapshot, 'distributed_bytes')} "
+        f"broken_distributed_bytes={_snapshot_uint(snapshot, 'broken_distributed_bytes')} "
+        f"max_replica_queue={_snapshot_uint(snapshot, 'max_replica_queue')} "
+        f"replica_targets={_snapshot_uint(snapshot, 'replica_target_count')} "
+        f"local_targets={_snapshot_uint(snapshot, 'local_target_count')} "
+        f"available_bytes={_snapshot_uint(snapshot, 'available_bytes')}"
     )
     return 0
 
