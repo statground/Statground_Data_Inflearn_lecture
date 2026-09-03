@@ -142,8 +142,6 @@ def load_thresholds(env: Mapping[str, str]) -> dict[str, float | int]:
         "max_used_ratio": float(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_USED_RATIO", "0.90")),
         "min_available_inodes": int(env.get("CLICKHOUSE_PRESSURE_GATE_MIN_AVAILABLE_INODES", "1000000")),
         "max_used_inode_ratio": float(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_USED_INODE_RATIO", "0.95")),
-        "max_distributed_files": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_FILES", "10000")),
-        "max_distributed_bytes": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_DISTRIBUTED_BYTES", str(512 * 1024**2))),
         "max_replica_queue": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_QUEUE", "2000")),
         "max_replica_delay_seconds": int(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_REPLICA_DELAY_SECONDS", "900")),
         "max_iowait_normalized": float(env.get("CLICKHOUSE_PRESSURE_GATE_MAX_IOWAIT_NORMALIZED", "0.50")),
@@ -177,9 +175,12 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
     decimal = lambda name: float(snapshot.get(name, 0) or 0)
     reasons: list[str] = []
     unhealthy = integer("unhealthy_replicas")
-    distributed_files = integer("distributed_files")
+    # Keep node-wide Distributed queue size observable without coupling direct
+    # writers to an unrelated backlog. Corrupt queue payloads remain fatal;
+    # capacity stays fail-closed through disk, inode, I/O, and target replicas.
+    integer("distributed_files")
     broken_distributed_files = integer("broken_distributed_files")
-    distributed_bytes = integer("distributed_bytes")
+    integer("distributed_bytes")
     broken_distributed_bytes = integer("broken_distributed_bytes")
     queue = integer("max_replica_queue")
     delay = integer("max_replica_delay_seconds")
@@ -205,15 +206,8 @@ def evaluate(snapshot: Mapping[str, object], thresholds: Mapping[str, float | in
         reasons.append(f"local_targets={local_targets}/{expected_local_targets}")
     if integer("invalid_local_target_engines") > 0:
         reasons.append(f"invalid_local_target_engines={integer('invalid_local_target_engines')}")
-    # Stop all writers while the shared Distributed queue is under abnormal
-    # pressure. Configurable ceilings let schedules resume automatically
-    # after the backlog drains without requiring a deployment.
-    if distributed_files > int(thresholds["max_distributed_files"]):
-        reasons.append(f"distributed_files={distributed_files}")
     if broken_distributed_files > 0:
         reasons.append(f"broken_distributed_files={broken_distributed_files}")
-    if distributed_bytes > int(thresholds["max_distributed_bytes"]):
-        reasons.append(f"distributed_bytes={distributed_bytes}")
     if broken_distributed_bytes > 0:
         reasons.append(f"broken_distributed_bytes={broken_distributed_bytes}")
     if unhealthy > 0:
