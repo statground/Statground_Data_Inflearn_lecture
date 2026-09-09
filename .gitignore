@@ -4,3 +4,6 @@
 *.test
 
 .statground_state/
+
+__pycache__/
+*.py[cod]
