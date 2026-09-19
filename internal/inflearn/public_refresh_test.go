@@ -335,6 +335,12 @@ func TestRefreshPublicLectureViewsInactiveModeMakesNoSQLRequest(t *testing.T) {
 	assertUpdateStateError(t, err, "degraded", "public_refresh_activation", "publication_v2_inactive")
 }
 
+func TestRefreshPublicLectureViewsRequiresReaderRefreshConfigForLoadedRollout(t *testing.T) {
+	svc := &Service{Cfg: Config{PublicationV2Enabled: true, PublicationWriterID: "test-writer", ReaderRefreshRequired: true}}
+	_, err := svc.RefreshPublicLectureViews(context.Background())
+	assertUpdateStateError(t, err, "degraded", "public_reader_config", "missing_reader_refresh_config")
+}
+
 func TestRefreshPublicLectureViewsDefersForPendingOutbox(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { writeCHRows(w, []map[string]any{{"pending": 1}}) }))
 	defer server.Close()

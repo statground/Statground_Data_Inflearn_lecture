@@ -66,6 +66,8 @@ type Config struct {
 	PublicationWriterID     string
 	PublicationCHUser       string
 	PublicationCHPassword   string
+	PublicationReaderConfig string
+	ReaderRefreshRequired   bool
 	CHOutboxDatabase        string
 	CHOutboxTable           string
 	CHOutboxReplayLimit     int
@@ -257,6 +259,7 @@ func LoadConfig() (Config, error) {
 		PublicationWriterID:     strings.TrimSpace(envDefault("INFLEARN_LECTURE_PUBLISHER_WRITER_ID", "")),
 		PublicationCHUser:       strings.TrimSpace(envDefault("INFLEARN_LECTURE_PUBLISHER_CH_USER", "")),
 		PublicationCHPassword:   envDefault("INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD", ""),
+		PublicationReaderConfig: strings.TrimSpace(envDefault("INFLEARN_LECTURE_READER_REFRESH_CONFIG_FILE", "")),
 		CHOutboxDatabase:        envDefault("CH_OUTBOX_DATABASE", "Data_Lecture_Inflearn_Log"),
 		CHOutboxTable:           envDefault("CH_OUTBOX_TABLE", "inflearn_direct_insert_outbox"),
 		CHOutboxReplayLimit:     parseBoundedNonNegativeInt(envDefault("CH_OUTBOX_REPLAY_LIMIT", "0"), 0, 50),
@@ -298,6 +301,7 @@ func LoadConfig() (Config, error) {
 		RequestSleepMax:         parseSeconds(envDefault("REQUEST_SLEEP_MAX", "0.6")),
 		UserAgent:               envDefault("CRAWLER_USER_AGENT", "Mozilla/5.0 (compatible; StatgroundCrawler/2.0; +https://www.statground.net)"),
 	}
+	cfg.ReaderRefreshRequired = cfg.PublicationV2Enabled
 	switch strings.ToLower(strings.TrimSpace(cfg.IngestMode)) {
 	case "kafka", "kafka_clickhouse", "kafka-clickhouse", "event", "events":
 		cfg.IngestMode = "kafka"

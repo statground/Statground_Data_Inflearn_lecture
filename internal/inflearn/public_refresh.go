@@ -155,12 +155,29 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 	if strings.TrimSpace(s.Cfg.PublicationWriterID) == "" {
 		return PublicRefreshReceipt{}, stateError("degraded", "public_refresh_lease", "missing_writer_identity")
 	}
+	var readerConfig lectureReaderConfigFile
+	readerRefreshEnabled := strings.TrimSpace(s.Cfg.PublicationReaderConfig) != ""
+	if s.Cfg.ReaderRefreshRequired && !readerRefreshEnabled {
+		return PublicRefreshReceipt{}, stateError("degraded", "public_reader_config", "missing_reader_refresh_config")
+	}
+	if readerRefreshEnabled {
+		var configErr error
+		readerConfig, configErr = loadLectureReaderConfig(s.Cfg.PublicationReaderConfig)
+		if configErr != nil {
+			return PublicRefreshReceipt{}, configErr
+		}
+	}
 	if err := s.validatePublicRefreshWriteSafety(ctx); err != nil {
 		return PublicRefreshReceipt{}, err
 	}
 	topology, err := s.readPublicationTopology(ctx)
 	if err != nil {
 		return PublicRefreshReceipt{}, err
+	}
+	if readerRefreshEnabled {
+		if err := s.reconcileCurrentLectureReaders(ctx, topology, readerConfig); err != nil {
+			return PublicRefreshReceipt{}, err
+		}
 	}
 	lease, err := s.acquirePublicationLease(ctx, topology)
 	if err != nil {
@@ -327,6 +344,13 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 		})
 	}
 
+	var preparedReaders preparedLectureReaderRefresh
+	if readerRefreshEnabled {
+		preparedReaders, err = s.prepareLectureReaderRefresh(ctx, topology, readerConfig)
+		if err != nil {
+			return PublicRefreshReceipt{}, err
+		}
+	}
 	if err := s.requireCurrentPublicationLease(ctx, lease, "public_activation_lease"); err != nil {
 		return PublicRefreshReceipt{}, err
 	}
@@ -389,6 +413,11 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 	}
 	if err := s.verifyActivatedPointer(ctx, activation); err != nil {
 		return PublicRefreshReceipt{}, err
+	}
+	if readerRefreshEnabled {
+		if err := s.executePreparedLectureReaderRefresh(ctx, topology, readerConfig, preparedReaders, activation, initialAuthorityRevision); err != nil {
+			return PublicRefreshReceipt{}, err
+		}
 	}
 	receipt := PublicRefreshReceipt{RunUUID: runUUID, ActivationUUID: activationUUID, ActivationRevision: activation.Revision}
 	printMachineJSON(map[string]any{

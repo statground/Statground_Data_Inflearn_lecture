@@ -76,12 +76,23 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	if cfg.PublicationV2Enabled {
 		t.Fatal("publication v2 must default inactive for rollout safety")
 	}
+	if cfg.ReaderRefreshRequired || cfg.PublicationReaderConfig != "" {
+		t.Fatalf("reader refresh rollout must default inactive: required=%v config=%q", cfg.ReaderRefreshRequired, cfg.PublicationReaderConfig)
+	}
 	if cfg.PublicUpdatePriority {
 		t.Fatal("public update priority must default inactive until Phase A exists")
 	}
 	if cfg.PublicationWriterID != "" {
 		t.Fatalf("publication writer ID=%q, want empty while rollout is inactive", cfg.PublicationWriterID)
 	}
+	t.Setenv("INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED", "true")
+	t.Setenv("INFLEARN_LECTURE_READER_REFRESH_CONFIG_FILE", " /run/secrets/lecture-readers.json ")
+	cfg, err = LoadConfig()
+	if err != nil || !cfg.ReaderRefreshRequired || cfg.PublicationReaderConfig != "/run/secrets/lecture-readers.json" {
+		t.Fatalf("reader refresh rollout config=%q required=%v err=%v", cfg.PublicationReaderConfig, cfg.ReaderRefreshRequired, err)
+	}
+	t.Setenv("INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED", "")
+	t.Setenv("INFLEARN_LECTURE_READER_REFRESH_CONFIG_FILE", "")
 	t.Setenv("INFLEARN_LECTURE_PUBLISHER_WRITER_ID", " gha:test:1:2 ")
 	cfg, err = LoadConfig()
 	if err != nil || cfg.PublicationWriterID != "gha:test:1:2" {
@@ -418,6 +429,9 @@ func TestInflearnWorkflowPinsBoundedPreflightRetry(t *testing.T) {
 		"PUBLIC_REFRESH_RUN_UUID: ${{ steps.refresh_public_lecture_views.outputs.publication_run_uuid || 'missing' }}",
 		"secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER",
 		"secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD",
+		"secrets.INFLEARN_LECTURE_READER_REFRESH_CONFIG_JSON",
+		"INFLEARN_LECTURE_READER_REFRESH_CONFIG_FILE",
+		"replica:lecture_publication.inflearn_public_catalog_reader_refresh_ack_local",
 		"INFLEARN_LECTURE_PUBLISHER_WRITER_ID: gha:${{ github.repository_id }}:${{ github.run_id }}:${{ github.run_attempt }}",
 		"vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'",
 		`"status":"inactive","publication_claim":false`,
@@ -442,7 +456,8 @@ func TestInflearnWorkflowPinsBoundedPreflightRetry(t *testing.T) {
 	publisherValidation := workflow[publisherValidationStart:moduleStart]
 	if !strings.Contains(publisherValidation, "if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'") ||
 		!strings.Contains(publisherValidation, "secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER") ||
-		!strings.Contains(publisherValidation, "secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD") {
+		!strings.Contains(publisherValidation, "secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD") ||
+		!strings.Contains(publisherValidation, "secrets.INFLEARN_LECTURE_READER_REFRESH_CONFIG_JSON") {
 		t.Fatal("publisher secrets must be resolved only by the enabled conditional validation step")
 	}
 	for _, stepName := range []string{
@@ -486,6 +501,25 @@ func TestInflearnWorkflowPinsBoundedPreflightRetry(t *testing.T) {
 			strings.Contains(block, `CH_USER: ${{ secrets.CH_USER`) || strings.Contains(block, `CH_PASSWORD: ${{ secrets.CH_PASSWORD`) {
 			t.Fatalf("%s must use only the dedicated publisher identity", name)
 		}
+	}
+	publisherBlock := workflow[refreshStart:verifyStart]
+	for _, want := range []string{
+		`READER_REFRESH_CONFIG_JSON: ${{ secrets.INFLEARN_LECTURE_READER_REFRESH_CONFIG_JSON }}`,
+		`READER_REFRESH_CONFIG_FILE="$(mktemp)"`,
+		`trap 'rm -f "$READER_REFRESH_CONFIG_FILE"' EXIT`,
+		`umask 077`,
+		`unset READER_REFRESH_CONFIG_JSON`,
+		`export INFLEARN_LECTURE_READER_REFRESH_CONFIG_FILE="$READER_REFRESH_CONFIG_FILE"`,
+	} {
+		if !strings.Contains(publisherBlock, want) {
+			t.Fatalf("publisher reader refresh config handling missing %q", want)
+		}
+	}
+	writeSecret := strings.Index(publisherBlock, `printf '%s' "$READER_REFRESH_CONFIG_JSON"`)
+	clearSecret := strings.Index(publisherBlock, "unset READER_REFRESH_CONFIG_JSON")
+	runPublisher := strings.Index(publisherBlock, "go run -mod=mod ./cmd/inflearn-refresh-public-views")
+	if writeSecret < 0 || clearSecret <= writeSecret || runPublisher <= clearSecret {
+		t.Fatal("reader refresh secret must be removed from the publisher environment immediately after the private file is written")
 	}
 	for _, want := range []string{
 		`"status":"deferred","phase":"provider_practice_refresh","category":"temporary_clickhouse"}'` + "\n              exit 1",

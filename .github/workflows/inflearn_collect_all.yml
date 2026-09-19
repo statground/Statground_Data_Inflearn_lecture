@@ -108,9 +108,11 @@ jobs:
         env:
           PUBLISHER_CH_USER: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER }}
           PUBLISHER_CH_PASSWORD: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD }}
+          READER_REFRESH_CONFIG_JSON: ${{ secrets.INFLEARN_LECTURE_READER_REFRESH_CONFIG_JSON }}
         run: |
           test -n "$PUBLISHER_CH_USER" || { echo "INFLEARN_LECTURE_PUBLISHER_CH_USER secret is required when publication v2 is enabled"; exit 1; }
           test -n "$PUBLISHER_CH_PASSWORD" || { echo "INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD secret is required when publication v2 is enabled"; exit 1; }
+          test -n "$READER_REFRESH_CONFIG_JSON" || { echo "INFLEARN_LECTURE_READER_REFRESH_CONFIG_JSON secret is required when publication v2 is enabled"; exit 1; }
 
       - name: Resolve Go modules and checksums
         env:
@@ -327,7 +329,8 @@ jobs:
             replica:lecture_publication.inflearn_public_catalog_generation_local,
             replica:lecture_publication.inflearn_public_catalog_activation_local,
             replica:lecture_publication.inflearn_public_catalog_source_authority_fence_local,
-            replica:lecture_publication.inflearn_public_catalog_source_authority_local
+            replica:lecture_publication.inflearn_public_catalog_source_authority_local,
+            replica:lecture_publication.inflearn_public_catalog_reader_refresh_ack_local
         run: python3 scripts/clickhouse_pressure_gate.py
 
       - name: Refresh exact public lecture views serially
@@ -348,7 +351,16 @@ jobs:
           CH_DIRECT_REPLICA_FALLBACK: "false"
           CH_DIRECT_OUTBOX_FALLBACK: "false"
           INFLEARN_LECTURE_PUBLISHER_WRITER_ID: gha:${{ github.repository_id }}:${{ github.run_id }}:${{ github.run_attempt }}
-        run: go run -mod=mod ./cmd/inflearn-refresh-public-views
+          READER_REFRESH_CONFIG_JSON: ${{ secrets.INFLEARN_LECTURE_READER_REFRESH_CONFIG_JSON }}
+        run: |
+          umask 077
+          READER_REFRESH_CONFIG_FILE="$(mktemp)"
+          trap 'rm -f "$READER_REFRESH_CONFIG_FILE"' EXIT
+          printf '%s' "$READER_REFRESH_CONFIG_JSON" > "$READER_REFRESH_CONFIG_FILE"
+          unset READER_REFRESH_CONFIG_JSON
+          test -s "$READER_REFRESH_CONFIG_FILE"
+          export INFLEARN_LECTURE_READER_REFRESH_CONFIG_FILE="$READER_REFRESH_CONFIG_FILE"
+          go run -mod=mod ./cmd/inflearn-refresh-public-views
 
       - name: Verify public lecture freshness and refresh health
         if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
