@@ -31,6 +31,10 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	t.Setenv("CH_OUTBOX_DATABASE", "")
 	t.Setenv("CH_OUTBOX_TABLE", "")
 	t.Setenv("CH_OUTBOX_REPLAY_LIMIT", "")
+	t.Setenv("WORKERS", "")
+	t.Setenv("INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED", "")
+	t.Setenv("INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED", "")
+	t.Setenv("INFLEARN_LECTURE_PUBLISHER_WRITER_ID", "")
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -65,6 +69,23 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	}
 	if cfg.CHOutboxReplayLimit != 0 {
 		t.Fatalf("CHOutboxReplayLimit = %d, want scheduled-safe default 0", cfg.CHOutboxReplayLimit)
+	}
+	if cfg.Workers != 4 {
+		t.Fatalf("Workers = %d, want 4", cfg.Workers)
+	}
+	if cfg.PublicationV2Enabled {
+		t.Fatal("publication v2 must default inactive for rollout safety")
+	}
+	if cfg.PublicUpdatePriority {
+		t.Fatal("public update priority must default inactive until Phase A exists")
+	}
+	if cfg.PublicationWriterID != "" {
+		t.Fatalf("publication writer ID=%q, want empty while rollout is inactive", cfg.PublicationWriterID)
+	}
+	t.Setenv("INFLEARN_LECTURE_PUBLISHER_WRITER_ID", " gha:test:1:2 ")
+	cfg, err = LoadConfig()
+	if err != nil || cfg.PublicationWriterID != "gha:test:1:2" {
+		t.Fatalf("writer identity=%q err=%v", cfg.PublicationWriterID, err)
 	}
 	t.Setenv("CH_OUTBOX_REPLAY_LIMIT", "500")
 	cfg, err = LoadConfig()
@@ -360,8 +381,120 @@ func TestInflearnWorkflowPinsBoundedPreflightRetry(t *testing.T) {
 	if got := strings.Count(workflow, `CH_OUTBOX_REPLAY_LIMIT: "0"`); got != 2 {
 		t.Fatalf("scheduled-safe replay limit count=%d, want update and translation", got)
 	}
+	conditionalReplicaFallback := `CH_DIRECT_REPLICA_FALLBACK: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && 'false' || 'true' }}`
+	conditionalOutboxFallback := `CH_DIRECT_OUTBOX_FALLBACK: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && 'false' || 'true' }}`
+	if got := strings.Count(workflow, conditionalReplicaFallback); got != 3 {
+		t.Fatalf("rollout-safe replica fallback count=%d, want collect/update/translation", got)
+	}
+	if got := strings.Count(workflow, conditionalOutboxFallback); got != 3 {
+		t.Fatalf("rollout-safe outbox fallback count=%d, want collect/update/translation", got)
+	}
+	if got := strings.Count(workflow, `CH_DIRECT_REPLICA_FALLBACK: "false"`); got != 2 {
+		t.Fatalf("hard-disabled replica fallback count=%d, want publisher and verifier", got)
+	}
+	if got := strings.Count(workflow, `CH_DIRECT_OUTBOX_FALLBACK: "false"`); got != 2 {
+		t.Fatalf("hard-disabled outbox fallback count=%d, want publisher and verifier", got)
+	}
+	if !strings.Contains(workflow, "cancel-in-progress: false") || strings.Contains(workflow, "cancel-in-progress: true") {
+		t.Fatal("scheduled writer concurrency must queue rather than cancel an active write/refresh")
+	}
 	if !strings.Contains(workflow, `github.event_name == 'workflow_dispatch' && github.event.inputs.outbox_replay_limit || '0'`) {
 		t.Fatal("collect-new must allow only explicit manual outbox replay")
+	}
+	if !strings.Contains(workflow, `UPDATE_BATCH_SIZE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '10' || '100' }}`) {
+		t.Fatal("update workflow must preserve the 100-row normal sweep and exact 10-row runtime-check cap")
+	}
+	if !strings.Contains(workflow, `WORKERS: "4"`) || strings.Contains(workflow, `WORKERS: "8"`) {
+		t.Fatal("update workflow must use four workers")
+	}
+	for _, want := range []string{
+		"./cmd/inflearn-refresh-public-views",
+		"./cmd/inflearn-verify-public-freshness",
+		"id: refresh_public_lecture_views",
+		"INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED || 'false' }}",
+		"INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED: ${{ vars.INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED || 'false' }}",
+		"INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED must be exactly true or false",
+		"INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED must be exactly true or false",
+		"PUBLIC_REFRESH_RUN_UUID: ${{ steps.refresh_public_lecture_views.outputs.publication_run_uuid || 'missing' }}",
+		"secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER",
+		"secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD",
+		"INFLEARN_LECTURE_PUBLISHER_WRITER_ID: gha:${{ github.repository_id }}:${{ github.run_id }}:${{ github.run_attempt }}",
+		"vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'",
+		`"status":"inactive","publication_claim":false`,
+		"replica:webr_lecture.inflearn_r_lecture_catalog_local",
+		"replica:mirtype_lecture.inflearn_language_lecture_catalog_local",
+		"Verify public lecture freshness and refresh health",
+		"if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("workflow missing public freshness contract %q", want)
+		}
+	}
+	generalValidationStart := strings.Index(workflow, "- name: Validate required ClickHouse repository secrets")
+	publisherValidationStart := strings.Index(workflow, "- name: Validate publication publisher secrets")
+	moduleStart := strings.Index(workflow, "- name: Resolve Go modules and checksums")
+	if generalValidationStart < 0 || publisherValidationStart <= generalValidationStart || moduleStart <= publisherValidationStart {
+		t.Fatal("cannot isolate secret validation steps")
+	}
+	if strings.Contains(workflow[generalValidationStart:publisherValidationStart], "INFLEARN_LECTURE_PUBLISHER_CH_") {
+		t.Fatal("inactive rollout must not resolve publisher secrets in the always-run validation step")
+	}
+	publisherValidation := workflow[publisherValidationStart:moduleStart]
+	if !strings.Contains(publisherValidation, "if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'") ||
+		!strings.Contains(publisherValidation, "secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER") ||
+		!strings.Contains(publisherValidation, "secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD") {
+		t.Fatal("publisher secrets must be resolved only by the enabled conditional validation step")
+	}
+	for _, stepName := range []string{
+		"- name: Collect new Inflearn courses into ClickHouse",
+		"- name: Update existing Inflearn courses in ClickHouse",
+	} {
+		start := strings.Index(workflow, stepName)
+		if start < 0 {
+			t.Fatalf("missing collector step %q", stepName)
+		}
+		end := strings.Index(workflow[start+len(stepName):], "\n      - name:")
+		if end < 0 {
+			t.Fatalf("cannot isolate collector step %q", stepName)
+		}
+		block := workflow[start : start+len(stepName)+end]
+		for _, secret := range []string{
+			"secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER",
+			"secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD",
+		} {
+			conditional := "vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && " + secret + " || ''"
+			if !strings.Contains(block, conditional) {
+				t.Fatalf("inactive collector must short-circuit publisher secret %q", secret)
+			}
+		}
+	}
+	if strings.Contains(workflow, "PUBLIC_REFRESH_MIN_SUCCESS_EPOCH") || strings.Contains(workflow, "refresh_started_epoch") {
+		t.Fatal("workflow must use the UUID publication receipt rather than second-precision timestamps")
+	}
+	refreshStart := strings.Index(workflow, "- name: Refresh exact public lecture views serially")
+	verifyStart := strings.Index(workflow, "- name: Verify public lecture freshness and refresh health")
+	inactiveStart := strings.Index(workflow, "- name: Report inactive publication v2")
+	if refreshStart < 0 || verifyStart <= refreshStart || inactiveStart <= verifyStart {
+		t.Fatal("cannot isolate publication workflow steps")
+	}
+	for name, block := range map[string]string{
+		"publisher": workflow[refreshStart:verifyStart],
+		"verifier":  workflow[verifyStart:inactiveStart],
+	} {
+		if !strings.Contains(block, `CH_USER: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER }}`) ||
+			!strings.Contains(block, `CH_PASSWORD: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD }}`) ||
+			strings.Contains(block, `CH_USER: ${{ secrets.CH_USER`) || strings.Contains(block, `CH_PASSWORD: ${{ secrets.CH_PASSWORD`) {
+			t.Fatalf("%s must use only the dedicated publisher identity", name)
+		}
+	}
+	for _, want := range []string{
+		`"status":"deferred","phase":"provider_practice_refresh","category":"temporary_clickhouse"}'` + "\n              exit 1",
+		`"status":"deferred","phase":"provider_practice_verify","category":"temporary_clickhouse"}'` + "\n              exit 1",
+		`"status":"deferred","phase":"display_translation","category":"temporary_clickhouse"}'` + "\n              exit 1",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("workflow temporary failure must be machine-readable and nonzero: missing %q", want)
+		}
 	}
 }
 

@@ -30,13 +30,15 @@ permissions:
 
 concurrency:
   group: inflearn-collector-all
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   collect_all:
     runs-on: ubuntu-latest
     timeout-minutes: 100
     env:
+      INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED || 'false' }}
+      INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED: ${{ vars.INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED || 'false' }}
       CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
       # Port 50005 is the durable direct S1_R1 endpoint, never the 50006 gateway.
       CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME: clickhouse-s1-r1
@@ -82,6 +84,14 @@ jobs:
           test -n "$CH_HOST" || { echo "CH_HOST or CLICKHOUSE_HOST secret is required"; exit 1; }
           test -n "$CH_USER" || { echo "CH_USER or CLICKHOUSE_USER secret is required"; exit 1; }
           test -n "$CH_PASSWORD" || { echo "CH_PASSWORD or CLICKHOUSE_PASSWORD secret is required"; exit 1; }
+          if [[ "$INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED" != "true" && "$INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED" != "false" ]]; then
+            echo "INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED must be exactly true or false"
+            exit 1
+          fi
+          if [[ "$INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED" != "true" && "$INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED" != "false" ]]; then
+            echo "INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED must be exactly true or false"
+            exit 1
+          fi
           if [[ "${CH_SECURE,,}" != "true" && "$CH_SECURE" != "1" ]]; then
             echo "::warning::ClickHouse transport is not TLS-protected; provision a verified HTTPS endpoint and set CH_SECURE=true"
           fi
@@ -92,6 +102,15 @@ jobs:
           host = os.environ.get("CH_HOST", "")
           print(f"CH_HOST_SHA256={hashlib.sha256(host.encode()).hexdigest()}")
           PY
+
+      - name: Validate publication publisher secrets
+        if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
+        env:
+          PUBLISHER_CH_USER: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER }}
+          PUBLISHER_CH_PASSWORD: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD }}
+        run: |
+          test -n "$PUBLISHER_CH_USER" || { echo "INFLEARN_LECTURE_PUBLISHER_CH_USER secret is required when publication v2 is enabled"; exit 1; }
+          test -n "$PUBLISHER_CH_PASSWORD" || { echo "INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD secret is required when publication v2 is enabled"; exit 1; }
 
       - name: Resolve Go modules and checksums
         env:
@@ -104,7 +123,7 @@ jobs:
         env:
           GOPROXY: https://proxy.golang.org,direct
         run: |
-          go build -mod=mod ./cmd/inflearn-collect-new ./cmd/inflearn-update-existing ./cmd/inflearn-collect-urls ./cmd/inflearn-translate-display
+          go build -mod=mod ./cmd/inflearn-collect-new ./cmd/inflearn-update-existing ./cmd/inflearn-collect-urls ./cmd/inflearn-translate-display ./cmd/inflearn-refresh-public-views ./cmd/inflearn-verify-public-freshness
 
       - name: Run unit tests
         env:
@@ -137,8 +156,11 @@ jobs:
           CLICKHOUSE_PREFLIGHT_RETRY_BUDGET_SECONDS: "90"
           CLICKHOUSE_PREFLIGHT_RETRY_BACKOFF_SECONDS: "5"
           CH_INSERT_DISTRIBUTED_SYNC: "true"
-          CH_DIRECT_REPLICA_FALLBACK: "true"
-          CH_DIRECT_OUTBOX_FALLBACK: "true"
+          CH_DIRECT_REPLICA_FALLBACK: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && 'false' || 'true' }}
+          CH_DIRECT_OUTBOX_FALLBACK: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && 'false' || 'true' }}
+          INFLEARN_LECTURE_PUBLISHER_CH_USER: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER || '' }}
+          INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD || '' }}
+          INFLEARN_LECTURE_PUBLISHER_WRITER_ID: gha-source:${{ github.repository_id }}:${{ github.run_id }}:${{ github.run_attempt }}:collect-new
           CH_OUTBOX_DATABASE: Data_Lecture_Inflearn_Log
           CH_OUTBOX_TABLE: inflearn_direct_insert_outbox
           CH_OUTBOX_REPLAY_LIMIT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.outbox_replay_limit || '0' }}
@@ -177,8 +199,11 @@ jobs:
           CLICKHOUSE_PREFLIGHT_RETRY_BUDGET_SECONDS: "90"
           CLICKHOUSE_PREFLIGHT_RETRY_BACKOFF_SECONDS: "5"
           CH_INSERT_DISTRIBUTED_SYNC: "true"
-          CH_DIRECT_REPLICA_FALLBACK: "true"
-          CH_DIRECT_OUTBOX_FALLBACK: "true"
+          CH_DIRECT_REPLICA_FALLBACK: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && 'false' || 'true' }}
+          CH_DIRECT_OUTBOX_FALLBACK: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && 'false' || 'true' }}
+          INFLEARN_LECTURE_PUBLISHER_CH_USER: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER || '' }}
+          INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD || '' }}
+          INFLEARN_LECTURE_PUBLISHER_WRITER_ID: gha-source:${{ github.repository_id }}:${{ github.run_id }}:${{ github.run_attempt }}:update-existing
           CH_OUTBOX_DATABASE: Data_Lecture_Inflearn_Log
           CH_OUTBOX_TABLE: inflearn_direct_insert_outbox
           CH_OUTBOX_REPLAY_LIMIT: "0"
@@ -186,7 +211,7 @@ jobs:
           PRODUCER_SOURCE: github_actions
           PRODUCER_IP: "::"
           UPDATE_BATCH_SIZE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '10' || '100' }}
-          WORKERS: "8"
+          WORKERS: "4"
           REQUEST_SLEEP_MIN: "0.2"
           REQUEST_SLEEP_MAX: "0.6"
         run: |
@@ -210,14 +235,25 @@ jobs:
           CH_BASE_URL="${CH_PROTOCOL}://${CH_HOST}:${CH_PORT}/${CH_HTTP_URL_PATH}"
           REFRESH_LOG="$(mktemp)"
           if ! curl --fail --silent --show-error --max-time 300 -u "$CH_USER:$CH_PASSWORD" "$CH_BASE_URL" --data-binary "SYSTEM REFRESH VIEW mirtype_content.mv_provider_practice_content_refresh" >"$REFRESH_LOG" 2>&1; then
-            if grep -Ei "TABLE_IS_READ_ONLY|NOT_INITIALIZED|not initialized|KEEPER_EXCEPTION|Coordination error|Connection loss|context deadline exceeded|timeout" "$REFRESH_LOG" >/dev/null; then
-              echo "Skipping MirType provider practice content refresh because ClickHouse replicated tables are temporarily read-only"
-              exit 0
+            if grep -Ei "TABLE_IS_READ_ONLY|NOT_INITIALIZED|not initialized|KEEPER_EXCEPTION|Coordination error|Connection loss|context deadline exceeded|timeout|timed out|Too many simultaneous queries|TOO_MANY_SIMULTANEOUS_QUERIES|Failed to connect|Connection refused|Empty reply from server|http status=(429|500|502|503|504)|returned error: (429|500|502|503|504)" "$REFRESH_LOG" >/dev/null; then
+              echo "::warning title=Provider practice refresh deferred::ClickHouse is temporarily unavailable; the workflow will fail for retry."
+              echo '{"schema":"statground.inflearn.workflow_state.v1","status":"deferred","phase":"provider_practice_refresh","category":"temporary_clickhouse"}'
+              exit 1
             fi
             cat "$REFRESH_LOG"
             exit 1
           fi
-          curl --fail --silent --show-error --max-time 60 -u "$CH_USER:$CH_PASSWORD" "$CH_BASE_URL" --data-binary "SELECT * FROM mirtype_content.v_provider_practice_content_current FORMAT TSVWithNames"
+          VERIFY_LOG="$(mktemp)"
+          if ! curl --fail --silent --show-error --max-time 60 -u "$CH_USER:$CH_PASSWORD" "$CH_BASE_URL" --data-binary "SELECT * FROM mirtype_content.v_provider_practice_content_current FORMAT TSVWithNames" >"$VERIFY_LOG" 2>&1; then
+            if grep -Ei "TABLE_IS_READ_ONLY|NOT_INITIALIZED|not initialized|KEEPER_EXCEPTION|Coordination error|Connection loss|context deadline exceeded|timeout|timed out|Too many simultaneous queries|TOO_MANY_SIMULTANEOUS_QUERIES|Failed to connect|Connection refused|Empty reply from server|http status=(429|500|502|503|504)|returned error: (429|500|502|503|504)" "$VERIFY_LOG" >/dev/null; then
+              echo "::warning title=Provider practice verification deferred::ClickHouse is temporarily unavailable; the workflow will fail for retry."
+              echo '{"schema":"statground.inflearn.workflow_state.v1","status":"deferred","phase":"provider_practice_verify","category":"temporary_clickhouse"}'
+              exit 1
+            fi
+            cat "$VERIFY_LOG"
+            exit 1
+          fi
+          cat "$VERIFY_LOG"
 
       - name: Translate missing display metadata
         env:
@@ -233,8 +269,8 @@ jobs:
           CLICKHOUSE_PREFLIGHT_RETRY_BUDGET_SECONDS: "90"
           CLICKHOUSE_PREFLIGHT_RETRY_BACKOFF_SECONDS: "5"
           CH_INSERT_DISTRIBUTED_SYNC: "true"
-          CH_DIRECT_REPLICA_FALLBACK: "true"
-          CH_DIRECT_OUTBOX_FALLBACK: "true"
+          CH_DIRECT_REPLICA_FALLBACK: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && 'false' || 'true' }}
+          CH_DIRECT_OUTBOX_FALLBACK: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && 'false' || 'true' }}
           CH_OUTBOX_DATABASE: Data_Lecture_Inflearn_Log
           CH_OUTBOX_TABLE: inflearn_direct_insert_outbox
           CH_OUTBOX_REPLAY_LIMIT: "0"
@@ -260,11 +296,79 @@ jobs:
           export INFLEARN_TRANSLATION_MAX_PER_RUN="${INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT:-80}"
           TRANSLATION_LOG="$(mktemp)"
           if ! go run -mod=mod ./cmd/inflearn-translate-display >"$TRANSLATION_LOG" 2>&1; then
-            if grep -Ei "TABLE_IS_READ_ONLY|NOT_INITIALIZED|not initialized|KEEPER_EXCEPTION|Coordination error|Connection loss|context deadline exceeded|timeout" "$TRANSLATION_LOG" >/dev/null; then
-              echo "Skipping display translation because ClickHouse replicated tables are temporarily read-only"
-              exit 0
+            if grep -Ei "TABLE_IS_READ_ONLY|NOT_INITIALIZED|not initialized|KEEPER_EXCEPTION|Coordination error|Connection loss|context deadline exceeded|timeout|timed out|Too many simultaneous queries|TOO_MANY_SIMULTANEOUS_QUERIES|Failed to connect|Connection refused|Empty reply from server|http status=(429|500|502|503|504)|returned error: (429|500|502|503|504)" "$TRANSLATION_LOG" >/dev/null; then
+              echo "::warning title=Display translation deferred::ClickHouse is temporarily unavailable; the workflow will fail for retry."
+              echo '{"schema":"statground.inflearn.workflow_state.v1","status":"deferred","phase":"display_translation","category":"temporary_clickhouse"}'
+              exit 1
             fi
             cat "$TRANSLATION_LOG"
             exit 1
           fi
           cat "$TRANSLATION_LOG"
+
+      - name: Gate public lecture refresh on storage pressure
+        if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
+        env:
+          CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
+          CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
+          CH_USER: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER }}
+          CH_PASSWORD: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD }}
+          CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
+          CLICKHOUSE_PRESSURE_GATE_TARGETS: >-
+            replica:webr_lecture.inflearn_r_lecture_catalog_local,
+            replica:mirtype_lecture.inflearn_language_lecture_catalog_local,
+            replica:Data_Lecture_Inflearn_Service.inflearn_course_dim_local,
+            replica:Data_Lecture_Inflearn_Service.inflearn_course_display_translation_local,
+            replica:Data_Lecture_Inflearn_Service.inflearn_course_price_fact_local,
+            replica:webr_lecture.inflearn_r_lecture_catalog_serving_local,
+            replica:mirtype_lecture.inflearn_language_lecture_catalog_serving_local,
+            replica:statground_lecture.inflearn_workbench_catalog_serving_local,
+            replica:lecture_publication.inflearn_public_catalog_publish_lease_local,
+            replica:lecture_publication.inflearn_public_catalog_generation_local,
+            replica:lecture_publication.inflearn_public_catalog_activation_local,
+            replica:lecture_publication.inflearn_public_catalog_source_authority_fence_local,
+            replica:lecture_publication.inflearn_public_catalog_source_authority_local
+        run: python3 scripts/clickhouse_pressure_gate.py
+
+      - name: Refresh exact public lecture views serially
+        if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
+        id: refresh_public_lecture_views
+        env:
+          STATE_BACKEND: clickhouse
+          CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
+          CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
+          CH_USER: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER }}
+          CH_PASSWORD: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD }}
+          CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
+          CH_RAW_DATABASE: Data_Lecture_Inflearn_Raw
+          CH_SERVICE_DATABASE: Data_Lecture_Inflearn_Service
+          CH_LOG_DATABASE: Data_Lecture_Inflearn_Log
+          CH_CLUSTER: statground_cluster
+          INGEST_MODE: clickhouse
+          CH_DIRECT_REPLICA_FALLBACK: "false"
+          CH_DIRECT_OUTBOX_FALLBACK: "false"
+          INFLEARN_LECTURE_PUBLISHER_WRITER_ID: gha:${{ github.repository_id }}:${{ github.run_id }}:${{ github.run_attempt }}
+        run: go run -mod=mod ./cmd/inflearn-refresh-public-views
+
+      - name: Verify public lecture freshness and refresh health
+        if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
+        env:
+          STATE_BACKEND: clickhouse
+          CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
+          CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
+          CH_USER: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER }}
+          CH_PASSWORD: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD }}
+          CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
+          CH_RAW_DATABASE: Data_Lecture_Inflearn_Raw
+          CH_SERVICE_DATABASE: Data_Lecture_Inflearn_Service
+          CH_LOG_DATABASE: Data_Lecture_Inflearn_Log
+          CH_CLUSTER: statground_cluster
+          INGEST_MODE: clickhouse
+          CH_DIRECT_REPLICA_FALLBACK: "false"
+          CH_DIRECT_OUTBOX_FALLBACK: "false"
+          PUBLIC_REFRESH_RUN_UUID: ${{ steps.refresh_public_lecture_views.outputs.publication_run_uuid || 'missing' }}
+        run: go run -mod=mod ./cmd/inflearn-verify-public-freshness
+
+      - name: Report inactive publication v2 without claiming freshness
+        if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED != 'true'
+        run: echo '{"schema":"statground.inflearn.publication_activation.v1","status":"inactive","publication_claim":false}'

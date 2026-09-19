@@ -37,6 +37,9 @@ var (
 const (
 	collectCheckpointSource = "inflearn_courseDetail"
 	updateCheckpointSource  = "inflearn_update_existing"
+	normalGlobalUpdateLimit = 100
+	publicPriorityLimit     = 100
+	maximumUpdateLimit      = normalGlobalUpdateLimit + publicPriorityLimit
 )
 
 type Config struct {
@@ -58,6 +61,11 @@ type Config struct {
 	CHInsertDistributedSync bool
 	CHDirectReplicaFallback bool
 	CHDirectOutboxFallback  bool
+	PublicUpdatePriority    bool
+	PublicationV2Enabled    bool
+	PublicationWriterID     string
+	PublicationCHUser       string
+	PublicationCHPassword   string
 	CHOutboxDatabase        string
 	CHOutboxTable           string
 	CHOutboxReplayLimit     int
@@ -113,8 +121,9 @@ type Config struct {
 }
 
 type Service struct {
-	Cfg        Config
-	HTTPClient *http.Client
+	Cfg               Config
+	HTTPClient        *http.Client
+	sourceAuthorityMu sync.Mutex
 }
 
 type chJSONResponse struct {
@@ -152,12 +161,65 @@ type updatePick struct {
 	CourseID  int
 	Locale    string
 	SourceURL string
+	Selection string
 }
 
 type updateResult struct {
 	Rows CourseRows
 	URL  string
 	Err  error
+}
+
+type updateSelectionError struct {
+	Phase string
+	Err   error
+}
+
+func (e *updateSelectionError) Error() string {
+	return fmt.Sprintf("%s: %v", e.Phase, e.Err)
+}
+
+func (e *updateSelectionError) Unwrap() error { return e.Err }
+
+type updateRunStateError struct {
+	Status   string `json:"status"`
+	Phase    string `json:"phase"`
+	Category string `json:"category"`
+}
+
+func (e *updateRunStateError) Error() string {
+	payload := struct {
+		Schema string `json:"schema"`
+		*updateRunStateError
+	}{Schema: "statground.inflearn.update_state.v1", updateRunStateError: e}
+	b, _ := json.Marshal(payload)
+	return string(b)
+}
+
+func newUpdateRunStateError(status, phase string, err error) error {
+	category := clickHouseResponseCategory(err.Error())
+	return &updateRunStateError{Status: status, Phase: phase, Category: category}
+}
+
+func newUpdateReadStateError(phase string, err error) error {
+	status := "degraded"
+	if isTemporaryClickHouseWriteError(err) {
+		status = "deferred"
+	}
+	return newUpdateRunStateError(status, phase, err)
+}
+
+func courseBatchWriteError(err error) error {
+	if err != nil && isTemporaryClickHouseWriteError(err) {
+		// A transport/timeout response is ambiguous: ClickHouse may have accepted
+		// a deduplicated insert even when the client did not receive its ACK.
+		return newUpdateRunStateError("degraded", "course_batch_write", err)
+	}
+	return err
+}
+
+func (s *Service) writeUpdateCourseBatch(ctx context.Context, batch CourseRows) error {
+	return courseBatchWriteError(batch.InsertAll(ctx, s))
 }
 
 func loadKST() *time.Location {
@@ -190,6 +252,11 @@ func LoadConfig() (Config, error) {
 		CHInsertDistributedSync: parseBool(envDefault("CH_INSERT_DISTRIBUTED_SYNC", "true")),
 		CHDirectReplicaFallback: parseBool(envDefault("CH_DIRECT_REPLICA_FALLBACK", "true")),
 		CHDirectOutboxFallback:  parseBool(envDefault("CH_DIRECT_OUTBOX_FALLBACK", "true")),
+		PublicUpdatePriority:    parseBool(envDefault("INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED", "false")),
+		PublicationV2Enabled:    parseBool(envDefault("INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED", "false")),
+		PublicationWriterID:     strings.TrimSpace(envDefault("INFLEARN_LECTURE_PUBLISHER_WRITER_ID", "")),
+		PublicationCHUser:       strings.TrimSpace(envDefault("INFLEARN_LECTURE_PUBLISHER_CH_USER", "")),
+		PublicationCHPassword:   envDefault("INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD", ""),
 		CHOutboxDatabase:        envDefault("CH_OUTBOX_DATABASE", "Data_Lecture_Inflearn_Log"),
 		CHOutboxTable:           envDefault("CH_OUTBOX_TABLE", "inflearn_direct_insert_outbox"),
 		CHOutboxReplayLimit:     parseBoundedNonNegativeInt(envDefault("CH_OUTBOX_REPLAY_LIMIT", "0"), 0, 50),
@@ -226,7 +293,7 @@ func LoadConfig() (Config, error) {
 		MaxURLsPerRun:           parsePositiveInt(envDefault("MAX_URLS_PER_RUN", "1500"), 1500),
 		CheckpointFlushEvery:    parsePositiveInt(envDefault("CHECKPOINT_FLUSH_EVERY", "200"), 200),
 		UpdateBatchSize:         parsePositiveInt(envDefault("UPDATE_BATCH_SIZE", "100"), 100),
-		Workers:                 parsePositiveInt(envDefault("WORKERS", "8"), 8),
+		Workers:                 parsePositiveInt(envDefault("WORKERS", "4"), 4),
 		RequestSleepMin:         parseSeconds(envDefault("REQUEST_SLEEP_MIN", "0.2")),
 		RequestSleepMax:         parseSeconds(envDefault("REQUEST_SLEEP_MAX", "0.6")),
 		UserAgent:               envDefault("CRAWLER_USER_AGENT", "Mozilla/5.0 (compatible; StatgroundCrawler/2.0; +https://www.statground.net)"),
@@ -2130,46 +2197,175 @@ func (s *Service) RunCollectNew(ctx context.Context) error {
 }
 
 func (s *Service) pickUpdateURLs(ctx context.Context, limit int) ([]updatePick, error) {
-	if s.UseLocalState() {
-		return s.localPickUpdateURLs(limit)
+	globalLimit, publicLimit := updateSelectionLimits(limit)
+	if !s.Cfg.PublicUpdatePriority {
+		publicLimit = 0
 	}
+	if s.UseLocalState() {
+		return s.localPickUpdateURLs(globalLimit)
+	}
+	if publicLimit == 0 {
+		return s.pickGlobalUpdateURLs(ctx, globalLimit)
+	}
+	// Read the complete latest-key set once, then apply the locale/source-URL
+	// consistency guard in Go before taking either limit. Legacy rows whose
+	// stored locale disagrees with the URL must not occupy the oldest slots on
+	// every run and starve valid keys behind a SQL LIMIT.
+	selectionSQL := fmt.Sprintf(`
+		    WITH public_exact AS (
+	      SELECT course_id, locale, min(priority_tier) AS priority_tier
+	      FROM lecture_publication.v_inflearn_public_update_priority_keys
+	      GROUP BY course_id, locale
+		    )
+	    SELECT
+	      course_id,
+	      locale,
+	      source_url,
+		      public_stale,
+		      public_priority_tier
+		    FROM (
+		      SELECT
+		        latest.course_id AS course_id,
+		        latest.locale AS locale,
+		        latest.source_url AS source_url,
+		        latest.last_fetched_at AS last_fetched_at,
+		        toUInt8(
+		          ifNull(public_exact.course_id, toUInt32(0)) > 0
+		          AND latest.last_fetched_at < now64(3, 'Asia/Seoul') - INTERVAL 24 HOUR
+		        ) AS public_stale,
+		        ifNull(public_exact.priority_tier, toUInt8(255)) AS public_priority_tier
+		      FROM (
+		        SELECT
+		          course_id,
+		          locale,
+		          argMax(source_url, fetched_at) AS source_url,
+		          max(fetched_at) AS last_fetched_at
+		        FROM %s.inflearn_course_snapshot_raw
+		        WHERE status_code = 'OK'
+		          AND course_id > 0
+		          AND notEmpty(trimBoth(locale))
+		        GROUP BY course_id, locale
+		        HAVING notEmpty(trimBoth(source_url))
+		      ) AS latest
+		      GLOBAL LEFT JOIN public_exact
+		        ON latest.course_id = public_exact.course_id
+		       AND latest.locale = public_exact.locale
+		    )
+		    ORDER BY last_fetched_at ASC, course_id ASC, locale ASC
+		    SETTINGS skip_unavailable_shards = 0, max_execution_time = 60, max_threads = 2
+		`, chIdent(s.Cfg.CHRawDatabase))
+	rows, err := s.CHQueryRows(ctx, selectionSQL)
+	if err != nil {
+		return nil, &updateSelectionError{Phase: "update_selection_read", Err: err}
+	}
+	global := make([]updatePick, 0, globalLimit)
+	publicTier0 := make([]updatePick, 0, publicLimit)
+	publicTier1 := make([]updatePick, 0, publicLimit)
+	for _, row := range rows {
+		if pick, ok := updatePickFromRow(row, "global_oldest"); ok {
+			if len(global) < globalLimit {
+				global = append(global, pick)
+			}
+			if asInt(row["public_stale"]) == 1 {
+				pick.Selection = "public_priority"
+				if asInt(row["public_priority_tier"]) == 0 {
+					publicTier0 = append(publicTier0, pick)
+				} else {
+					publicTier1 = append(publicTier1, pick)
+				}
+			}
+		}
+	}
+	public := append(publicTier0, publicTier1...)
+	return mergeUpdatePicks(global, public, globalLimit, publicLimit), nil
+}
+
+func updateSelectionLimits(limit int) (global, public int) {
+	if limit <= 0 {
+		limit = normalGlobalUpdateLimit
+	}
+	if limit < normalGlobalUpdateLimit {
+		return limit, 0
+	}
+	return normalGlobalUpdateLimit, publicPriorityLimit
+}
+
+func (s *Service) pickGlobalUpdateURLs(ctx context.Context, limit int) ([]updatePick, error) {
 	sql := fmt.Sprintf(`
-        WITH latest AS (
-          SELECT
-            course_id,
-            locale,
-            argMax(source_url, fetched_at) AS source_url,
-            max(fetched_at) AS last_fetched_at
-          FROM %s.inflearn_course_snapshot_raw
-          WHERE status_code = 'OK'
-          GROUP BY course_id, locale
-        )
-        SELECT
-          course_id,
-          locale,
-          source_url,
-          formatDateTime(last_fetched_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS last_fetched_at
-        FROM latest
-        ORDER BY last_fetched_at ASC
-        LIMIT %d
-    `, chIdent(s.Cfg.CHRawDatabase), limit)
+		WITH latest AS (
+		  SELECT
+		    course_id,
+		    locale,
+		    argMax(source_url, fetched_at) AS source_url,
+		    max(fetched_at) AS last_fetched_at
+		  FROM %s.inflearn_course_snapshot_raw
+		  WHERE status_code = 'OK'
+		    AND course_id > 0
+		    AND notEmpty(trimBoth(locale))
+		  GROUP BY course_id, locale
+		  HAVING notEmpty(trimBoth(source_url))
+		)
+		SELECT course_id, locale, source_url
+		FROM latest
+		ORDER BY last_fetched_at ASC, course_id ASC, locale ASC
+			SETTINGS max_execution_time = 60, max_threads = 2
+		`, chIdent(s.Cfg.CHRawDatabase))
 	rows, err := s.CHQueryRows(ctx, sql)
 	if err != nil {
-		return nil, err
+		return nil, &updateSelectionError{Phase: "update_selection_read", Err: err}
 	}
-	out := make([]updatePick, 0, len(rows))
+	out := make([]updatePick, 0, limit)
 	for _, row := range rows {
-		rawURL := asString(row["source_url"])
-		if strings.TrimSpace(rawURL) == "" {
-			continue
+		if pick, ok := updatePickFromRow(row, "global_oldest"); ok {
+			out = append(out, pick)
+			if len(out) == limit {
+				break
+			}
 		}
-		out = append(out, updatePick{
-			CourseID:  asInt(row["course_id"]),
-			Locale:    asString(row["locale"]),
-			SourceURL: rawURL,
-		})
 	}
 	return out, nil
+}
+
+func updatePickFromRow(row map[string]any, selection string) (updatePick, bool) {
+	rawURL := strings.TrimSpace(asString(row["source_url"]))
+	courseID := asInt(row["course_id"])
+	storedLocale := normalizeInflearnURLLocale(asString(row["locale"]))
+	if courseID <= 0 || rawURL == "" || storedLocale == "" || ParseLocaleFromURL(rawURL) != storedLocale {
+		return updatePick{}, false
+	}
+	return updatePick{
+		CourseID:  courseID,
+		Locale:    storedLocale,
+		SourceURL: rawURL,
+		Selection: selection,
+	}, true
+}
+
+func mergeUpdatePicks(global, public []updatePick, globalLimit, publicLimit int) []updatePick {
+	totalLimit := globalLimit + publicLimit
+	out := make([]updatePick, 0, totalLimit)
+	seen := make(map[string]struct{}, totalLimit)
+	appendUnique := func(picks []updatePick, limit int) {
+		added := 0
+		for _, pick := range picks {
+			if added >= limit || len(out) >= totalLimit {
+				return
+			}
+			key := localCourseKey(pick.CourseID, pick.Locale)
+			if pick.CourseID <= 0 || strings.TrimSpace(pick.SourceURL) == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, pick)
+			added++
+		}
+	}
+	appendUnique(global, globalLimit)
+	appendUnique(public, publicLimit)
+	return out
 }
 
 func (s *Service) getUpdateProgress(ctx context.Context) (int, int, error) {
@@ -2222,13 +2418,15 @@ func (s *Service) RunCollectURLs(ctx context.Context, urls []string) error {
 
 func (s *Service) RunUpdateExisting(ctx context.Context) error {
 	if err := s.ValidateIngest(ctx); err != nil {
+		if isTemporaryClickHouseWriteError(err) {
+			return newUpdateRunStateError("deferred", "clickhouse_preflight", err)
+		}
 		return err
 	}
 	totalDone, _, err := s.getUpdateProgress(ctx)
 	if err != nil {
 		if isTemporaryClickHouseWriteError(err) {
-			fmt.Printf("[warn] update skipped because ClickHouse checkpoint read is temporarily unavailable: %s\n", s.sanitizeClickHouseError(err))
-			return nil
+			return newUpdateRunStateError("deferred", "checkpoint_read", err)
 		}
 		return err
 	}
@@ -2236,16 +2434,36 @@ func (s *Service) RunUpdateExisting(ctx context.Context) error {
 	picks, err := s.pickUpdateURLs(ctx, s.Cfg.UpdateBatchSize)
 	if err != nil {
 		if isTemporaryClickHouseWriteError(err) {
-			fmt.Printf("[warn] update skipped because ClickHouse course snapshot read is temporarily unavailable: %s\n", s.sanitizeClickHouseError(err))
-			return nil
+			phase := "course_snapshot_read"
+			var selectionErr *updateSelectionError
+			if errors.As(err, &selectionErr) {
+				phase = selectionErr.Phase
+			}
+			return newUpdateRunStateError("deferred", phase, err)
 		}
 		return err
 	}
-	fmt.Printf("[update] picked=%d (UPDATE_BATCH_SIZE=%d)\n", len(picks), s.Cfg.UpdateBatchSize)
+	globalPicked, publicPicked := 0, 0
+	for _, pick := range picks {
+		switch pick.Selection {
+		case "public_priority":
+			publicPicked++
+		default:
+			globalPicked++
+		}
+	}
+	selectionPayload, _ := json.Marshal(map[string]any{
+		"schema":          "statground.inflearn.update_selection.v1",
+		"status":          "ready",
+		"global_oldest":   globalPicked,
+		"public_priority": publicPicked,
+		"total":           len(picks),
+	})
+	fmt.Println(string(selectionPayload))
 	if len(picks) == 0 {
 		if err := s.setUpdateProgress(ctx, totalDone, 0); err != nil {
 			if isTemporaryClickHouseWriteError(err) {
-				fmt.Printf("[warn] update empty checkpoint deferred because ClickHouse is temporarily unavailable: %s\n", s.sanitizeClickHouseError(err))
+				return newUpdateRunStateError("degraded", "checkpoint_write", err)
 			} else {
 				return err
 			}
@@ -2298,7 +2516,7 @@ func (s *Service) RunUpdateExisting(ctx context.Context) error {
 		batch.Append(result.Rows)
 	}
 
-	if err := batch.InsertAll(ctx, s); err != nil {
+	if err := s.writeUpdateCourseBatch(ctx, batch); err != nil {
 		return err
 	}
 	if s.UseLocalState() {
@@ -2309,7 +2527,7 @@ func (s *Service) RunUpdateExisting(ctx context.Context) error {
 	totalDone += len(picks)
 	if err := s.setUpdateProgress(ctx, totalDone, len(picks)); err != nil {
 		if isTemporaryClickHouseWriteError(err) {
-			fmt.Printf("[warn] update progress checkpoint deferred because ClickHouse is temporarily unavailable: %s\n", s.sanitizeClickHouseError(err))
+			return newUpdateRunStateError("degraded", "checkpoint_write", err)
 		} else {
 			return err
 		}

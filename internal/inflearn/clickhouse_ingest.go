@@ -177,6 +177,11 @@ func (s *Service) InsertCheckpointClickHouse(ctx context.Context, source string,
 }
 
 func (s *Service) InsertCourseRowsClickHouse(ctx context.Context, rows CourseRows) error {
+	if s.Cfg.PublicationV2Enabled && len(rows.CourseDim) > 0 {
+		if err := s.publishSourceAuthorityEvents(ctx, rows.CourseDim); err != nil {
+			return fmt.Errorf("source authority before course batch: %w", err)
+		}
+	}
 	tasks := []struct {
 		database string
 		table    string
