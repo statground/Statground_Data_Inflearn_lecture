@@ -1,8 +1,12 @@
 package inflearn
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -96,8 +100,8 @@ func TestLoadLectureReaderConfigRejectsUnknownAndCrossOriginEndpoints(t *testing
 func TestLectureReaderContractLiteralsAndExactKeySets(t *testing.T) {
 	if lectureReaderInventoryFormat != "statground.lecture-publication-reader-inventory.v1" ||
 		lectureReaderRefreshFormat != "statground.lecture-publication-reader-refresh.v1" ||
-		lectureReaderRefreshPath != "/internal/lecture-publication/refresh" {
-		t.Fatalf("contract literals changed: inventory=%q refresh=%q path=%q", lectureReaderInventoryFormat, lectureReaderRefreshFormat, lectureReaderRefreshPath)
+		lectureReaderRefreshPath != "/internal/lecture-publication/refresh" || lectureReaderRefreshAttempts != 3 {
+		t.Fatalf("contract literals changed: inventory=%q refresh=%q path=%q attempts=%d", lectureReaderInventoryFormat, lectureReaderRefreshFormat, lectureReaderRefreshPath, lectureReaderRefreshAttempts)
 	}
 	wantDiscovery := stringSet("format", "app_service", "reader_instance", "reader_epoch_uuid", "refresh_nonce", "observed_at")
 	wantReceipt := stringSet(
@@ -163,6 +167,130 @@ func TestLectureReaderDiscoveryAndRefreshUseExactEpochBoundContract(t *testing.T
 	}
 	if receipt.ListCount != 40 || receipt.DetailCourseID != 123 || receipt.SitemapSHA256 != strings.Repeat("a", 64) {
 		t.Fatalf("receipt=%+v", receipt)
+	}
+}
+
+func testLectureReaderReceipt() map[string]any {
+	now := time.Now().UTC()
+	return map[string]any{
+		"format": lectureReaderRefreshFormat, "app_service": "web-r", "reader_instance": "web-r-test-1",
+		"reader_epoch_uuid": testReaderEpoch, "activation_revision": 8, "activation_uuid": testActivationUUID,
+		"run_uuid": testActivationRun, "source_authority_revision": 9, "refresh_nonce": testRefreshNonce,
+		"surface": "webr", "generation_ms": 1700000000123, "list_count": 40, "detail_course_id": 123,
+		"homepage_count": 8, "sitemap_entry_count": 40, "sitemap_sha256": strings.Repeat("a", 64),
+		"refresh_started_at": now.Format(time.RFC3339Nano), "refreshed_at": now.Add(time.Second).Format(time.RFC3339Nano),
+	}
+}
+
+func testLectureReaderRefreshInput(endpoint string) (preparedLectureReader, activationEvidence) {
+	reader := preparedLectureReader{
+		Config: lectureReaderConfig{
+			AppService: "web-r", ReaderInstance: "web-r-test-1",
+			RefreshEndpoint: endpoint, BearerToken: testReaderBearer,
+		},
+		EpochUUID: testReaderEpoch,
+	}
+	activation := activationEvidence{
+		Revision: 8, ActivationUUID: testActivationUUID, RunUUID: testActivationRun,
+		WebRGenerationMS: 1700000000123,
+	}
+	return reader, activation
+}
+
+func TestPostLectureReaderRefreshRetriesTransientFailureWithExactPayload(t *testing.T) {
+	var bodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies = append(bodies, append([]byte(nil), raw...))
+		if len(bodies) < lectureReaderRefreshAttempts {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(testLectureReaderReceipt())
+	}))
+	defer server.Close()
+	reader, activation := testLectureReaderRefreshInput(server.URL + lectureReaderRefreshPath)
+	receipt, err := postLectureReaderRefresh(context.Background(), reader, testRefreshNonce, activation, 9, activation.WebRGenerationMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != lectureReaderRefreshAttempts || receipt.RefreshNonce != testRefreshNonce {
+		t.Fatalf("attempts=%d receipt=%+v", len(bodies), receipt)
+	}
+	for _, body := range bodies[1:] {
+		if !bytes.Equal(body, bodies[0]) {
+			t.Fatal("transient retry changed the exact request payload")
+		}
+	}
+	var request map[string]any
+	if err := json.Unmarshal(bodies[0], &request); err != nil || request["refresh_nonce"] != testRefreshNonce {
+		t.Fatalf("request=%v err=%v", request, err)
+	}
+}
+
+func TestPostLectureReaderRefreshDoesNotRetryPermanentResponses(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+		body   map[string]any
+	}{
+		{name: "4xx", status: http.StatusConflict},
+		{name: "invalid_receipt", status: http.StatusOK, body: map[string]any{"format": "wrong"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if test.status != http.StatusOK {
+					http.Error(w, "permanent", test.status)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(test.body)
+			}))
+			defer server.Close()
+			reader, activation := testLectureReaderRefreshInput(server.URL + lectureReaderRefreshPath)
+			if _, err := postLectureReaderRefresh(context.Background(), reader, testRefreshNonce, activation, 9, activation.WebRGenerationMS); err == nil {
+				t.Fatal("permanent response was accepted")
+			}
+			if calls != 1 {
+				t.Fatalf("permanent response attempts=%d, want 1", calls)
+			}
+		})
+	}
+}
+
+type lectureRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn lectureRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
+func TestLectureReaderRefreshRetriesTransportFailuresOnlyToBound(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "connection", err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection unavailable")}},
+		{name: "timeout", err: context.DeadlineExceeded},
+		{name: "unexpected_eof", err: io.ErrUnexpectedEOF},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			client := &http.Client{Transport: lectureRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls++
+				return nil, test.err
+			})}
+			reader := lectureReaderConfig{RefreshEndpoint: "https://reader.example/internal/lecture-publication/refresh", BearerToken: testReaderBearer}
+			if _, err := requestLectureReaderRefreshWithRetry(context.Background(), client, reader, []byte(`{"refresh_nonce":"same"}`), lectureReaderRefreshAttempts, 0); err == nil {
+				t.Fatalf("%s failure was accepted", test.name)
+			}
+			if calls != lectureReaderRefreshAttempts {
+				t.Fatalf("%s attempts=%d, want %d", test.name, calls, lectureReaderRefreshAttempts)
+			}
+		})
 	}
 }
 

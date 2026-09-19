@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +26,8 @@ const (
 	lectureReaderInventoryFormat = "statground.lecture-publication-reader-inventory.v1"
 	lectureReaderRefreshFormat   = "statground.lecture-publication-reader-refresh.v1"
 	lectureReaderRefreshPath     = "/internal/lecture-publication/refresh"
+	lectureReaderRefreshAttempts = 3
+	lectureReaderRefreshBackoff  = 100 * time.Millisecond
 	lectureReaderACKLocalTable   = "lecture_publication.inflearn_public_catalog_reader_refresh_ack_local"
 	lectureReaderACKTable        = "lecture_publication.inflearn_public_catalog_reader_refresh_ack"
 	readerInventoryLocalTable    = "Data_Book_Service.book_publication_reader_inventory_local"
@@ -388,14 +391,34 @@ func readerHTTPClient(reader lectureReaderConfig) (*http.Client, error) {
 	}, nil
 }
 
+type readerHTTPStatusError struct {
+	StatusCode int
+}
+
+func (err *readerHTTPStatusError) Error() string {
+	return fmt.Sprintf("reader status %d", err.StatusCode)
+}
+
+type readerResponseReadError struct {
+	Err error
+}
+
+func (err *readerResponseReadError) Error() string {
+	return "reader response read failed: " + err.Err.Error()
+}
+func (err *readerResponseReadError) Unwrap() error { return err.Err }
+
 func readBoundedJSONResponse(response *http.Response) (map[string]any, error) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		return nil, fmt.Errorf("reader status %d", response.StatusCode)
+		return nil, &readerHTTPStatusError{StatusCode: response.StatusCode}
 	}
 	raw, err := io.ReadAll(io.LimitReader(response.Body, 65537))
-	if err != nil || len(raw) == 0 || len(raw) > 65536 {
+	if err != nil {
+		return nil, &readerResponseReadError{Err: err}
+	}
+	if len(raw) == 0 || len(raw) > 65536 {
 		return nil, fmt.Errorf("reader response size")
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -408,6 +431,76 @@ func readBoundedJSONResponse(response *http.Response) (map[string]any, error) {
 		return nil, fmt.Errorf("reader response trailing JSON")
 	}
 	return value, nil
+}
+
+func retryableLectureReaderRefreshError(err error) bool {
+	var statusErr *readerHTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode >= http.StatusInternalServerError && statusErr.StatusCode <= 599
+	}
+	var readErr *readerResponseReadError
+	if errors.As(err, &readErr) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	var operationErr *net.OpError
+	return errors.As(err, &operationErr)
+}
+
+func requestLectureReaderRefresh(ctx context.Context, client *http.Client, reader lectureReaderConfig, body []byte) (map[string]any, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, reader.RefreshEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+reader.BearerToken)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Cache-Control", "no-store")
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	return readBoundedJSONResponse(response)
+}
+
+func requestLectureReaderRefreshWithRetry(ctx context.Context, client *http.Client, reader lectureReaderConfig, body []byte, attempts int, baseBackoff time.Duration) (map[string]any, error) {
+	if attempts < 1 {
+		return nil, fmt.Errorf("reader refresh attempts must be positive")
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		value, err := requestLectureReaderRefresh(ctx, client, reader, body)
+		if err == nil {
+			return value, nil
+		}
+		lastErr = err
+		if attempt == attempts || !retryableLectureReaderRefreshError(err) {
+			return nil, err
+		}
+		delay := baseBackoff * time.Duration(1<<(attempt-1))
+		if delay <= 0 {
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
 }
 
 func discoverLectureReader(ctx context.Context, reader lectureReaderConfig, nonce string) (string, error) {
@@ -483,19 +576,9 @@ func postLectureReaderRefresh(ctx context.Context, reader preparedLectureReader,
 	if err != nil {
 		return lectureReaderReceipt{}, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, reader.Config.RefreshEndpoint, bytes.NewReader(body))
-	if err != nil {
-		return lectureReaderReceipt{}, err
-	}
-	request.Header.Set("Authorization", "Bearer "+reader.Config.BearerToken)
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Cache-Control", "no-store")
-	response, err := client.Do(request)
-	if err != nil {
-		return lectureReaderReceipt{}, err
-	}
-	value, err := readBoundedJSONResponse(response)
+	value, err := requestLectureReaderRefreshWithRetry(
+		ctx, client, reader.Config, body, lectureReaderRefreshAttempts, lectureReaderRefreshBackoff,
+	)
 	if err != nil || !exactJSONKeys(value, lectureReaderReceiptKeys) {
 		return lectureReaderReceipt{}, fmt.Errorf("reader refresh contract")
 	}
