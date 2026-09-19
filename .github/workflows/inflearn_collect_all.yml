@@ -330,7 +330,8 @@ jobs:
             replica:lecture_publication.inflearn_public_catalog_activation_local,
             replica:lecture_publication.inflearn_public_catalog_source_authority_fence_local,
             replica:lecture_publication.inflearn_public_catalog_source_authority_local,
-            replica:lecture_publication.inflearn_public_catalog_reader_refresh_ack_local
+            replica:lecture_publication.inflearn_public_catalog_reader_refresh_ack_local,
+            replica:lecture_publication.inflearn_public_catalog_reader_transition_ack_v2_local
         run: python3 scripts/clickhouse_pressure_gate.py
 
       - name: Refresh exact public lecture views serially

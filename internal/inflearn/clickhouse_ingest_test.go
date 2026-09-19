@@ -432,6 +432,7 @@ func TestInflearnWorkflowPinsBoundedPreflightRetry(t *testing.T) {
 		"secrets.INFLEARN_LECTURE_READER_REFRESH_CONFIG_JSON",
 		"INFLEARN_LECTURE_READER_REFRESH_CONFIG_FILE",
 		"replica:lecture_publication.inflearn_public_catalog_reader_refresh_ack_local",
+		"replica:lecture_publication.inflearn_public_catalog_reader_transition_ack_v2_local",
 		"INFLEARN_LECTURE_PUBLISHER_WRITER_ID: gha:${{ github.repository_id }}:${{ github.run_id }}:${{ github.run_attempt }}",
 		"vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'",
 		`"status":"inactive","publication_claim":false`,

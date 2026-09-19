@@ -174,14 +174,14 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 	if err != nil {
 		return PublicRefreshReceipt{}, err
 	}
-	if readerRefreshEnabled {
-		if err := s.reconcileCurrentLectureReaders(ctx, topology, readerConfig); err != nil {
-			return PublicRefreshReceipt{}, err
-		}
-	}
 	lease, err := s.acquirePublicationLease(ctx, topology)
 	if err != nil {
 		return PublicRefreshReceipt{}, err
+	}
+	if readerRefreshEnabled {
+		if err := s.reconcilePublicationTransitionReaders(ctx, topology, readerConfig, lease); err != nil {
+			return PublicRefreshReceipt{}, err
+		}
 	}
 	priorPointers, _, err := s.readPublicationPointer(ctx, "public_refresh_pointer_preflight")
 	if err != nil {
@@ -344,13 +344,6 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 		})
 	}
 
-	var preparedReaders preparedLectureReaderRefresh
-	if readerRefreshEnabled {
-		preparedReaders, err = s.prepareLectureReaderRefresh(ctx, topology, readerConfig)
-		if err != nil {
-			return PublicRefreshReceipt{}, err
-		}
-	}
 	if err := s.requireCurrentPublicationLease(ctx, lease, "public_activation_lease"); err != nil {
 		return PublicRefreshReceipt{}, err
 	}
@@ -383,13 +376,6 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 	if rawRevision == ^uint64(0) {
 		return PublicRefreshReceipt{}, stateError("degraded", "public_activation_revision", "activation_revision_exhausted")
 	}
-	activatedMS, err := s.readServerTimeMS(ctx)
-	if err != nil {
-		return PublicRefreshReceipt{}, newUpdateReadStateError("public_activation_time", err)
-	}
-	if activatedMS < completedMS || activatedMS >= lease.ExpiresMS {
-		return PublicRefreshReceipt{}, stateError("degraded", "public_activation_time", "activation_outside_lease")
-	}
 	activation := activationEvidence{
 		Revision: rawRevision + 1, ActivationUUID: activationUUID, RunUUID: runUUID,
 		FenceEpoch: lease.FenceEpoch, LeaseUUID: lease.LeaseUUID,
@@ -399,9 +385,69 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 		MirMarkerUUID:          evidenceBySurface["mirtype"].MarkerUUID,
 		StatgroundGenerationMS: evidenceBySurface["statground"].GenerationMS,
 		StatgroundMarkerUUID:   evidenceBySurface["statground"].MarkerUUID,
-		Kind:                   "publish", ActivatedMS: activatedMS,
+		Kind:                   "publish",
 	}
+	var preparedTransition preparedPublicationTransition
+	if readerRefreshEnabled {
+		preparedTransition, err = s.preparePublicationTransitionReaders(
+			ctx, topology, readerConfig, priorPointers, activation, initialAuthorityRevision,
+		)
+		if err != nil {
+			return PublicRefreshReceipt{}, err
+		}
+	}
+	failPrepared := func(cause error) (PublicRefreshReceipt, error) {
+		if !readerRefreshEnabled {
+			return PublicRefreshReceipt{}, cause
+		}
+		if abortErr := abortPreparedPublicationTransition(ctx, preparedTransition); abortErr != nil {
+			return PublicRefreshReceipt{}, stateError("degraded", "public_reader_transition_abort", "preactivation_abort_failed")
+		}
+		return PublicRefreshReceipt{}, cause
+	}
+	if readerRefreshEnabled {
+		if err := s.requireCurrentPublicationLease(ctx, lease, "public_activation_post_prepare_lease"); err != nil {
+			return failPrepared(err)
+		}
+		postPreparePreflight, err := s.runPublicationCandidatePreflight(ctx, generations, lease)
+		if err != nil {
+			return failPrepared(err)
+		}
+		for _, surface := range expectedPublicationSurfaces {
+			before, after := evidenceBySurface[surface], postPreparePreflight[surface]
+			if after.SourceAuthorityRevision != initialAuthorityRevision || before.GenerationMS != after.GenerationMS ||
+				before.Rows != after.Rows || before.Unique != after.Unique || before.FingerprintSum != after.FingerprintSum ||
+				before.FingerprintXOR != after.FingerprintXOR || before.SourceFetchedMaxMS != after.SourceFetchedMaxMS {
+				return failPrepared(stateError("degraded", "public_activation_post_prepare", "source_or_candidate_changed_during_prepare"))
+			}
+		}
+		postPrepareAuthorityRevision, _, err := s.readSourceAuthorityRevision(ctx, topology, "public_activation_post_prepare_authority")
+		if err != nil {
+			return failPrepared(err)
+		}
+		if postPrepareAuthorityRevision != initialAuthorityRevision {
+			return failPrepared(stateError("degraded", "public_activation_post_prepare_authority", "source_authority_changed_during_prepare"))
+		}
+		postPrepareRawRevision, err := s.readRawActivationRevision(ctx, topology)
+		if err != nil {
+			return failPrepared(err)
+		}
+		if postPrepareRawRevision != rawRevision {
+			return failPrepared(stateError("degraded", "public_activation_post_prepare_revision", "activation_revision_changed_during_prepare"))
+		}
+	}
+	activatedMS, err := s.readServerTimeMS(ctx)
+	if err != nil {
+		return failPrepared(newUpdateReadStateError("public_activation_time", err))
+	}
+	if activatedMS < completedMS || activatedMS >= lease.ExpiresMS {
+		return failPrepared(stateError("degraded", "public_activation_time", "activation_outside_lease"))
+	}
+	activation.ActivatedMS = activatedMS
 	if err := s.insertAndReadbackActivation(ctx, topology, activation); err != nil {
+		// An ambiguous activation write may already be visible. Never issue an
+		// unsafe ABORT after that point; leave every reader closed for the next
+		// reconciliation run.
 		return PublicRefreshReceipt{}, err
 	}
 	postActivationAuthorityRevision, _, err := s.readSourceAuthorityRevision(ctx, topology, "public_activation_source_authority_readback")
@@ -415,7 +461,46 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 		return PublicRefreshReceipt{}, err
 	}
 	if readerRefreshEnabled {
-		if err := s.executePreparedLectureReaderRefresh(ctx, topology, readerConfig, preparedReaders, activation, initialAuthorityRevision); err != nil {
+		committedReaders, commitErr := s.commitPublicationTransitionReaders(ctx, preparedTransition, activation, initialAuthorityRevision)
+		if commitErr != nil {
+			return PublicRefreshReceipt{}, commitErr
+		}
+		if err := s.proveCommittedPublicationTransitionReaders(ctx, preparedTransition, committedReaders); err != nil {
+			return PublicRefreshReceipt{}, err
+		}
+		finalInventory, err := s.proveLectureReaderInventory(ctx, topology, readerConfig)
+		if err != nil || !sameLectureReaderInventory(finalInventory, preparedTransition.Inventory) {
+			return PublicRefreshReceipt{}, stateError("degraded", "public_reader_transition_final_inventory", "reader_inventory_changed_after_commit")
+		}
+		finalAuthority, _, err := s.readSourceAuthorityRevision(ctx, topology, "public_reader_transition_final_authority")
+		if err != nil {
+			return PublicRefreshReceipt{}, err
+		}
+		if finalAuthority != initialAuthorityRevision {
+			return PublicRefreshReceipt{}, stateError("degraded", "public_reader_transition_final_authority", "source_authority_changed_after_commit")
+		}
+		if err := s.verifyActivatedPointer(ctx, activation); err != nil {
+			return PublicRefreshReceipt{}, err
+		}
+		finalPreflight, err := s.runPublicationCandidatePreflight(ctx, generations, lease)
+		if err != nil {
+			return PublicRefreshReceipt{}, err
+		}
+		for _, surface := range expectedPublicationSurfaces {
+			before, after := evidenceBySurface[surface], finalPreflight[surface]
+			if after.SourceAuthorityRevision != initialAuthorityRevision || before.GenerationMS != after.GenerationMS ||
+				before.Rows != after.Rows || before.Unique != after.Unique || before.FingerprintSum != after.FingerprintSum ||
+				before.FingerprintXOR != after.FingerprintXOR || before.SourceFetchedMaxMS != after.SourceFetchedMaxMS {
+				return PublicRefreshReceipt{}, stateError("degraded", "public_reader_transition_final_proof", "source_or_candidate_changed_after_commit")
+			}
+		}
+		release, err := s.appendAndReadbackPublicationTransitionRelease(
+			ctx, topology, preparedTransition, committedReaders, activation, initialAuthorityRevision,
+		)
+		if err != nil {
+			return PublicRefreshReceipt{}, err
+		}
+		if err := s.finalizePublicationTransitionReaders(ctx, committedReaders, release); err != nil {
 			return PublicRefreshReceipt{}, err
 		}
 	}
