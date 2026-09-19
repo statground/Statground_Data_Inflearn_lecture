@@ -1,6 +1,7 @@
 package inflearn
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -62,6 +63,61 @@ func TestPublicationTransitionV2ContractLiteralsAndDeterministicIDs(t *testing.T
 	)
 	if !reflect.DeepEqual(publicationTransitionInventoryKeys, wantInventory) {
 		t.Fatalf("inventory keys=%v", publicationTransitionInventoryKeys)
+	}
+}
+
+func TestPublicationTransitionInventoryAcceptsDurableRecoveryPhases(t *testing.T) {
+	oldDigest := strings.Repeat("a", 64)
+	candidateDigest := strings.Repeat("b", 64)
+	prepareDigest := strings.Repeat("c", 64)
+	proofDigest := strings.Repeat("d", 64)
+	commitDigest := strings.Repeat("e", 64)
+	transitionID := stablePublicationTransitionUUID("transition", testActivationUUID)
+	inventoryNonce := stablePublicationTransitionUUID("inventory", transitionID, "web-r", "web-r-test-1")
+	phase := "steady"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		value := map[string]any{
+			"format": publicationTransitionInventoryFormat, "app_service": "web-r", "domain": "lecture",
+			"reader_instance": "web-r-test-1", "reader_epoch_uuid": testReaderEpoch,
+			"inventory_nonce": inventoryNonce, "phase": phase, "admission_open": phase == "steady",
+			"transition_id": transitionID, "serving_authority_sha256": oldDigest,
+			"old_authority_sha256": oldDigest, "candidate_authority_sha256": candidateDigest,
+			"prepare_receipt_sha256": "", "commit_receipt_sha256": "", "old_state_proof_sha256": "",
+			"last_finalized_transition_id": "", "last_finalize_receipt_sha256": "",
+			"inflight": 0, "observed_at": time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		switch phase {
+		case "steady":
+			value["transition_id"], value["old_authority_sha256"], value["candidate_authority_sha256"] = "", "", ""
+		case "prepared":
+			value["prepare_receipt_sha256"], value["old_state_proof_sha256"] = prepareDigest, proofDigest
+		case "committing":
+			value["serving_authority_sha256"] = candidateDigest
+			value["prepare_receipt_sha256"], value["old_state_proof_sha256"] = prepareDigest, proofDigest
+		case "committed":
+			value["serving_authority_sha256"] = candidateDigest
+			value["prepare_receipt_sha256"], value["old_state_proof_sha256"] = prepareDigest, proofDigest
+			value["commit_receipt_sha256"] = commitDigest
+		case "recovery_hold":
+			value["transition_id"], value["serving_authority_sha256"] = "", ""
+			value["old_authority_sha256"], value["candidate_authority_sha256"] = "", ""
+		}
+		_ = json.NewEncoder(writer).Encode(value)
+	}))
+	defer server.Close()
+	reader := lectureReaderConfig{
+		AppService: "web-r", ReaderInstance: "web-r-test-1",
+		InventoryEndpoint: server.URL, BearerToken: testReaderBearer,
+	}
+	for _, want := range []string{"steady", "preparing", "prepared", "committing", "committed", "recovery_hold"} {
+		phase = want
+		got, err := discoverPublicationTransitionReader(context.Background(), reader, inventoryNonce)
+		if err != nil {
+			t.Fatalf("phase %s: %v", want, err)
+		}
+		if got.Phase != want || got.AdmissionOpen != (want == "steady") {
+			t.Fatalf("phase %s inventory=%+v", want, got)
+		}
 	}
 }
 
@@ -169,15 +225,15 @@ func TestPublicationTransitionPrepareCommitFinalizeExactFlow(t *testing.T) {
 		InventoryEndpoint: server.URL + "/internal/book-publication/drain",
 		RefreshEndpoint:   server.URL + lectureReaderRefreshPath, BearerToken: testReaderBearer,
 	}
-	inventory, err := discoverPublicationTransitionReader(t.Context(), reader, inventoryNonce)
+	inventory, err := discoverPublicationTransitionReader(context.Background(), reader, inventoryNonce)
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := preparePublicationTransitionReader(t.Context(), inventory, transitionID, oldAuthority, candidate)
+	prepared, err := preparePublicationTransitionReader(context.Background(), inventory, transitionID, oldAuthority, candidate)
 	if err != nil {
 		t.Fatal(err)
 	}
-	committed, err := commitPublicationTransitionReader(t.Context(), prepared, candidate)
+	committed, err := commitPublicationTransitionReader(context.Background(), prepared, candidate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +244,7 @@ func TestPublicationTransitionPrepareCommitFinalizeExactFlow(t *testing.T) {
 		ReaderInventorySHA256: strings.Repeat("d", 64), ReaderReceiptsSHA256: strings.Repeat("e", 64),
 		FinalProofSHA256: strings.Repeat("f", 64),
 	}
-	if _, err := finalizePublicationTransitionReader(t.Context(), committed, release); err != nil {
+	if _, err := finalizePublicationTransitionReader(context.Background(), committed, release); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -197,8 +253,12 @@ func TestPublicationTransitionAbortRequiresPreparedProof(t *testing.T) {
 	transitionID := stablePublicationTransitionUUID("transition", testActivationUUID)
 	oldDigest := strings.Repeat("a", 64)
 	oldProof := strings.Repeat("b", 64)
+	expectedRequestProof := oldProof
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		value := decodeTransitionRequest(t, request)
+		if got := asString(value["old_state_proof_sha256"]); got != expectedRequestProof {
+			t.Errorf("abort request proof=%q, want %q", got, expectedRequestProof)
+		}
 		now := time.Now().UTC()
 		receipt := hashedTransitionReceipt(t, map[string]any{
 			"format": publicationTransitionAbortReceipt, "app_service": "web-r", "domain": "lecture",
@@ -219,11 +279,17 @@ func TestPublicationTransitionAbortRequiresPreparedProof(t *testing.T) {
 		InventoryNonce: testRefreshNonce, Phase: "prepared", TransitionID: transitionID,
 		OldAuthoritySHA256: oldDigest, OldStateProofSHA256: oldProof,
 	}
-	if _, err := abortPublicationTransitionReader(t.Context(), inventory); err != nil {
+	if _, err := abortPublicationTransitionReader(context.Background(), inventory); err != nil {
 		t.Fatal(err)
 	}
+	inventory.Phase = "preparing"
+	inventory.OldStateProofSHA256 = ""
+	expectedRequestProof = ""
+	if _, err := abortPublicationTransitionReader(context.Background(), inventory); err != nil {
+		t.Fatalf("preparing recovery abort: %v", err)
+	}
 	inventory.Phase = "committed"
-	if _, err := abortPublicationTransitionReader(t.Context(), inventory); err == nil {
+	if _, err := abortPublicationTransitionReader(context.Background(), inventory); err == nil {
 		t.Fatal("post-COMMIT abort was accepted")
 	}
 }

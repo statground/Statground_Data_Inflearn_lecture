@@ -315,7 +315,8 @@ func discoverPublicationTransitionReader(ctx context.Context, reader lectureRead
 		return publicationTransitionInventory{}, fmt.Errorf("publication transition inventory identity")
 	}
 	phase := asString(value["phase"])
-	if phase != "steady" && phase != "prepared" && phase != "committed" {
+	if phase != "steady" && phase != "preparing" && phase != "prepared" && phase != "committing" &&
+		phase != "committed" && phase != "recovery_hold" {
 		return publicationTransitionInventory{}, fmt.Errorf("publication transition inventory phase")
 	}
 	admissionOpen, ok := value["admission_open"].(bool)
@@ -341,6 +342,19 @@ func discoverPublicationTransitionReader(ctx context.Context, reader lectureRead
 		LastFinalizedTransitionID: strings.ToLower(strings.TrimSpace(asString(value["last_finalized_transition_id"]))),
 		LastFinalizeReceiptSHA256: strings.TrimSpace(asString(value["last_finalize_receipt_sha256"])), Inflight: inflight,
 	}
+	if result.LastFinalizedTransitionID == "" {
+		if result.LastFinalizeReceiptSHA256 != "" {
+			return publicationTransitionInventory{}, fmt.Errorf("publication transition finalized residue")
+		}
+	} else if !isCanonicalUUID(result.LastFinalizedTransitionID) || !validLowerSHA256(result.LastFinalizeReceiptSHA256) {
+		return publicationTransitionInventory{}, fmt.Errorf("publication transition finalized identity")
+	}
+	if phase == "recovery_hold" {
+		// A corrupt or unwritable durable ledger can have no trustworthy active
+		// identity. Preserve the fail-closed phase on the wire so reconciliation
+		// can report an operator-actionable error without interpreting residue.
+		return result, nil
+	}
 	if phase == "steady" {
 		if result.TransitionID != "" || result.OldAuthoritySHA256 != "" || result.CandidateAuthoritySHA256 != "" ||
 			result.PrepareReceiptSHA256 != "" || result.CommitReceiptSHA256 != "" || result.OldStateProofSHA256 != "" {
@@ -349,15 +363,33 @@ func discoverPublicationTransitionReader(ctx context.Context, reader lectureRead
 		if result.ServingAuthoritySHA256 != "" && !validLowerSHA256(result.ServingAuthoritySHA256) {
 			return publicationTransitionInventory{}, fmt.Errorf("publication transition serving digest")
 		}
-		if result.LastFinalizedTransitionID != "" && (!isCanonicalUUID(result.LastFinalizedTransitionID) || !validLowerSHA256(result.LastFinalizeReceiptSHA256)) {
-			return publicationTransitionInventory{}, fmt.Errorf("publication transition finalized identity")
-		}
 		return result, nil
 	}
 	if !isCanonicalUUID(result.TransitionID) || !validLowerSHA256(result.OldAuthoritySHA256) ||
-		!validLowerSHA256(result.CandidateAuthoritySHA256) || !validLowerSHA256(result.PrepareReceiptSHA256) ||
-		!validLowerSHA256(result.OldStateProofSHA256) || (phase == "committed" && !validLowerSHA256(result.CommitReceiptSHA256)) {
+		!validLowerSHA256(result.CandidateAuthoritySHA256) {
 		return publicationTransitionInventory{}, fmt.Errorf("publication transition pending identity")
+	}
+	switch phase {
+	case "preparing":
+		if result.ServingAuthoritySHA256 != result.OldAuthoritySHA256 || result.PrepareReceiptSHA256 != "" ||
+			result.CommitReceiptSHA256 != "" || result.OldStateProofSHA256 != "" {
+			return publicationTransitionInventory{}, fmt.Errorf("publication transition preparing evidence")
+		}
+	case "prepared":
+		if result.ServingAuthoritySHA256 != result.OldAuthoritySHA256 || !validLowerSHA256(result.PrepareReceiptSHA256) ||
+			!validLowerSHA256(result.OldStateProofSHA256) || result.CommitReceiptSHA256 != "" {
+			return publicationTransitionInventory{}, fmt.Errorf("publication transition prepared evidence")
+		}
+	case "committing":
+		if result.ServingAuthoritySHA256 != result.CandidateAuthoritySHA256 || !validLowerSHA256(result.PrepareReceiptSHA256) ||
+			!validLowerSHA256(result.OldStateProofSHA256) || result.CommitReceiptSHA256 != "" {
+			return publicationTransitionInventory{}, fmt.Errorf("publication transition committing evidence")
+		}
+	case "committed":
+		if result.ServingAuthoritySHA256 != result.CandidateAuthoritySHA256 || !validLowerSHA256(result.PrepareReceiptSHA256) ||
+			!validLowerSHA256(result.OldStateProofSHA256) || !validLowerSHA256(result.CommitReceiptSHA256) {
+			return publicationTransitionInventory{}, fmt.Errorf("publication transition committed evidence")
+		}
 	}
 	return result, nil
 }
@@ -552,8 +584,10 @@ func finalizePublicationTransitionReader(ctx context.Context, committed publicat
 }
 
 func abortPublicationTransitionReader(ctx context.Context, inventory publicationTransitionInventory) (string, error) {
-	if inventory.Phase != "prepared" || !isCanonicalUUID(inventory.TransitionID) ||
-		!validLowerSHA256(inventory.OldAuthoritySHA256) || !validLowerSHA256(inventory.OldStateProofSHA256) {
+	if (inventory.Phase != "preparing" && inventory.Phase != "prepared") || !isCanonicalUUID(inventory.TransitionID) ||
+		!validLowerSHA256(inventory.OldAuthoritySHA256) ||
+		(inventory.Phase == "prepared" && !validLowerSHA256(inventory.OldStateProofSHA256)) ||
+		(inventory.Phase == "preparing" && inventory.OldStateProofSHA256 != "") {
 		return "", fmt.Errorf("publication transition cannot abort")
 	}
 	reader := inventory.Reader
@@ -583,12 +617,16 @@ func abortPublicationTransitionReader(ctx context.Context, inventory publication
 		"domain": publicationTransitionDomain, "reader_instance": reader.Config.ReaderInstance,
 		"reader_epoch_uuid": reader.EpochUUID, "inventory_nonce": inventory.InventoryNonce,
 		"transition_id": inventory.TransitionID, "abort_nonce": abortNonce, "phase": "steady",
-		"old_authority_sha256": inventory.OldAuthoritySHA256, "old_state_proof_sha256": inventory.OldStateProofSHA256,
+		"old_authority_sha256": inventory.OldAuthoritySHA256,
 	}
 	for key, expected := range expectedStrings {
 		if asString(value[key]) != expected {
 			return "", fmt.Errorf("publication transition abort identity")
 		}
+	}
+	proofDigest := strings.TrimSpace(asString(value["old_state_proof_sha256"]))
+	if !validLowerSHA256(proofDigest) || (inventory.Phase == "prepared" && proofDigest != inventory.OldStateProofSHA256) {
+		return "", fmt.Errorf("publication transition abort proof")
 	}
 	receiptDigest := strings.TrimSpace(asString(value["receipt_sha256"]))
 	calculated, hashErr := canonicalReceiptSHA256(value)
@@ -1156,6 +1194,9 @@ func (s *Service) reconcilePublicationTransitionReaders(ctx context.Context, top
 		if err != nil {
 			return stateError("degraded", "public_reader_transition_reconcile", "reader_inventory_failed")
 		}
+		if state.Phase == "recovery_hold" {
+			return stateError("degraded", "public_reader_transition_reconcile", "reader_ledger_recovery_hold")
+		}
 		probed = append(probed, state)
 		if state.Phase != "steady" {
 			pending++
@@ -1178,6 +1219,9 @@ func (s *Service) reconcilePublicationTransitionReaders(ctx context.Context, top
 		state, err := discoverPublicationTransitionReader(ctx, probe.Reader.Config, stableNonce)
 		if err != nil {
 			return stateError("degraded", "public_reader_transition_reconcile", "stable_reader_inventory_failed")
+		}
+		if state.Phase == "recovery_hold" {
+			return stateError("degraded", "public_reader_transition_reconcile", "reader_ledger_recovery_hold")
 		}
 		states = append(states, state)
 	}
@@ -1236,7 +1280,7 @@ func (s *Service) reconcilePublicationTransitionReaders(ctx context.Context, top
 			if state.Phase == "steady" {
 				continue
 			}
-			if state.Phase != "prepared" {
+			if state.Phase != "preparing" && state.Phase != "prepared" {
 				return stateError("degraded", "public_reader_transition_reconcile", "committed_transition_not_current")
 			}
 			surface := lectureSurfaceForService(state.Reader.Config.AppService)
@@ -1247,20 +1291,31 @@ func (s *Service) reconcilePublicationTransitionReaders(ctx context.Context, top
 			if state.OldAuthoritySHA256 != oldDigest || state.ServingAuthoritySHA256 != oldDigest {
 				return stateError("degraded", "public_reader_transition_reconcile", "old_authority_changed_before_abort")
 			}
+		}
+		// Validate the complete pending set before changing any reader. A crash
+		// between the durable preparing fence and its proof has no receipt to
+		// replay, so v2 ABORT asks the reader to re-prove its durable old authority
+		// and reopen. Prepared readers retain the stricter exact-proof ABORT.
+		for _, state := range states {
+			if state.Phase == "steady" {
+				continue
+			}
 			if _, err := abortPublicationTransitionReader(ctx, state); err != nil {
 				return stateError("degraded", "public_reader_transition_reconcile", "reader_abort_resume_failed")
 			}
 		}
 		return nil
 	}
+	for _, state := range states {
+		if state.Phase == "steady" {
+			return stateError("degraded", "public_reader_transition_reconcile", "unreleased_steady_reader")
+		}
+	}
 	candidateSourceAuthorityRevision, err := s.resolveTransitionCandidateSourceAuthority(ctx, currentActivation, states)
 	if err != nil {
 		return err
 	}
 	for _, state := range states {
-		if state.Phase == "steady" {
-			return stateError("degraded", "public_reader_transition_reconcile", "unreleased_steady_reader")
-		}
 		candidate := transitionAuthorityForReader(currentActivation, candidateSourceAuthorityRevision, state.Reader.Config.AppService)
 		candidateDigest, _ := canonicalJSONSHA256(candidate.jsonValue())
 		if candidateDigest != state.CandidateAuthoritySHA256 {
