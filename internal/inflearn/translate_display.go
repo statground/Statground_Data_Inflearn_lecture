@@ -113,16 +113,20 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 	if err := s.ValidateClickHouseIngest(ctx); err != nil {
 		return err
 	}
-	remaining := s.Cfg.TranslationMaxPerRun
+	// Rotate the first target every scheduled window so a bounded run does not
+	// continually spend its entire budget on the first few languages.
+	runAt := time.Now()
+	targets := rotatedTranslationTargets(s.Cfg.TranslationTargetLanguages, runAt)
+	displayRemaining, curriculumRemaining := splitTranslationBudget(s.Cfg.TranslationMaxPerRun, runAt)
 	totalInserted := 0
 	totalCurriculumInserted := 0
-	for _, target := range s.Cfg.TranslationTargetLanguages {
-		if remaining <= 0 {
+	for _, target := range targets {
+		if displayRemaining <= 0 {
 			break
 		}
 		limit := s.Cfg.TranslationBatchSize
-		if limit > remaining {
-			limit = remaining
+		if limit > displayRemaining {
+			limit = displayRemaining
 		}
 		candidates, err := s.pickDisplayTranslationCandidates(ctx, target, limit)
 		if err != nil {
@@ -141,7 +145,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 			sourceHash := candidate.SourceHash()
 			if s.Cfg.TranslationDryRun {
 				fmt.Printf("[translate:dry-run] target=%s course_id=%d source_locale=%s source_hash=%d title=%q\n", target, candidate.CourseID, candidate.SourceLocale, sourceHash, candidate.Title)
-				remaining--
+				displayRemaining--
 				continue
 			}
 			translated, err := s.translateDisplayCandidate(ctx, target, candidate)
@@ -168,7 +172,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 				"generation_error":    "",
 				"ingested_at":         now,
 			})
-			remaining--
+			displayRemaining--
 		}
 		if len(rows) > 0 {
 			if err := s.insertDisplayTranslations(ctx, rows); err != nil {
@@ -176,15 +180,18 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 			}
 			totalInserted += len(rows)
 		}
-		fmt.Printf("[translate] target=%s inserted=%d remaining=%d\n", target, len(rows), remaining)
+		fmt.Printf("[translate] target=%s inserted=%d remaining=%d\n", target, len(rows), displayRemaining)
 	}
-	for _, target := range s.Cfg.TranslationTargetLanguages {
-		if remaining <= 0 {
+	// Unused course budget can still translate curriculum, while a busy course
+	// backlog cannot starve curriculum indefinitely.
+	curriculumRemaining += displayRemaining
+	for _, target := range targets {
+		if curriculumRemaining <= 0 {
 			break
 		}
 		limit := s.Cfg.TranslationBatchSize
-		if limit > remaining {
-			limit = remaining
+		if limit > curriculumRemaining {
+			limit = curriculumRemaining
 		}
 		candidates, err := s.pickDisplayCurriculumTranslationCandidates(ctx, target, limit)
 		if err != nil {
@@ -203,7 +210,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 			sourceHash := candidate.SourceHash()
 			if s.Cfg.TranslationDryRun {
 				fmt.Printf("[translate-curriculum:dry-run] target=%s course_id=%d section_id=%d unit_id=%d source_locale=%s source_hash=%d title=%q\n", target, candidate.CourseID, candidate.SectionID, candidate.UnitID, candidate.SourceLocale, sourceHash, candidate.UnitTitle)
-				remaining--
+				curriculumRemaining--
 				continue
 			}
 			translated, err := s.translateCurriculumCandidate(ctx, target, candidate)
@@ -228,7 +235,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 				"generation_error":  "",
 				"ingested_at":       now,
 			})
-			remaining--
+			curriculumRemaining--
 		}
 		if len(rows) > 0 {
 			if err := s.insertCurriculumTranslations(ctx, rows); err != nil {
@@ -236,10 +243,39 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 			}
 			totalCurriculumInserted += len(rows)
 		}
-		fmt.Printf("[translate-curriculum] target=%s inserted=%d remaining=%d\n", target, len(rows), remaining)
+		fmt.Printf("[translate-curriculum] target=%s inserted=%d remaining=%d\n", target, len(rows), curriculumRemaining)
 	}
 	fmt.Printf("[done] display_translations_inserted=%d curriculum_translations_inserted=%d\n", totalInserted, totalCurriculumInserted)
 	return nil
+}
+
+func rotatedTranslationTargets(targets []string, at time.Time) []string {
+	if len(targets) == 0 {
+		return nil
+	}
+	start := int((at.UTC().Unix() / int64(12*time.Hour/time.Second)) % int64(len(targets)))
+	if start < 0 {
+		start += len(targets)
+	}
+	rotated := make([]string, 0, len(targets))
+	rotated = append(rotated, targets[start:]...)
+	rotated = append(rotated, targets[:start]...)
+	return rotated
+}
+
+func splitTranslationBudget(max int, at time.Time) (int, int) {
+	if max <= 0 {
+		return 0, 0
+	}
+	display, curriculum := max/2, max/2
+	if max%2 != 0 {
+		if (at.UTC().Unix()/int64(12*time.Hour/time.Second))%2 == 0 {
+			display++
+		} else {
+			curriculum++
+		}
+	}
+	return display, curriculum
 }
 
 func (c displayTranslationCandidate) SourceHash() uint64 {
@@ -840,6 +876,8 @@ func localizeTranslationLevel(target, raw string) string {
 
 func inferTranslationProvider() string {
 	switch {
+	case strings.TrimSpace(osEnv("OPENAI_API_KEY")) != "":
+		return "openai"
 	case strings.TrimSpace(osEnv("GH_MODELS_API_KEY")) != "" || strings.TrimSpace(osEnv("GITHUB_MODELS_API_KEY")) != "":
 		return "github_models"
 	case strings.TrimSpace(osEnv("OPENROUTER_API_KEY")) != "":
@@ -872,6 +910,8 @@ func defaultTranslationModel(provider string) string {
 	switch provider {
 	case "github_models":
 		return "openai/gpt-4.1"
+	case "openrouter":
+		return "openai/gpt-4.1-mini"
 	case "groq":
 		return "llama-3.1-8b-instant"
 	case "cerebras":
