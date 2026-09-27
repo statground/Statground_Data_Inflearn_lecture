@@ -76,8 +76,8 @@ func TestTranslationCandidatesRetryIncompleteCurrentSourceOnly(t *testing.T) {
 		t.Fatalf("got %d candidate queries, want 2", len(queries))
 	}
 	for index, required := range [][]string{
-		{"e.existing_source_hash = c.source_hash", "e.translated.1 = ''", "c.description != '' AND e.translated.2 = ''"},
-		{"e.existing_source_hash = c.source_hash", "c.section_title != '' AND e.translated.1 = ''", "e.translated.2 = ''"},
+		{"e.existing_source_hash = c.source_hash", "tupleElement(e.translated, 1) = ''", "c.description != '' AND tupleElement(e.translated, 2) = ''"},
+		{"e.existing_source_hash = c.source_hash", "c.section_title != '' AND tupleElement(e.translated, 1) = ''", "tupleElement(e.translated, 2) = ''"},
 	} {
 		for _, fragment := range required {
 			if !strings.Contains(queries[index], fragment) {

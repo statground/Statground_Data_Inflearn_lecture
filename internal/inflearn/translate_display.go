@@ -415,12 +415,12 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
          AND toString(e.existing_source_locale) = toString(c.locale)
          AND e.existing_source_hash = c.source_hash
         WHERE e.existing_course_id = 0
-           OR e.translated.1 = ''
-           OR (c.description != '' AND e.translated.2 = '')
-           OR (c.category_main_title != '' AND e.translated.3 = '')
-           OR (c.category_sub_title != '' AND e.translated.4 = '')
-           OR (c.level_code != '' AND e.translated.5 = '')
-           OR (c.keywords != '' AND e.translated.6 = '')
+           OR tupleElement(e.translated, 1) = ''
+           OR (c.description != '' AND tupleElement(e.translated, 2) = '')
+           OR (c.category_main_title != '' AND tupleElement(e.translated, 3) = '')
+           OR (c.category_sub_title != '' AND tupleElement(e.translated, 4) = '')
+           OR (c.level_code != '' AND tupleElement(e.translated, 5) = '')
+           OR (c.keywords != '' AND tupleElement(e.translated, 6) = '')
         ORDER BY c.order_latest_activity_at DESC, c.order_max_fetched_at DESC, c.course_id DESC
         LIMIT %d
         SETTINGS max_execution_time = 20, timeout_overflow_mode = 'break', max_threads = 4
@@ -632,8 +632,8 @@ func (s *Service) pickDisplayCurriculumTranslationCandidates(ctx context.Context
          AND toString(e.existing_source_locale) = toString(c.locale)
          AND e.existing_source_hash = c.source_hash
         WHERE e.existing_course_id = 0
-           OR (c.section_title != '' AND e.translated.1 = '')
-           OR e.translated.2 = ''
+           OR (c.section_title != '' AND tupleElement(e.translated, 1) = '')
+           OR tupleElement(e.translated, 2) = ''
         ORDER BY c.order_max_fetched_at DESC, c.course_id DESC, c.section_id ASC, c.unit_id ASC
         LIMIT %d
         SETTINGS max_execution_time = 20, timeout_overflow_mode = 'break', max_threads = 4
