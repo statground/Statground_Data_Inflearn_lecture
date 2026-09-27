@@ -398,7 +398,9 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
         existing AS (
           SELECT course_id AS existing_course_id,
                  source_locale AS existing_source_locale,
-                 source_hash AS existing_source_hash
+                 source_hash AS existing_source_hash,
+                 argMax(tuple(title, description, category_main_title,
+                              category_sub_title, level_code, keywords), translated_at) AS translated
           FROM %s
           WHERE toString(target_language) = %s
             AND toString(generation_status) = 'success'
@@ -413,6 +415,12 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
          AND toString(e.existing_source_locale) = toString(c.locale)
          AND e.existing_source_hash = c.source_hash
         WHERE e.existing_course_id = 0
+           OR tupleElement(e.translated, 1) = ''
+           OR (c.description != '' AND tupleElement(e.translated, 2) = '')
+           OR (c.category_main_title != '' AND tupleElement(e.translated, 3) = '')
+           OR (c.category_sub_title != '' AND tupleElement(e.translated, 4) = '')
+           OR (c.level_code != '' AND tupleElement(e.translated, 5) = '')
+           OR (c.keywords != '' AND tupleElement(e.translated, 6) = '')
         ORDER BY c.order_latest_activity_at DESC, c.order_max_fetched_at DESC, c.course_id DESC
         LIMIT %d
         SETTINGS max_execution_time = 20, timeout_overflow_mode = 'break', max_threads = 4
@@ -503,8 +511,17 @@ func (s *Service) translateDisplayCandidate(ctx context.Context, target string, 
 	if err := json.Unmarshal([]byte(content), &out); err != nil {
 		return displayTranslationResult{}, err
 	}
-	if strings.TrimSpace(out.Title) == "" {
-		return displayTranslationResult{}, fmt.Errorf("translation title is empty")
+	for _, field := range []struct{ name, source, translated string }{
+		{"title", candidate.Title, out.Title},
+		{"description", candidate.Description, out.Description},
+		{"category_main_title", candidate.CategoryMainTitle, out.CategoryMainTitle},
+		{"category_sub_title", candidate.CategorySubTitle, out.CategorySubTitle},
+		{"level_code", candidate.LevelCode, out.LevelCode},
+		{"keywords", candidate.Keywords, out.Keywords},
+	} {
+		if strings.TrimSpace(field.source) != "" && strings.TrimSpace(field.translated) == "" {
+			return displayTranslationResult{}, fmt.Errorf("translation %s is empty", field.name)
+		}
 	}
 	return out, nil
 }
@@ -597,7 +614,8 @@ func (s *Service) pickDisplayCurriculumTranslationCandidates(ctx context.Context
                  section_id AS existing_section_id,
                  unit_id AS existing_unit_id,
                  source_locale AS existing_source_locale,
-                 source_hash AS existing_source_hash
+                 source_hash AS existing_source_hash,
+                 argMax(tuple(section_title, unit_title), translated_at) AS translated
           FROM %s
           WHERE toString(target_language) = %s
             AND toString(generation_status) = 'success'
@@ -614,6 +632,8 @@ func (s *Service) pickDisplayCurriculumTranslationCandidates(ctx context.Context
          AND toString(e.existing_source_locale) = toString(c.locale)
          AND e.existing_source_hash = c.source_hash
         WHERE e.existing_course_id = 0
+           OR (c.section_title != '' AND tupleElement(e.translated, 1) = '')
+           OR tupleElement(e.translated, 2) = ''
         ORDER BY c.order_max_fetched_at DESC, c.course_id DESC, c.section_id ASC, c.unit_id ASC
         LIMIT %d
         SETTINGS max_execution_time = 20, timeout_overflow_mode = 'break', max_threads = 4
@@ -698,8 +718,8 @@ func (s *Service) translateCurriculumCandidate(ctx context.Context, target strin
 	if strings.TrimSpace(out.UnitTitle) == "" {
 		return displayCurriculumTranslationResult{}, fmt.Errorf("translation unit title is empty")
 	}
-	if strings.TrimSpace(out.SectionTitle) == "" {
-		out.SectionTitle = candidate.SectionTitle
+	if strings.TrimSpace(candidate.SectionTitle) != "" && strings.TrimSpace(out.SectionTitle) == "" {
+		return displayCurriculumTranslationResult{}, fmt.Errorf("translation section title is empty")
 	}
 	return out, nil
 }

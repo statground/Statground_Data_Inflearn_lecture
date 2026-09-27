@@ -1,10 +1,91 @@
 package inflearn
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+func translationTestService(t *testing.T, answer any) *Service {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		content, _ := json.Marshal(answer)
+		response, _ := json.Marshal(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": string(content)}}},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(response)
+	}))
+	t.Cleanup(server.Close)
+	return &Service{
+		Cfg:        Config{TranslationEndpoint: server.URL, TranslationModel: "test", TranslationAPIKey: "test"},
+		HTTPClient: server.Client(),
+	}
+}
+
+func TestDisplayTranslationRejectsMissingNonemptySourceFields(t *testing.T) {
+	candidate := displayTranslationCandidate{Title: "원문", Description: "설명"}
+	svc := translationTestService(t, displayTranslationResult{Title: "Translated"})
+	_, err := svc.translateDisplayCandidate(context.Background(), "en", candidate)
+	if err == nil || !stringsContains(err.Error(), "description") {
+		t.Fatalf("missing translated description must not be marked success: %v", err)
+	}
+}
+
+func TestDisplayTranslationAllowsAbsentOptionalSourceFields(t *testing.T) {
+	candidate := displayTranslationCandidate{Title: "원문"}
+	svc := translationTestService(t, displayTranslationResult{Title: "Translated"})
+	got, err := svc.translateDisplayCandidate(context.Background(), "en", candidate)
+	if err != nil || got.Title != "Translated" {
+		t.Fatalf("translation of a title-only source must remain valid: got=%+v err=%v", got, err)
+	}
+}
+
+func TestCurriculumTranslationRejectsMissingSectionTitle(t *testing.T) {
+	candidate := displayCurriculumTranslationCandidate{SectionTitle: "목차", UnitTitle: "강의"}
+	svc := translationTestService(t, displayCurriculumTranslationResult{UnitTitle: "Lecture"})
+	_, err := svc.translateCurriculumCandidate(context.Background(), "en", candidate)
+	if err == nil || !stringsContains(err.Error(), "section title") {
+		t.Fatalf("missing translated section title must not be replaced with the source: %v", err)
+	}
+}
+
+func TestTranslationCandidatesRetryIncompleteCurrentSourceOnly(t *testing.T) {
+	queries := []string{}
+	svc := &Service{
+		Cfg: Config{CHHost: "localhost", CHPort: 8123, CHServiceDatabase: "Data_Lecture_Inflearn_Service"},
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			body, _ := io.ReadAll(request.Body)
+			queries = append(queries, string(body))
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data":[]}`)), Header: make(http.Header)}, nil
+		})},
+	}
+	if _, err := svc.pickDisplayTranslationCandidates(context.Background(), "en", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.pickDisplayCurriculumTranslationCandidates(context.Background(), "en", 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 2 {
+		t.Fatalf("got %d candidate queries, want 2", len(queries))
+	}
+	for index, required := range [][]string{
+		{"e.existing_source_hash = c.source_hash", "tupleElement(e.translated, 1) = ''", "c.description != '' AND tupleElement(e.translated, 2) = ''"},
+		{"e.existing_source_hash = c.source_hash", "c.section_title != '' AND tupleElement(e.translated, 1) = ''", "tupleElement(e.translated, 2) = ''"},
+	} {
+		for _, fragment := range required {
+			if !strings.Contains(queries[index], fragment) {
+				t.Errorf("candidate query %d missing %q", index, fragment)
+			}
+		}
+	}
+}
 
 func TestRotatedTranslationTargets(t *testing.T) {
 	targets := []string{"ko", "en", "ja"}
