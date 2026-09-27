@@ -142,6 +142,7 @@ jobs:
         run: python3 scripts/clickhouse_pressure_gate.py
 
       - name: Collect new Inflearn courses into ClickHouse
+        id: collect_new
         env:
           STATE_BACKEND: clickhouse
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
@@ -185,6 +186,7 @@ jobs:
           go run -mod=mod ./cmd/inflearn-collect-new
 
       - name: Update existing Inflearn courses in ClickHouse
+        id: update_existing
         env:
           STATE_BACKEND: clickhouse
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
@@ -258,6 +260,7 @@ jobs:
           cat "$VERIFY_LOG"
 
       - name: Translate missing display metadata
+        id: translate_display
         env:
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
           CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
@@ -291,11 +294,13 @@ jobs:
         run: |
           if [ -z "$CH_HOST" ] || [ -z "$CH_USER" ]; then
             echo "ClickHouse secrets are not configured; skipping translation run."
+            echo "translation_status=blocked_clickhouse_config" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ -z "$INFLEARN_TRANSLATION_API_KEY" ]; then
             echo "::warning title=Inflearn translation unavailable::No translation provider key is configured; collection succeeded but course and curriculum translations were not refreshed."
             echo '{"schema":"statground.inflearn.workflow_state.v1","status":"blocked","phase":"display_translation","reason":"api_key_missing"}'
+            echo "translation_status=blocked_api_key" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           export INFLEARN_TRANSLATION_TARGET_LANGS="${INFLEARN_TRANSLATION_TARGET_LANGS_INPUT:-ko,en,ja,zh-Hans,zh-Hant,es,fr,de,pt-BR,ru,id,vi,th,ms,fil,hi,ar,it,nl,pl,sv,tr,uk}"
@@ -311,6 +316,7 @@ jobs:
             exit 1
           fi
           cat "$TRANSLATION_LOG"
+          echo "translation_status=completed" >> "$GITHUB_OUTPUT"
 
       - name: Gate public lecture refresh on storage pressure
         if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
@@ -369,6 +375,7 @@ jobs:
 
       - name: Verify public lecture freshness and refresh health
         if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
+        id: verify_public_freshness
         env:
           STATE_BACKEND: clickhouse
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
@@ -389,3 +396,14 @@ jobs:
       - name: Report inactive publication v2 without claiming freshness
         if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED != 'true'
         run: echo '{"schema":"statground.inflearn.publication_activation.v1","status":"inactive","publication_claim":false}'
+
+      - name: Report collection, translation, and public serving separately
+        if: always()
+        env:
+          INFLEARN_COLLECT_OUTCOME: ${{ steps.collect_new.outcome }}
+          INFLEARN_UPDATE_OUTCOME: ${{ steps.update_existing.outcome }}
+          INFLEARN_TRANSLATION_STATUS: ${{ steps.translate_display.outputs.translation_status || steps.translate_display.outcome }}
+          INFLEARN_PUBLICATION_ENABLED: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED || 'false' }}
+          INFLEARN_PUBLICATION_OUTCOME: ${{ steps.refresh_public_lecture_views.outcome }}
+          INFLEARN_FRESHNESS_OUTCOME: ${{ steps.verify_public_freshness.outcome }}
+        run: python3 scripts/inflearn_workflow_status.py
