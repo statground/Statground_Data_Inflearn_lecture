@@ -79,9 +79,14 @@ func TestLoadConfigClickHouseIngestDoesNotRequireKafka(t *testing.T) {
 	if cfg.ReaderRefreshRequired || cfg.PublicationReaderConfig != "" {
 		t.Fatalf("reader refresh rollout must default inactive: required=%v config=%q", cfg.ReaderRefreshRequired, cfg.PublicationReaderConfig)
 	}
-	if cfg.PublicUpdatePriority {
-		t.Fatal("public update priority must default inactive until Phase A exists")
+	if !cfg.PublicUpdatePriority {
+		t.Fatal("public update priority must default active to refresh selected public courses")
 	}
+	t.Setenv("INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED", "false")
+	if disabled, err := LoadConfig(); err != nil || disabled.PublicUpdatePriority {
+		t.Fatalf("public update priority opt-out must remain available: enabled=%v err=%v", disabled.PublicUpdatePriority, err)
+	}
+	t.Setenv("INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED", "")
 	if cfg.PublicationWriterID != "" {
 		t.Fatalf("publication writer ID=%q, want empty while rollout is inactive", cfg.PublicationWriterID)
 	}
@@ -423,7 +428,7 @@ func TestInflearnWorkflowPinsBoundedPreflightRetry(t *testing.T) {
 		"./cmd/inflearn-verify-public-freshness",
 		"id: refresh_public_lecture_views",
 		"INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED || 'false' }}",
-		"INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED: ${{ vars.INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED || 'false' }}",
+		"INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED: ${{ vars.INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED || 'true' }}",
 		"INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED must be exactly true or false",
 		"INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED must be exactly true or false",
 		"PUBLIC_REFRESH_RUN_UUID: ${{ steps.refresh_public_lecture_views.outputs.publication_run_uuid || 'missing' }}",

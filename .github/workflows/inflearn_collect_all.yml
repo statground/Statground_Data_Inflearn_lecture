@@ -38,7 +38,7 @@ jobs:
     timeout-minutes: 100
     env:
       INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED: ${{ vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED || 'false' }}
-      INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED: ${{ vars.INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED || 'false' }}
+      INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED: ${{ vars.INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED || 'true' }}
       CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
       # Port 50005 is the durable direct S1_R1 endpoint, never the 50006 gateway.
       CLICKHOUSE_DIRECT_ENDPOINT_HOSTNAME: clickhouse-s1-r1

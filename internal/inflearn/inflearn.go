@@ -254,7 +254,7 @@ func LoadConfig() (Config, error) {
 		CHInsertDistributedSync: parseBool(envDefault("CH_INSERT_DISTRIBUTED_SYNC", "true")),
 		CHDirectReplicaFallback: parseBool(envDefault("CH_DIRECT_REPLICA_FALLBACK", "true")),
 		CHDirectOutboxFallback:  parseBool(envDefault("CH_DIRECT_OUTBOX_FALLBACK", "true")),
-		PublicUpdatePriority:    parseBool(envDefault("INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED", "false")),
+		PublicUpdatePriority:    parseBool(envDefault("INFLEARN_PUBLIC_UPDATE_PRIORITY_ENABLED", "true")),
 		PublicationV2Enabled:    parseBool(envDefault("INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED", "false")),
 		PublicationWriterID:     strings.TrimSpace(envDefault("INFLEARN_LECTURE_PUBLISHER_WRITER_ID", "")),
 		PublicationCHUser:       strings.TrimSpace(envDefault("INFLEARN_LECTURE_PUBLISHER_CH_USER", "")),
