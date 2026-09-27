@@ -342,13 +342,6 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
           WHERE %s
           GROUP BY native_course_id
         ),
-        existing AS (
-          SELECT course_id AS existing_course_id
-          FROM %s
-          WHERE toString(target_language) = %s
-            AND toString(generation_status) = 'success'
-          GROUP BY existing_course_id
-        ),
         scored AS (
           SELECT
             c.course_id AS course_id,
@@ -368,8 +361,7 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
             %s AS source_rank
           FROM latest AS c
           LEFT JOIN native_target AS n ON n.native_course_id = c.course_id
-          LEFT JOIN existing AS e ON e.existing_course_id = toUInt32(c.course_id)
-          WHERE n.native_course_id = 0 AND e.existing_course_id = 0
+          WHERE n.native_course_id = 0
         ),
         per_course AS (
           SELECT
@@ -382,8 +374,9 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
             max(max_fetched_at) AS order_max_fetched_at
           FROM scored
           GROUP BY course_id
-        )
-        SELECT
+        ),
+        candidates AS (
+          SELECT
           course_id,
           tupleElement(best, 1) AS locale,
           tupleElement(best, 2) AS title,
@@ -391,12 +384,39 @@ func (s *Service) pickDisplayTranslationCandidates(ctx context.Context, target s
           tupleElement(best, 4) AS category_main_title,
           tupleElement(best, 5) AS category_sub_title,
           tupleElement(best, 6) AS level_code,
-          tupleElement(best, 7) AS keywords
-        FROM per_course
-        ORDER BY order_latest_activity_at DESC, order_max_fetched_at DESC, course_id DESC
+          tupleElement(best, 7) AS keywords,
+          reinterpretAsUInt64(substring(SHA256(concat(
+            tupleElement(best, 1), unhex('1F'), tupleElement(best, 2), unhex('1F'),
+            tupleElement(best, 3), unhex('1F'), tupleElement(best, 4), unhex('1F'),
+            tupleElement(best, 5), unhex('1F'), tupleElement(best, 6), unhex('1F'),
+            tupleElement(best, 7)
+          )), 1, 8)) AS source_hash,
+          order_latest_activity_at,
+          order_max_fetched_at
+          FROM per_course
+        ),
+        existing AS (
+          SELECT course_id AS existing_course_id,
+                 source_locale AS existing_source_locale,
+                 source_hash AS existing_source_hash
+          FROM %s
+          WHERE toString(target_language) = %s
+            AND toString(generation_status) = 'success'
+            AND prompt_hash = toUInt64('%d')
+          GROUP BY existing_course_id, existing_source_locale, existing_source_hash
+        )
+        SELECT c.course_id, c.locale, c.title, c.description,
+               c.category_main_title, c.category_sub_title, c.level_code, c.keywords
+        FROM candidates AS c
+        LEFT JOIN existing AS e
+          ON e.existing_course_id = toUInt32(c.course_id)
+         AND toString(e.existing_source_locale) = toString(c.locale)
+         AND e.existing_source_hash = c.source_hash
+        WHERE e.existing_course_id = 0
+        ORDER BY c.order_latest_activity_at DESC, c.order_max_fetched_at DESC, c.course_id DESC
         LIMIT %d
         SETTINGS max_execution_time = 20, timeout_overflow_mode = 'break', max_threads = 4
-    `, chIdent(s.Cfg.CHServiceDatabase), courseIDFilter, nativePredicate, chTablePath(s.Cfg.TranslationTable), QuoteSQLString(target), sourcePreference, limit)
+    `, chIdent(s.Cfg.CHServiceDatabase), courseIDFilter, nativePredicate, sourcePreference, chTablePath(s.Cfg.TranslationTable), QuoteSQLString(target), H64(translationPromptContract), limit)
 	if parseBool(envDefault("INFLEARN_TRANSLATION_DEBUG_SQL", "0")) {
 		fmt.Printf("[debug_sql] target=%s\n%s\n", target, sql)
 	}
@@ -526,13 +546,6 @@ func (s *Service) pickDisplayCurriculumTranslationCandidates(ctx context.Context
           WHERE %s
           GROUP BY native_course_id, native_section_id, native_unit_id
         ),
-        existing AS (
-          SELECT course_id AS existing_course_id, section_id AS existing_section_id, unit_id AS existing_unit_id
-          FROM %s
-          WHERE toString(target_language) = %s
-            AND toString(generation_status) = 'success'
-          GROUP BY existing_course_id, existing_section_id, existing_unit_id
-        ),
         scored AS (
           SELECT
             c.course_id AS course_id,
@@ -548,11 +561,7 @@ func (s *Service) pickDisplayCurriculumTranslationCandidates(ctx context.Context
             ON n.native_course_id = toUInt32(c.course_id)
            AND n.native_section_id = toUInt32(c.section_id)
            AND n.native_unit_id = toUInt32(c.unit_id)
-          LEFT JOIN existing AS e
-            ON e.existing_course_id = toUInt32(c.course_id)
-           AND e.existing_section_id = toUInt32(c.section_id)
-           AND e.existing_unit_id = toUInt32(c.unit_id)
-          WHERE n.native_course_id = 0 AND e.existing_course_id = 0
+          WHERE n.native_course_id = 0
         ),
         per_unit AS (
           SELECT
@@ -566,19 +575,49 @@ func (s *Service) pickDisplayCurriculumTranslationCandidates(ctx context.Context
             max(max_fetched_at) AS order_max_fetched_at
           FROM scored
           GROUP BY course_id, section_id, unit_id
-        )
-        SELECT
+        ),
+        candidates AS (
+          SELECT
           course_id,
           tupleElement(best, 1) AS locale,
           section_id,
           tupleElement(best, 2) AS section_title,
           unit_id,
-          tupleElement(best, 3) AS unit_title
-        FROM per_unit
-        ORDER BY order_max_fetched_at DESC, course_id DESC, section_id ASC, unit_id ASC
+          tupleElement(best, 3) AS unit_title,
+          reinterpretAsUInt64(substring(SHA256(concat(
+            tupleElement(best, 1), unhex('1F'), toString(section_id), unhex('1F'),
+            tupleElement(best, 2), unhex('1F'), toString(unit_id), unhex('1F'),
+            tupleElement(best, 3)
+          )), 1, 8)) AS source_hash,
+          order_max_fetched_at
+          FROM per_unit
+        ),
+        existing AS (
+          SELECT course_id AS existing_course_id,
+                 section_id AS existing_section_id,
+                 unit_id AS existing_unit_id,
+                 source_locale AS existing_source_locale,
+                 source_hash AS existing_source_hash
+          FROM %s
+          WHERE toString(target_language) = %s
+            AND toString(generation_status) = 'success'
+            AND prompt_hash = toUInt64('%d')
+          GROUP BY existing_course_id, existing_section_id, existing_unit_id,
+                   existing_source_locale, existing_source_hash
+        )
+        SELECT c.course_id, c.locale, c.section_id, c.section_title, c.unit_id, c.unit_title
+        FROM candidates AS c
+        LEFT JOIN existing AS e
+          ON e.existing_course_id = toUInt32(c.course_id)
+         AND e.existing_section_id = toUInt32(c.section_id)
+         AND e.existing_unit_id = toUInt32(c.unit_id)
+         AND toString(e.existing_source_locale) = toString(c.locale)
+         AND e.existing_source_hash = c.source_hash
+        WHERE e.existing_course_id = 0
+        ORDER BY c.order_max_fetched_at DESC, c.course_id DESC, c.section_id ASC, c.unit_id ASC
         LIMIT %d
         SETTINGS max_execution_time = 20, timeout_overflow_mode = 'break', max_threads = 4
-    `, chIdent(s.Cfg.CHServiceDatabase), courseIDFilter, nativePredicate, chTablePathWithDefault(s.Cfg.TranslationCurriculumTable, "Data_Lecture_Inflearn_Service", "inflearn_course_curriculum_display_translation"), QuoteSQLString(target), sourcePreference, limit)
+    `, chIdent(s.Cfg.CHServiceDatabase), courseIDFilter, nativePredicate, sourcePreference, chTablePathWithDefault(s.Cfg.TranslationCurriculumTable, "Data_Lecture_Inflearn_Service", "inflearn_course_curriculum_display_translation"), QuoteSQLString(target), H64(curriculumTranslationPromptContract), limit)
 	rows, err := s.CHQueryRows(ctx, sql)
 	if err != nil {
 		return nil, err
