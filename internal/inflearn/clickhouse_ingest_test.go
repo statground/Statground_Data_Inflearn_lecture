@@ -382,6 +382,31 @@ func TestValidateClickHousePreflightHonorsCanceledContext(t *testing.T) {
 	}
 }
 
+func TestTranslationDryRunPreflightDoesNotReplayOutbox(t *testing.T) {
+	queries := []string{}
+	svc := &Service{
+		Cfg: Config{
+			CHHost: "localhost", CHPort: 8123, CHUser: "test",
+			CHDirectOutboxFallback: true, CHOutboxReplayLimit: 1, TranslationDryRun: true,
+		},
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body, _ := io.ReadAll(req.Body)
+			queries = append(queries, string(body))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"data":[{"ok":1}]}`)),
+				Header:     make(http.Header),
+			}, nil
+		})},
+	}
+	if err := svc.ValidateClickHouseIngest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 1 || !strings.Contains(queries[0], "SELECT 1 AS ok") {
+		t.Fatalf("dry-run preflight issued unexpected queries: %v", queries)
+	}
+}
+
 func TestInflearnWorkflowPinsBoundedPreflightRetry(t *testing.T) {
 	source, err := os.ReadFile("../../.github/workflows/inflearn_collect_all.yml")
 	if err != nil {

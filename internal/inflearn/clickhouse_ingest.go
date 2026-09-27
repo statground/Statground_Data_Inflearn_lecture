@@ -108,7 +108,9 @@ func (s *Service) ValidateClickHouseIngest(ctx context.Context) error {
 		return fmt.Errorf("clickhouse preflight returned an unexpected response")
 	}
 	fmt.Println("[clickhouse] preflight ok mode=direct")
-	if s.Cfg.CHDirectOutboxFallback {
+	// A translation dry run may inspect candidates but must never replay queued
+	// writes, even when the normal ingest configuration enables recovery.
+	if s.Cfg.CHDirectOutboxFallback && !s.Cfg.TranslationDryRun {
 		drained, err := s.drainClickHouseDirectOutbox(ctx)
 		if err != nil {
 			fmt.Printf("[warn] clickhouse direct outbox drain skipped: %s\n", s.sanitizeClickHouseError(err))
