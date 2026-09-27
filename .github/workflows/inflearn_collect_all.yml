@@ -293,15 +293,15 @@ jobs:
           INFLEARN_TRANSLATION_BATCH_SIZE: "12"
         run: |
           if [ -z "$CH_HOST" ] || [ -z "$CH_USER" ]; then
-            echo "ClickHouse secrets are not configured; skipping translation run."
+            echo "::error title=Inflearn translation blocked::ClickHouse connection secrets are missing; display translation was not refreshed."
             echo "translation_status=blocked_clickhouse_config" >> "$GITHUB_OUTPUT"
-            exit 0
+            exit 1
           fi
           if [ -z "$INFLEARN_TRANSLATION_API_KEY" ]; then
-            echo "::warning title=Inflearn translation unavailable::No translation provider key is configured; collection succeeded but course and curriculum translations were not refreshed."
+            echo "::error title=Inflearn translation blocked::No translation provider key is configured; course and curriculum translations were not refreshed."
             echo '{"schema":"statground.inflearn.workflow_state.v1","status":"blocked","phase":"display_translation","reason":"api_key_missing"}'
             echo "translation_status=blocked_api_key" >> "$GITHUB_OUTPUT"
-            exit 0
+            exit 1
           fi
           export INFLEARN_TRANSLATION_TARGET_LANGS="${INFLEARN_TRANSLATION_TARGET_LANGS_INPUT:-ko,en,ja,zh-Hans,zh-Hant,es,fr,de,pt-BR,ru,id,vi,th,ms,fil,hi,ar,it,nl,pl,sv,tr,uk}"
           export INFLEARN_TRANSLATION_MAX_PER_RUN="${INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT:-80}"

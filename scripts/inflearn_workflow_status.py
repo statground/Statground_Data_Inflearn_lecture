@@ -3,6 +3,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
 
@@ -56,6 +57,11 @@ def main():
         with Path(summary_path).open("a", encoding="utf-8") as summary:
             summary.write("\n".join(rows))
 
+    if status["display_translation"] in {"blocked_api_key", "blocked_clickhouse_config"}:
+        print("::error title=Inflearn translation blocked::Required translation configuration is missing; collection remains separate from translation and publication.")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
