@@ -279,8 +279,7 @@ jobs:
           CH_OUTBOX_DATABASE: Data_Lecture_Inflearn_Log
           CH_OUTBOX_TABLE: inflearn_direct_insert_outbox
           CH_OUTBOX_REPLAY_LIMIT: "0"
-          INFLEARN_TRANSLATION_API_KEY: ${{ secrets.INFLEARN_TRANSLATION_API_KEY || secrets.OPENAI_API_KEY || secrets.GH_MODELS_API_KEY || secrets.GITHUB_MODELS_API_KEY || secrets.OPENROUTER_API_KEY || secrets.GROQ_API_KEY || secrets.CEREBRAS_API_KEY }}
-          GH_MODELS_API_KEY: ${{ secrets.GH_MODELS_API_KEY || secrets.GITHUB_MODELS_API_KEY }}
+          INFLEARN_TRANSLATION_API_KEY: ${{ secrets.INFLEARN_TRANSLATION_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -297,7 +296,7 @@ jobs:
             echo "translation_status=blocked_clickhouse_config" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          if [ -z "$INFLEARN_TRANSLATION_API_KEY" ]; then
+          if [ -z "$INFLEARN_TRANSLATION_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$OPENROUTER_API_KEY" ] && [ -z "$GROQ_API_KEY" ] && [ -z "$CEREBRAS_API_KEY" ]; then
             echo "::error title=Inflearn translation blocked::No translation provider key is configured; course and curriculum translations were not refreshed."
             echo '{"schema":"statground.inflearn.workflow_state.v1","status":"blocked","phase":"display_translation","reason":"api_key_missing"}'
             echo "translation_status=blocked_api_key" >> "$GITHUB_OUTPUT"
