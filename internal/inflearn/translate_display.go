@@ -81,7 +81,7 @@ func LoadTranslationConfig() (Config, error) {
 		TranslationCurriculumTable: envDefault("INFLEARN_CURRICULUM_TRANSLATION_TABLE", "Data_Lecture_Inflearn_Service.inflearn_course_curriculum_display_translation"),
 		TranslationProvider:        strings.ToLower(strings.TrimSpace(envDefault("INFLEARN_TRANSLATION_PROVIDER", ""))),
 		TranslationEndpoint:        strings.TrimSpace(envDefault("INFLEARN_TRANSLATION_ENDPOINT", "")),
-		TranslationAPIKey:          envFirst("INFLEARN_TRANSLATION_API_KEY", "OPENAI_API_KEY", "GH_MODELS_API_KEY", "GITHUB_MODELS_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY"),
+		TranslationAPIKey:          envFirst("INFLEARN_TRANSLATION_API_KEY"),
 		TranslationModel:           strings.TrimSpace(envDefault("INFLEARN_TRANSLATION_MODEL", "")),
 		TranslationDryRun:          parseBool(envDefault("INFLEARN_TRANSLATION_DRY_RUN", "0")),
 	}
@@ -91,6 +91,13 @@ func LoadTranslationConfig() (Config, error) {
 	if cfg.TranslationProvider == "" {
 		cfg.TranslationProvider = inferTranslationProvider()
 	}
+	providerKey, err := translationProviderKey(cfg.TranslationProvider)
+	if err != nil {
+		return Config{}, err
+	}
+	if cfg.TranslationAPIKey == "" {
+		cfg.TranslationAPIKey = envFirst(providerKey)
+	}
 	if cfg.TranslationEndpoint == "" {
 		cfg.TranslationEndpoint = defaultTranslationEndpoint(cfg.TranslationProvider)
 	}
@@ -98,7 +105,7 @@ func LoadTranslationConfig() (Config, error) {
 		cfg.TranslationModel = defaultTranslationModel(cfg.TranslationProvider)
 	}
 	if cfg.TranslationAPIKey == "" && !cfg.TranslationDryRun {
-		return Config{}, fmt.Errorf("missing translation API key; set INFLEARN_TRANSLATION_API_KEY, OPENAI_API_KEY, or GH_MODELS_API_KEY")
+		return Config{}, fmt.Errorf("missing translation API key for %s; set INFLEARN_TRANSLATION_API_KEY or %s", cfg.TranslationProvider, providerKey)
 	}
 	if len(cfg.TranslationTargetLanguages) == 0 {
 		return Config{}, fmt.Errorf("INFLEARN_TRANSLATION_TARGET_LANGS resolved to empty list")
@@ -937,8 +944,6 @@ func inferTranslationProvider() string {
 	switch {
 	case strings.TrimSpace(osEnv("OPENAI_API_KEY")) != "":
 		return "openai"
-	case strings.TrimSpace(osEnv("GH_MODELS_API_KEY")) != "" || strings.TrimSpace(osEnv("GITHUB_MODELS_API_KEY")) != "":
-		return "github_models"
 	case strings.TrimSpace(osEnv("OPENROUTER_API_KEY")) != "":
 		return "openrouter"
 	case strings.TrimSpace(osEnv("GROQ_API_KEY")) != "":
@@ -950,10 +955,25 @@ func inferTranslationProvider() string {
 	}
 }
 
+func translationProviderKey(provider string) (string, error) {
+	switch provider {
+	case "openai":
+		return "OPENAI_API_KEY", nil
+	case "openrouter":
+		return "OPENROUTER_API_KEY", nil
+	case "groq":
+		return "GROQ_API_KEY", nil
+	case "cerebras":
+		return "CEREBRAS_API_KEY", nil
+	case "github_models":
+		return "", fmt.Errorf("github_models translation provider was retired; configure a supported provider")
+	default:
+		return "", fmt.Errorf("unsupported translation provider %q", provider)
+	}
+}
+
 func defaultTranslationEndpoint(provider string) string {
 	switch provider {
-	case "github_models":
-		return "https://models.github.ai/inference/chat/completions"
 	case "openrouter":
 		return "https://openrouter.ai/api/v1/chat/completions"
 	case "groq":
@@ -967,8 +987,6 @@ func defaultTranslationEndpoint(provider string) string {
 
 func defaultTranslationModel(provider string) string {
 	switch provider {
-	case "github_models":
-		return "openai/gpt-4.1"
 	case "openrouter":
 		return "openai/gpt-4.1-mini"
 	case "groq":

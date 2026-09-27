@@ -143,15 +143,38 @@ func TestInferTranslationProviderMatchesKeyPriority(t *testing.T) {
 		t.Fatalf("provider with OPENAI key selected first = %q", got)
 	}
 	t.Setenv("OPENAI_API_KEY", "")
-	if got := inferTranslationProvider(); got != "github_models" {
-		t.Fatalf("provider with GH key selected first = %q", got)
-	}
-	t.Setenv("GH_MODELS_API_KEY", "")
 	if got := inferTranslationProvider(); got != "openrouter" {
 		t.Fatalf("provider with OpenRouter key = %q", got)
 	}
 	if got := defaultTranslationModel("openrouter"); got != "openai/gpt-4.1-mini" {
 		t.Fatalf("OpenRouter model = %q", got)
+	}
+}
+
+func TestTranslationConfigUsesOnlySelectedProviderKey(t *testing.T) {
+	for _, key := range []string{"INFLEARN_TRANSLATION_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("CH_HOST", "localhost")
+	t.Setenv("INFLEARN_TRANSLATION_DRY_RUN", "0")
+	t.Setenv("INFLEARN_TRANSLATION_PROVIDER", "openrouter")
+	t.Setenv("OPENAI_API_KEY", "wrong-provider")
+	if _, err := LoadTranslationConfig(); err == nil || !strings.Contains(err.Error(), "OPENROUTER_API_KEY") {
+		t.Fatalf("an OpenAI key must not authorize OpenRouter: %v", err)
+	}
+	t.Setenv("OPENROUTER_API_KEY", "selected-provider")
+	cfg, err := LoadTranslationConfig()
+	if err != nil || cfg.TranslationAPIKey != "selected-provider" {
+		t.Fatalf("selected provider key was not used: key=%q err=%v", cfg.TranslationAPIKey, err)
+	}
+	t.Setenv("INFLEARN_TRANSLATION_API_KEY", "explicit-override")
+	cfg, err = LoadTranslationConfig()
+	if err != nil || cfg.TranslationAPIKey != "explicit-override" {
+		t.Fatalf("explicit override was not used: key=%q err=%v", cfg.TranslationAPIKey, err)
+	}
+	t.Setenv("INFLEARN_TRANSLATION_PROVIDER", "github_models")
+	if _, err := LoadTranslationConfig(); err == nil || !strings.Contains(err.Error(), "retired") {
+		t.Fatalf("retired GitHub Models must fail closed: %v", err)
 	}
 }
 
