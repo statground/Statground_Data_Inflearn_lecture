@@ -130,7 +130,9 @@ jobs:
       - name: Run unit tests
         env:
           GOPROXY: https://proxy.golang.org,direct
-        run: go test -mod=mod ./...
+        run: |
+          go test -mod=mod ./...
+          python3 -m unittest scripts/test_inflearn_workflow_status.py
 
       - name: Gate ClickHouse writes on storage pressure
         env:

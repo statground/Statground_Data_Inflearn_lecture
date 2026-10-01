@@ -42,10 +42,36 @@ class WorkflowStatusTest(unittest.TestCase):
 
     def test_missing_translation_key_fails_before_publication_refresh(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_collect_all.yml").read_text()
-        branch = workflow.split('if [ -z "$INFLEARN_TRANSLATION_API_KEY" ]; then', 1)[1].split("\n          fi", 1)[0]
-        self.assertIn("translation_status=blocked_api_key", branch)
-        self.assertIn("exit 1", branch)
-        self.assertIn("::error title=Inflearn translation blocked::", branch)
+        translation_step = workflow.split("      - name: Translate missing display metadata\n", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+        shell_script = translation_step.split("        run: |\n", 1)[1]
+        shell_script = "\n".join(
+            line[10:] if line.startswith("          ") else line for line in shell_script.splitlines()
+        )
+        self.assertLess(
+            workflow.index("      - name: Translate missing display metadata\n"),
+            workflow.index("      - name: Refresh exact public lecture views serially\n"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "output"
+            env = {
+                **os.environ,
+                "CH_HOST": "example.invalid",
+                "CH_USER": "test-reader",
+                "GITHUB_OUTPUT": str(output),
+                **{key: "" for key in (
+                    "INFLEARN_TRANSLATION_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
+                    "GROQ_API_KEY", "CEREBRAS_API_KEY",
+                )},
+            }
+            completed = subprocess.run(
+                ["bash", "-e", "-o", "pipefail", "-c", shell_script],
+                env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("::error title=Inflearn translation blocked::", completed.stdout)
+            self.assertIn("translation_status=blocked_api_key", output.read_text())
 
     def test_public_serving_requires_refresh_and_freshness_receipts(self):
         status, _, _, code = self.run_status(
