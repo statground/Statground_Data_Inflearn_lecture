@@ -323,6 +323,75 @@ func TestReadRawActivationRevisionRejectsReplicaDrift(t *testing.T) {
 	assertUpdateStateError(t, err, "degraded", "public_activation_revision", "activation_revision_replica_drift")
 }
 
+func TestCheckPublicLectureViewsReadsEmptyHistoryWithoutWriting(t *testing.T) {
+	for _, authorityPresent := range []bool{true, false} {
+		t.Run(strconv.FormatBool(authorityPresent), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				query := strings.TrimSpace(string(body))
+				if !strings.HasPrefix(query, "SELECT ") {
+					t.Errorf("preflight made a non-SELECT request")
+					http.Error(w, "unexpected SQL", http.StatusBadRequest)
+					return
+				}
+				switch {
+				case strings.Contains(query, "replayed_at IS NULL"):
+					writeCHRows(w, []map[string]any{{"pending": 0}})
+				case strings.Contains(query, "FROM system.clusters"):
+					writeCHRows(w, publicationTopologyRows())
+				case strings.Contains(query, "FROM "+lectureCurrentLeaseView):
+					writeCHRows(w, nil)
+				case strings.Contains(query, "maxOrDefault(fence_epoch)"):
+					if !strings.Contains(query, "'system', 'replicas'") ||
+						!strings.Contains(query, "table = 'inflearn_public_catalog_publish_lease_local'") {
+						t.Errorf("missing exact lease replica inventory")
+					}
+					writeCHRows(w, rawLeaseEpochRows(0))
+				case strings.Contains(query, "maxOrDefault(activation_revision)"):
+					if !strings.Contains(query, "'system', 'replicas'") ||
+						!strings.Contains(query, "table = 'inflearn_public_catalog_activation_local'") {
+						t.Errorf("missing exact activation replica inventory")
+					}
+					writeCHRows(w, rawActivationRevisionRows(0))
+				case strings.Contains(query, "v_inflearn_public_catalog_source_authority_fence_current_local"):
+					var rows []map[string]any
+					if authorityPresent {
+						for _, host := range publicationHosts() {
+							rows = append(rows, map[string]any{
+								"hostname": host, "authority_revision": 1,
+								"operation_uuid": "01994602-0000-7000-8000-000000000001",
+							})
+						}
+					}
+					writeCHRows(w, rows)
+				default:
+					t.Errorf("unexpected preflight query: %s", query)
+					http.Error(w, "unexpected SQL", http.StatusBadRequest)
+				}
+			}))
+			defer server.Close()
+			svc := publicRefreshTestService(t, server)
+			got, err := svc.CheckPublicLectureViews(context.Background())
+			if !authorityPresent {
+				assertUpdateStateError(t, err, "degraded", "public_refresh_source_authority_preflight", "authority_fence_endpoint_count")
+				return
+			}
+			if want := (PublicRefreshPreflight{Endpoints: 4, SourceAuthorityRevision: 1}); err != nil || got != want {
+				t.Fatalf("preflight got %+v, %v; want %+v", got, err, want)
+			}
+		})
+	}
+}
+
+func TestReadRawLeaseEpochRejectsMissingReplicaRatherThanCountingZero(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCHRows(w, rawLeaseEpochRows(0)[:3])
+	}))
+	defer server.Close()
+	_, err := publicRefreshTestService(t, server).readRawLeaseEpoch(context.Background(), publicationTopology())
+	assertUpdateStateError(t, err, "degraded", "public_refresh_lease_epoch", "lease_epoch_replica_count")
+}
+
 func TestRefreshPublicLectureViewsRejectsEnabledFallbackBeforeQuery(t *testing.T) {
 	svc := &Service{Cfg: Config{PublicationV2Enabled: true, PublicationWriterID: "test-writer", CHDirectReplicaFallback: true}}
 	_, err := svc.RefreshPublicLectureViews(context.Background())

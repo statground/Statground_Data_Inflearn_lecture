@@ -52,6 +52,13 @@ type PublicRefreshReceipt struct {
 	ActivationRevision uint64 `json:"activation_revision"`
 }
 
+type PublicRefreshPreflight struct {
+	Endpoints               int    `json:"endpoints"`
+	PreviousLeaseEpoch      uint64 `json:"previous_lease_epoch"`
+	PreviousActivation      uint64 `json:"previous_activation_revision"`
+	SourceAuthorityRevision uint64 `json:"source_authority_revision"`
+}
+
 type publicRefreshState struct {
 	Database         string
 	View             string
@@ -146,6 +153,41 @@ type activationEvidence struct {
 	StatgroundMarkerUUID   string
 	Kind                   string
 	ActivatedMS            int64
+}
+
+// CheckPublicLectureViews reads the publication prerequisites without acquiring
+// a lease, refreshing a view, or contacting reader control endpoints.
+func (s *Service) CheckPublicLectureViews(ctx context.Context) (PublicRefreshPreflight, error) {
+	if err := s.validatePublicRefreshWriteSafety(ctx); err != nil {
+		return PublicRefreshPreflight{}, err
+	}
+	topology, err := s.readPublicationTopology(ctx)
+	if err != nil {
+		return PublicRefreshPreflight{}, err
+	}
+	current, err := s.readCurrentPublicationLease(ctx)
+	if err != nil {
+		return PublicRefreshPreflight{}, err
+	}
+	if current.LeaseUUID != "" {
+		return PublicRefreshPreflight{}, stateError("deferred", "public_refresh_lease", "publication_lease_already_active")
+	}
+	epoch, err := s.readRawLeaseEpoch(ctx, topology)
+	if err != nil {
+		return PublicRefreshPreflight{}, err
+	}
+	revision, err := s.readRawActivationRevision(ctx, topology)
+	if err != nil {
+		return PublicRefreshPreflight{}, err
+	}
+	authority, _, err := s.readSourceAuthorityRevision(ctx, topology, "public_refresh_source_authority_preflight")
+	if err != nil {
+		return PublicRefreshPreflight{}, err
+	}
+	return PublicRefreshPreflight{
+		Endpoints: len(topology), PreviousLeaseEpoch: epoch,
+		PreviousActivation: revision, SourceAuthorityRevision: authority,
+	}, nil
 }
 
 func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshReceipt, error) {
@@ -635,12 +677,29 @@ func (s *Service) acquirePublicationLease(ctx context.Context, topology map[stri
 	return publicationLease{}, stateError("degraded", "public_refresh_lease", "lease_reconcile_failed")
 }
 
+// An empty history has no GROUP BY rows. Include the exact replica inventory
+// so that a verified empty endpoint contributes zero and an absent replica
+// still fails the caller's endpoint checks.
+func publicationHistoryMaximumSQL(cluster, table, field, alias string) string {
+	return fmt.Sprintf(`SELECT hostname, toString(max(value)) AS %[4]s
+		FROM
+		(
+			SELECT hostName() AS hostname, maxOrDefault(%[3]s) AS value, toUInt8(0) AS observed_replica
+			FROM clusterAllReplicas(%[1]s, lecture_publication.%[2]s)
+			GROUP BY hostname
+			UNION ALL
+			SELECT hostName() AS hostname, toUInt64(0) AS value, toUInt8(1) AS observed_replica
+			FROM clusterAllReplicas(%[1]s, 'system', 'replicas')
+			WHERE database = 'lecture_publication' AND table = '%[2]s'
+		)
+		GROUP BY hostname HAVING countIf(observed_replica = 1) = 1 ORDER BY hostname
+		SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 30`,
+		QuoteSQLString(cluster), table, field, alias)
+}
+
 func (s *Service) readRawLeaseEpoch(ctx context.Context, topology map[string]int) (uint64, error) {
-	rows, err := s.CHQueryRows(ctx, fmt.Sprintf(`SELECT hostName() AS hostname,
-		toString(maxOrDefault(fence_epoch)) AS raw_fence_epoch
-		FROM clusterAllReplicas(%s, lecture_publication.inflearn_public_catalog_publish_lease_local)
-		GROUP BY hostname ORDER BY hostname
-		SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 30`, QuoteSQLString(s.Cfg.CHCluster)))
+	rows, err := s.CHQueryRows(ctx, publicationHistoryMaximumSQL(s.Cfg.CHCluster,
+		"inflearn_public_catalog_publish_lease_local", "fence_epoch", "raw_fence_epoch"))
 	if err != nil {
 		return 0, newUpdateReadStateError("public_refresh_lease_epoch", err)
 	}
@@ -896,11 +955,8 @@ func containsString(values []string, value string) bool {
 }
 
 func (s *Service) readRawActivationRevision(ctx context.Context, topology map[string]int) (uint64, error) {
-	rows, err := s.CHQueryRows(ctx, fmt.Sprintf(`SELECT hostName() AS hostname,
-		toString(maxOrDefault(activation_revision)) AS raw_revision
-		FROM clusterAllReplicas(%s, lecture_publication.inflearn_public_catalog_activation_local)
-		GROUP BY hostname ORDER BY hostname
-		SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 30`, QuoteSQLString(s.Cfg.CHCluster)))
+	rows, err := s.CHQueryRows(ctx, publicationHistoryMaximumSQL(s.Cfg.CHCluster,
+		"inflearn_public_catalog_activation_local", "activation_revision", "raw_revision"))
 	if err != nil {
 		return 0, newUpdateReadStateError("public_activation_revision", err)
 	}
