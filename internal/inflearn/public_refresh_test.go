@@ -18,7 +18,7 @@ var leaseInsertPattern = regexp.MustCompile(`(?s)SELECT toUInt64\(([0-9]+)\), to
 var markerSurfacePattern = regexp.MustCompile(`(?s)SELECT '([^']+)', fromUnixTimestamp64Milli`)
 
 func TestRefreshPublicLectureViewsPublishesThreeEndpointLocalSurfacesThenOneActivation(t *testing.T) {
-	h := &publicationHappyHarness{t: t, markers: map[string]string{}}
+	h := &publicationHappyHarness{t: t, markers: map[string]string{}, snapshotSafe: map[string]bool{}, snapshotReadbackBounded: map[string]bool{}}
 	server := httptest.NewServer(http.HandlerFunc(h.serveHTTP))
 	defer server.Close()
 	svc := publicRefreshTestService(t, server)
@@ -35,6 +35,17 @@ func TestRefreshPublicLectureViewsPublishesThreeEndpointLocalSurfacesThenOneActi
 	if strings.Join(h.snapshotSurfaces, ",") != "webr,mirtype,statground" || h.markerReadbacks != 3 {
 		t.Fatalf("snapshots=%v marker readbacks=%d", h.snapshotSurfaces, h.markerReadbacks)
 	}
+	if !h.statgroundProjectionBounded || !h.statgroundSnapshotBounded {
+		t.Fatalf("statground resource bounds missing: projection=%t snapshot=%t", h.statgroundProjectionBounded, h.statgroundSnapshotBounded)
+	}
+	for _, surface := range []string{"webr", "mirtype", "statground"} {
+		if !h.snapshotSafe[surface] {
+			t.Fatalf("%s snapshot insert omitted local quorum/dedup/synchronous safety settings", surface)
+		}
+		if !h.snapshotReadbackBounded[surface] {
+			t.Fatalf("%s snapshot readback omitted memory/thread/time bounds", surface)
+		}
+	}
 	wantCommands := []string{
 		"SYSTEM REFRESH VIEW webr_lecture.mv_inflearn_r_lecture_catalog_refresh",
 		"SYSTEM WAIT VIEW webr_lecture.mv_inflearn_r_lecture_catalog_refresh",
@@ -47,7 +58,7 @@ func TestRefreshPublicLectureViewsPublishesThreeEndpointLocalSurfacesThenOneActi
 }
 
 func TestRefreshPublicLectureViewsRejectsSourceAuthorityRaceBeforeActivation(t *testing.T) {
-	h := &publicationHappyHarness{t: t, markers: map[string]string{}, authorityRevisions: []uint64{1, 2}}
+	h := &publicationHappyHarness{t: t, markers: map[string]string{}, snapshotSafe: map[string]bool{}, snapshotReadbackBounded: map[string]bool{}, authorityRevisions: []uint64{1, 2}}
 	server := httptest.NewServer(http.HandlerFunc(h.serveHTTP))
 	defer server.Close()
 	_, err := publicRefreshTestService(t, server).RefreshPublicLectureViews(context.Background())
@@ -63,10 +74,13 @@ type publicationHappyHarness struct {
 	leaseSet                                                                                           bool
 	pointerReads, rawRevisionReads, timeReads, markerReadbacks, preflightReads, authorityRevisionReads int
 	markers                                                                                            map[string]string
+	snapshotSafe                                                                                       map[string]bool
+	snapshotReadbackBounded                                                                            map[string]bool
 	runUUID, activationUUID                                                                            string
 	currentMarkerSurface                                                                               string
 	systemCommands, snapshotSurfaces                                                                   []string
 	authorityRevisions                                                                                 []uint64
+	statgroundProjectionBounded, statgroundSnapshotBounded                                             bool
 }
 
 func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +151,7 @@ func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Reque
 	case strings.Contains(query, "FROM "+lectureProjectionCandidateView):
 		writeCHRows(w, []map[string]any{candidateStatsRow(12, 12, 120, 30, surfaceGeneration(querySurface(query)))})
 	case strings.Contains(query, "FROM "+lectureStatgroundProjectionView):
+		h.statgroundProjectionBounded = hasStatgroundProjectionBounds(query)
 		writeCHRows(w, []map[string]any{{"rows": 12, "unique_keys": 12, "fingerprint_sum": 120, "fingerprint_xor": 30, "source_fetched_max_ms": 400000, "observed_ms": 400500}})
 	case strings.Contains(query, "SELECT toUnixTimestamp64Milli(now64"):
 		times := []int64{100000, 400500, 401000, 402000, 403000}
@@ -145,17 +160,27 @@ func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Reque
 		}
 		writeCHRows(w, []map[string]any{{"server_time_ms": times[h.timeReads]}})
 		h.timeReads++
-	case strings.HasPrefix(query, "INSERT INTO webr_lecture.inflearn_r_lecture_catalog_serving"):
+	case strings.HasPrefix(query, "INSERT INTO webr_lecture.inflearn_r_lecture_catalog_serving_local"):
+		h.snapshotSafe["webr"] = hasSnapshotSafetySettings(query)
 		h.snapshotSurfaces = append(h.snapshotSurfaces, "webr")
 		w.WriteHeader(http.StatusOK)
-	case strings.HasPrefix(query, "INSERT INTO mirtype_lecture.inflearn_language_lecture_catalog_serving"):
+	case strings.HasPrefix(query, "INSERT INTO mirtype_lecture.inflearn_language_lecture_catalog_serving_local"):
+		h.snapshotSafe["mirtype"] = hasSnapshotSafetySettings(query)
 		h.snapshotSurfaces = append(h.snapshotSurfaces, "mirtype")
 		w.WriteHeader(http.StatusOK)
-	case strings.HasPrefix(query, "INSERT INTO statground_lecture.inflearn_workbench_catalog_serving"):
+	case strings.HasPrefix(query, "INSERT INTO statground_lecture.inflearn_workbench_catalog_serving_local"):
+		h.snapshotSafe["statground"] = hasSnapshotSafetySettings(query)
+		h.statgroundSnapshotBounded = hasStatgroundProjectionBounds(query)
 		h.snapshotSurfaces = append(h.snapshotSurfaces, "statground")
 		w.WriteHeader(http.StatusOK)
+	case strings.HasPrefix(query, "INSERT INTO webr_lecture.inflearn_r_lecture_catalog_serving") ||
+		strings.HasPrefix(query, "INSERT INTO mirtype_lecture.inflearn_language_lecture_catalog_serving") ||
+		strings.HasPrefix(query, "INSERT INTO statground_lecture.inflearn_workbench_catalog_serving"):
+		h.t.Errorf("snapshot write used Distributed facade instead of the global local replica: %s", query)
+		w.WriteHeader(http.StatusBadRequest)
 	case strings.Contains(query, lectureProjectionSnapshotLocalView):
 		surface := querySurface(query)
+		h.snapshotReadbackBounded[surface] = hasStatgroundProjectionBounds(query)
 		writeCHRows(w, snapshotReplicaRows(surface, surfaceGeneration(surface)))
 	case strings.HasPrefix(query, "INSERT INTO "+lectureMarkerTable):
 		if !strings.Contains(query, "insert_quorum = 4") || !strings.Contains(query, "insert_deduplication_token") {
@@ -189,6 +214,100 @@ func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Reque
 	default:
 		h.t.Errorf("unexpected query: %s", query)
 		w.WriteHeader(http.StatusBadRequest)
+	}
+}
+
+func hasStatgroundProjectionBounds(query string) bool {
+	for _, required := range []string{
+		"max_threads = 1",
+		"max_memory_usage = 536870912",
+		"max_bytes_before_external_group_by = 67108864",
+		"max_bytes_before_external_sort = 67108864",
+	} {
+		if !strings.Contains(query, required) {
+			return false
+		}
+	}
+	return strings.Contains(query, "max_execution_time = 120") ||
+		strings.Contains(query, "max_execution_time = 180")
+}
+
+func hasSnapshotSafetySettings(query string) bool {
+	for _, required := range []string{
+		"distributed_foreground_insert = 1",
+		"insert_distributed_sync = 1",
+		"async_insert = 0",
+		"insert_quorum = 4",
+		"insert_quorum_parallel = 0",
+		"insert_deduplicate = 1",
+		"insert_deduplication_token = 'inflearn-public-snapshot-v2-",
+	} {
+		if !strings.Contains(query, required) {
+			return false
+		}
+	}
+	return hasStatgroundProjectionBounds(query)
+}
+
+func TestInsertAndReadbackSnapshotReconcilesAmbiguousACKFromQuorumReadback(t *testing.T) {
+	inserts := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		query := strings.TrimSpace(string(body))
+		switch {
+		case strings.HasPrefix(query, "INSERT INTO webr_lecture.inflearn_r_lecture_catalog_serving_local"):
+			inserts = append(inserts, query)
+			http.Error(w, "ambiguous timeout after commit", http.StatusGatewayTimeout)
+		case strings.Contains(query, lectureProjectionSnapshotLocalView):
+			writeCHRows(w, snapshotReplicaRows("webr", 200500))
+		default:
+			t.Fatalf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+	evidence := generationEvidence{Surface: "webr", GenerationMS: 200500, Rows: 12, Unique: 12, FingerprintSum: 120, FingerprintXOR: 30}
+	err := publicRefreshTestService(t, server).insertAndReadbackSnapshot(context.Background(), publicationTopology(), evidence, "018f0000-0000-7000-8000-000000000002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inserts) != 1 || !hasSnapshotSafetySettings(inserts[0]) {
+		t.Fatalf("ambiguous ACK was not reconciled by one safe insert/readback: inserts=%d", len(inserts))
+	}
+}
+
+func TestInsertAndReadbackSnapshotRetriesSameDeduplicatedOperationAfterPartialReadback(t *testing.T) {
+	inserts := []string{}
+	readbacks := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		query := strings.TrimSpace(string(body))
+		switch {
+		case strings.HasPrefix(query, "INSERT INTO webr_lecture.inflearn_r_lecture_catalog_serving_local"):
+			inserts = append(inserts, query)
+			if len(inserts) == 1 {
+				http.Error(w, "ambiguous timeout", http.StatusGatewayTimeout)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(query, lectureProjectionSnapshotLocalView):
+			readbacks++
+			rows := snapshotReplicaRows("webr", 200500)
+			if readbacks == 1 {
+				rows = rows[:3]
+			}
+			writeCHRows(w, rows)
+		default:
+			t.Fatalf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+	evidence := generationEvidence{Surface: "webr", GenerationMS: 200500, Rows: 12, Unique: 12, FingerprintSum: 120, FingerprintXOR: 30}
+	err := publicRefreshTestService(t, server).insertAndReadbackSnapshot(context.Background(), publicationTopology(), evidence, "018f0000-0000-7000-8000-000000000002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inserts) != 2 || inserts[0] != inserts[1] || !hasSnapshotSafetySettings(inserts[0]) {
+		t.Fatalf("snapshot retry changed operation identity or settings: inserts=%d same=%t", len(inserts), len(inserts) == 2 && inserts[0] == inserts[1])
 	}
 }
 

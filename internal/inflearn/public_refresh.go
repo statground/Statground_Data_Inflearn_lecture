@@ -1118,7 +1118,9 @@ func (s *Service) validateStatgroundProjectionCandidate(ctx context.Context, gen
 		toString(groupBitXor(row_fingerprint)) AS fingerprint_xor,
 		toUnixTimestamp64Milli(max(source_fetched_at)) AS source_fetched_max_ms,
 		toUnixTimestamp64Milli(now64(3, 'Asia/Seoul')) AS observed_ms
-		FROM %s SETTINGS skip_unavailable_shards = 0, max_threads = 2, max_execution_time = 120`, lectureStatgroundProjectionView))
+		FROM %s SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 120,
+		max_memory_usage = 536870912, max_bytes_before_external_group_by = 67108864,
+		max_bytes_before_external_sort = 67108864`, lectureStatgroundProjectionView))
 	if err != nil {
 		return generationEvidence{}, newUpdateReadStateError(phase, err)
 	}
@@ -1154,15 +1156,15 @@ func (s *Service) insertAndReadbackSnapshot(ctx context.Context, topology map[st
 	var sql string
 	switch evidence.Surface {
 	case "webr":
-		sql = fmt.Sprintf(`INSERT INTO webr_lecture.inflearn_r_lecture_catalog_serving
+		sql = fmt.Sprintf(`INSERT INTO webr_lecture.inflearn_r_lecture_catalog_serving_local
 			SELECT * FROM webr_lecture.v_inflearn_r_lecture_catalog_projection
 			WHERE refresh_batch = fromUnixTimestamp64Milli(%d)`, evidence.GenerationMS)
 	case "mirtype":
-		sql = fmt.Sprintf(`INSERT INTO mirtype_lecture.inflearn_language_lecture_catalog_serving
+		sql = fmt.Sprintf(`INSERT INTO mirtype_lecture.inflearn_language_lecture_catalog_serving_local
 			SELECT * FROM mirtype_lecture.v_inflearn_language_lecture_catalog_projection
 			WHERE refresh_batch = fromUnixTimestamp64Milli(%d)`, evidence.GenerationMS)
 	case "statground":
-		sql = fmt.Sprintf(`INSERT INTO statground_lecture.inflearn_workbench_catalog_serving
+		sql = fmt.Sprintf(`INSERT INTO statground_lecture.inflearn_workbench_catalog_serving_local
 			SELECT course_id,locale,display_language,language_rank,slug,en_slug,status,title,
 			description,thumbnail_url,category_main_slug,category_main_title,category_sub_slug,
 			category_sub_title,level_code,is_new,is_best,student_count,like_count,review_count,
@@ -1174,10 +1176,19 @@ func (s *Service) insertAndReadbackSnapshot(ctx context.Context, topology map[st
 	default:
 		return stateError("degraded", phase, "unknown_surface")
 	}
+	// Every serving_local table uses one global ReplicatedMergeTree path shared
+	// by all four endpoints.  Writing through its Distributed facade can send
+	// one block to each shard concurrently, so the second shard races the first
+	// serial quorum insert against the same replication group.  The dedicated
+	// publisher instead writes the complete generation once to its connected
+	// local replica and requires all four replicas to acknowledge it.
 	token := fmt.Sprintf("inflearn-public-snapshot-v2-%016x", H64(runUUID+"\x1f"+evidence.Surface+"\x1f"+strconv.FormatInt(evidence.GenerationMS, 10)))
+	resourceSettings := `, max_threads = 1, max_memory_usage = 536870912,
+		max_bytes_before_external_group_by = 67108864, max_bytes_before_external_sort = 67108864,
+		max_execution_time = 180`
 	sql += fmt.Sprintf(` SETTINGS distributed_foreground_insert = 1, insert_distributed_sync = 1, async_insert = 0,
 		insert_quorum = 4, insert_quorum_parallel = 0, insert_quorum_timeout = 60000,
-		insert_deduplicate = 1, insert_deduplication_token = %s`, QuoteSQLString(token))
+		insert_deduplicate = 1, insert_deduplication_token = %s%s`, QuoteSQLString(token), resourceSettings)
 	var insertErr error
 	for attempt := 0; attempt < publicationMutationReconcileAttempts; attempt++ {
 		insertErr = s.execPublicRefreshCommand(ctx, sql, 5*time.Minute)
@@ -1205,7 +1216,9 @@ func (s *Service) readbackSnapshot(ctx context.Context, topology map[string]int,
 		FROM clusterAllReplicas(%s, lecture_publication.v_inflearn_public_catalog_projection_snapshot_local)
 		WHERE surface = %s AND generation = fromUnixTimestamp64Milli(%d)
 		GROUP BY hostname, surface ORDER BY hostname
-		SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 120`,
+		SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 120,
+		max_memory_usage = 536870912, max_bytes_before_external_group_by = 67108864,
+		max_bytes_before_external_sort = 67108864`,
 		QuoteSQLString(s.Cfg.CHCluster), QuoteSQLString(evidence.Surface), evidence.GenerationMS))
 	if err != nil {
 		return newUpdateReadStateError(phase, err)
