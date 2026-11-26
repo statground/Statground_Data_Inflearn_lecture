@@ -166,6 +166,60 @@ type preparedPublicationTransition struct {
 	Readers      []publicationTransitionPrepareReceiptValue
 }
 
+type PublicationReadersPreflight struct {
+	InventoryRevision uint64                         `json:"inventory_revision"`
+	InventoryUUID     string                         `json:"inventory_uuid"`
+	Readers           []PublicationReaderObservation `json:"readers"`
+}
+
+type PublicationReaderObservation struct {
+	AppService    string `json:"app_service"`
+	Instance      string `json:"reader_instance"`
+	EpochUUID     string `json:"reader_epoch_uuid"`
+	Phase         string `json:"phase"`
+	AdmissionOpen bool   `json:"admission_open"`
+	Inflight      uint64 `json:"inflight"`
+}
+
+// CheckPublicationReaders reads the registered inventory and authenticated
+// process states without syncing replicas or changing any admission gate.
+func (s *Service) CheckPublicationReaders(ctx context.Context) (PublicationReadersPreflight, error) {
+	cfg, err := loadLectureReaderConfig(s.Cfg.PublicationReaderConfig)
+	if err != nil {
+		return PublicationReadersPreflight{}, err
+	}
+	topology, err := s.readPublicationTopology(ctx)
+	if err != nil {
+		return PublicationReadersPreflight{}, err
+	}
+	inventory, err := s.readLectureReaderInventory(ctx, topology, cfg)
+	if err != nil {
+		return PublicationReadersPreflight{}, err
+	}
+	result := PublicationReadersPreflight{
+		InventoryRevision: inventory.Revision, InventoryUUID: inventory.UUID,
+		Readers: make([]PublicationReaderObservation, 0, len(inventory.Readers)),
+	}
+	for _, reader := range inventory.Readers {
+		state, err := discoverPublicationTransitionReader(ctx, reader, UUIDv7String(time.Now()))
+		if err != nil {
+			return PublicationReadersPreflight{}, stateError("degraded", "public_reader_transition_inventory", "reader_inventory_failed")
+		}
+		result.Readers = append(result.Readers, PublicationReaderObservation{
+			AppService: reader.AppService, Instance: reader.ReaderInstance, EpochUUID: state.Reader.EpochUUID,
+			Phase: state.Phase, AdmissionOpen: state.AdmissionOpen, Inflight: state.Inflight,
+		})
+	}
+	current, err := s.readLectureReaderInventory(ctx, topology, cfg)
+	if err != nil {
+		return PublicationReadersPreflight{}, err
+	}
+	if !sameLectureReaderInventory(inventory, current) {
+		return PublicationReadersPreflight{}, stateError("degraded", "public_reader_transition_inventory", "reader_inventory_changed")
+	}
+	return result, nil
+}
+
 func failBeforePublicationActivation(ctx context.Context, prepared preparedPublicationTransition, cause error) error {
 	var firstErr error
 	for _, receipt := range prepared.Readers {

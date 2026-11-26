@@ -270,6 +270,10 @@ func (s *Service) proveLectureReaderInventory(ctx context.Context, topology map[
 			return lectureReaderInventory{}, newUpdateReadStateError("public_reader_inventory_sync", err)
 		}
 	}
+	return s.readLectureReaderInventory(ctx, topology, cfg)
+}
+
+func (s *Service) readLectureReaderInventory(ctx context.Context, topology map[string]int, cfg lectureReaderConfigFile) (lectureReaderInventory, error) {
 	authorityRows, err := s.CHQueryRows(ctx, fmt.Sprintf(`SELECT hostName() AS hostname,
 		toString(inventory_revision) AS inventory_revision,toString(inventory_uuid) AS inventory_uuid,
 		toString(reader_count) AS reader_count,toString(complete) AS complete
