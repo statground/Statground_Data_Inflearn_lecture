@@ -439,13 +439,7 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 		}
 	}
 	failPrepared := func(cause error) (PublicRefreshReceipt, error) {
-		if !readerRefreshEnabled {
-			return PublicRefreshReceipt{}, cause
-		}
-		if abortErr := abortPreparedPublicationTransition(ctx, preparedTransition); abortErr != nil {
-			return PublicRefreshReceipt{}, stateError("degraded", "public_reader_transition_abort", "preactivation_abort_failed")
-		}
-		return PublicRefreshReceipt{}, cause
+		return PublicRefreshReceipt{}, failBeforePublicationActivation(ctx, preparedTransition, cause)
 	}
 	if readerRefreshEnabled {
 		if err := s.requireCurrentPublicationLease(ctx, lease, "public_activation_post_prepare_lease"); err != nil {

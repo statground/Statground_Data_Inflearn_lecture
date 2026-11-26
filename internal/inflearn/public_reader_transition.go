@@ -166,7 +166,7 @@ type preparedPublicationTransition struct {
 	Readers      []publicationTransitionPrepareReceiptValue
 }
 
-func abortPreparedPublicationTransition(ctx context.Context, prepared preparedPublicationTransition) error {
+func failBeforePublicationActivation(ctx context.Context, prepared preparedPublicationTransition, cause error) error {
 	var firstErr error
 	for _, receipt := range prepared.Readers {
 		pending := receipt.Inventory
@@ -177,11 +177,19 @@ func abortPreparedPublicationTransition(ctx context.Context, prepared preparedPu
 		pending.CandidateAuthoritySHA256 = receipt.CandidateAuthoritySHA256
 		pending.PrepareReceiptSHA256 = receipt.ReceiptSHA256
 		pending.OldStateProofSHA256 = receipt.OldStateProofSHA256
-		if _, err := abortPublicationTransitionReader(ctx, pending); err != nil && firstErr == nil {
+		// Cleanup must survive the failed proof's context without letting one
+		// unreachable reader consume the time available to the next one.
+		abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(publicationTransitionTimeoutSeconds)*time.Second)
+		_, err := abortPublicationTransitionReader(abortCtx, pending)
+		cancel()
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	return firstErr
+	if firstErr != nil {
+		return stateError("degraded", "public_reader_transition_abort", "preactivation_abort_failed")
+	}
+	return cause
 }
 
 const zeroUUID = "00000000-0000-0000-0000-000000000000"
@@ -831,6 +839,9 @@ func (s *Service) preparePublicationTransitionReaders(ctx context.Context, topol
 	}
 	transitionID := publicationTransitionID(activation)
 	prepared := preparedPublicationTransition{TransitionID: transitionID, Inventory: inventory}
+	reject := func(cause error) (preparedPublicationTransition, error) {
+		return preparedPublicationTransition{}, failBeforePublicationActivation(ctx, prepared, cause)
+	}
 	discoveredReaders := make([]publicationTransitionInventory, 0, len(inventory.Readers))
 	for _, reader := range inventory.Readers {
 		inventoryNonce := stablePublicationTransitionUUID("inventory", transitionID, reader.AppService, reader.ReaderInstance)
@@ -863,25 +874,24 @@ func (s *Service) preparePublicationTransitionReaders(ctx context.Context, topol
 		candidateAuthority := transitionAuthorityForReader(activation, sourceAuthorityRevision, reader.AppService)
 		oldDigest, _ := canonicalJSONSHA256(oldAuthority.jsonValue())
 		if discovered.ServingAuthoritySHA256 != oldDigest {
-			return preparedPublicationTransition{}, stateError("degraded", "public_reader_transition_inventory", "reader_serving_authority_mismatch")
+			return reject(stateError("degraded", "public_reader_transition_inventory", "reader_serving_authority_mismatch"))
 		}
 		receipt, err := preparePublicationTransitionReader(ctx, discovered, transitionID, oldAuthority, candidateAuthority)
 		if err != nil {
-			_ = abortPreparedPublicationTransition(ctx, prepared)
-			return preparedPublicationTransition{}, stateError("degraded", "public_reader_transition_prepare", "reader_prepare_failed")
+			return reject(stateError("degraded", "public_reader_transition_prepare", "reader_prepare_failed"))
 		}
 		prepared.Readers = append(prepared.Readers, receipt)
 	}
 	if len(prepared.Readers) != len(inventory.Readers) {
-		return preparedPublicationTransition{}, stateError("degraded", "public_reader_transition_prepare", "reader_prepare_set_incomplete")
+		return reject(stateError("degraded", "public_reader_transition_prepare", "reader_prepare_set_incomplete"))
 	}
 	postInventory, err := s.proveLectureReaderInventory(ctx, topology, cfg)
 	if err != nil || !sameLectureReaderInventory(postInventory, inventory) {
-		return preparedPublicationTransition{}, stateError("degraded", "public_reader_transition_prepare", "reader_inventory_changed")
+		return reject(stateError("degraded", "public_reader_transition_prepare", "reader_inventory_changed"))
 	}
 	currentAuthority, _, err := s.readSourceAuthorityRevision(ctx, topology, "public_reader_transition_prepare_authority")
 	if err != nil || currentAuthority != sourceAuthorityRevision {
-		return preparedPublicationTransition{}, stateError("degraded", "public_reader_transition_prepare", "source_authority_changed")
+		return reject(stateError("degraded", "public_reader_transition_prepare", "source_authority_changed"))
 	}
 	return prepared, nil
 }
