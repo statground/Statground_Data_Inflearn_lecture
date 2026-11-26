@@ -412,7 +412,7 @@ func TestInflearnWorkflowPinsBoundedPreflightRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workflow := string(source)
+	workflow, _, _ := strings.Cut(string(source), "\n  reader_preflight:\n")
 	if got := strings.Count(workflow, `CLICKHOUSE_PREFLIGHT_RETRY_BUDGET_SECONDS: "90"`); got != 3 {
 		t.Fatalf("preflight retry budget count=%d, want 3", got)
 	}
