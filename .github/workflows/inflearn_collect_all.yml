@@ -104,13 +104,22 @@ jobs:
           PY
 
       - name: Validate publication publisher secrets
+        id: publisher_admission
         if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
         env:
+          CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
           PUBLISHER_CH_USER: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER }}
           PUBLISHER_CH_PASSWORD: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD }}
           READER_REFRESH_CONFIG_JSON: ${{ secrets.INFLEARN_LECTURE_READER_REFRESH_CONFIG_JSON }}
         run: |
-          test -n "$PUBLISHER_CH_USER" || { echo "INFLEARN_LECTURE_PUBLISHER_CH_USER secret is required when publication v2 is enabled"; exit 1; }
+          case "${CH_SECURE,,}" in
+            true|1) ;;
+            *) echo "::error title=Inflearn publisher blocked::Enable TLS for the publication ClickHouse connection"; exit 1 ;;
+          esac
+          case "$CH_HOST" in
+            ""|*://*) echo "::error title=Inflearn publisher blocked::Configure the ClickHouse hostname separately from its protocol"; exit 1 ;;
+          esac
+          test "$PUBLISHER_CH_USER" = "inflearn_lecture_generation_publisher" || { echo "::error title=Inflearn publisher blocked::The publication identity must match the dedicated ClickHouse account"; exit 1; }
           test -n "$PUBLISHER_CH_PASSWORD" || { echo "INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD secret is required when publication v2 is enabled"; exit 1; }
           test -n "$READER_REFRESH_CONFIG_JSON" || { echo "INFLEARN_LECTURE_READER_REFRESH_CONFIG_JSON secret is required when publication v2 is enabled"; exit 1; }
 
@@ -375,7 +384,7 @@ jobs:
           go run -mod=mod ./cmd/inflearn-refresh-public-views
 
       - name: Verify public lecture freshness and refresh health
-        if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
+        if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && steps.publisher_admission.outcome == 'success'
         id: verify_public_freshness
         env:
           STATE_BACKEND: clickhouse

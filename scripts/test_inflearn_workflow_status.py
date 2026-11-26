@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from textwrap import dedent
 import unittest
 
 
@@ -90,6 +91,41 @@ class WorkflowStatusTest(unittest.TestCase):
         )
         self.assertEqual(status["public_serving"], "verified")
         self.assertEqual(code, 0)
+
+    def test_publisher_credentials_require_tls_and_the_dedicated_identity(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_collect_all.yml").read_text()
+        admission = workflow.split("      - name: Validate publication publisher secrets\n", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+        freshness = workflow.split("      - name: Verify public lecture freshness and refresh health\n", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+        self.assertIn("id: publisher_admission", admission)
+        self.assertIn("if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'", admission)
+        self.assertIn("steps.publisher_admission.outcome == 'success'", freshness)
+        script = dedent(admission.split("        run: |\n", 1)[1])
+        baseline = {
+            "CH_SECURE": "true",
+            "CH_HOST": "db.example.invalid",
+            "PUBLISHER_CH_USER": "inflearn_lecture_generation_publisher",
+            "PUBLISHER_CH_PASSWORD": "fixture-value",
+            "READER_REFRESH_CONFIG_JSON": "{}",
+        }
+        for overrides, expected in (
+            ({}, 0),
+            ({"CH_SECURE": "1"}, 0),
+            ({"CH_SECURE": "false"}, 1),
+            ({"CH_HOST": "http://db.example.invalid"}, 1),
+            ({"PUBLISHER_CH_USER": "collector"}, 1),
+            ({"PUBLISHER_CH_PASSWORD": ""}, 1),
+        ):
+            with self.subTest(overrides=overrides):
+                result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", script],
+                    env={**baseline, **overrides}, text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode, expected)
+                self.assertNotIn("fixture-value", result.stdout + result.stderr)
 
     def test_incomplete_source_is_not_reported_collected(self):
         status, _, _, code = self.run_status(INFLEARN_UPDATE_OUTCOME="failure")
