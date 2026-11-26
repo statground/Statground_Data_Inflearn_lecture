@@ -39,7 +39,7 @@ jobs:
       - name: Validate pressure-gate and workflow contracts
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-        run: python3 -m unittest scripts/test_clickhouse_pressure_gate.py
+        run: python3 -m unittest scripts/test_clickhouse_pressure_gate.py scripts/test_inflearn_workflow_status.py
 
       - name: Set up Go for actionlint
         uses: actions/setup-go@v6
