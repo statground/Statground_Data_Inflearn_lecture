@@ -29,7 +29,7 @@ const (
 	publicationLeaseDurationMillis       = int64(110 * time.Minute / time.Millisecond)
 	publicationSourceFreshnessMillis     = int64(36 * time.Hour / time.Millisecond)
 	publicationMutationReconcileAttempts = 2
-	statgroundProjectionResources        = `max_memory_usage = 1610612736, max_block_size = 8192,
+	lectureProjectionResources           = `max_memory_usage = 1610612736, max_block_size = 8192,
 		max_bytes_before_external_group_by = 67108864, max_bytes_before_external_sort = 67108864,
 		max_temporary_data_on_disk_size_for_query = 2147483648`
 )
@@ -327,6 +327,9 @@ func (s *Service) refreshPublicLectureViews(ctx context.Context, resume *firstPu
 	for _, surface := range []string{"webr", "mirtype", "statground"} {
 		if err := s.requireCurrentPublicationLease(ctx, lease, "public_snapshot_"+surface+"_lease"); err != nil {
 			return PublicRefreshReceipt{}, err
+		}
+		if resume != nil && surface == "webr" && resume.webrSnapshot {
+			continue
 		}
 		if err := s.insertAndReadbackSnapshot(ctx, topology, evidenceBySurface[surface], runUUID); err != nil {
 			return PublicRefreshReceipt{}, err
@@ -1174,7 +1177,7 @@ func (s *Service) validateStatgroundProjectionCandidate(ctx context.Context, gen
 		toUnixTimestamp64Milli(max(source_fetched_at)) AS source_fetched_max_ms,
 		toUnixTimestamp64Milli(now64(3, 'Asia/Seoul')) AS observed_ms
 		FROM %s SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 120,
-		%s`, lectureStatgroundProjectionView, statgroundProjectionResources))
+		%s`, lectureStatgroundProjectionView, lectureProjectionResources))
 	if err != nil {
 		return generationEvidence{}, newUpdateReadStateError(phase, err)
 	}
@@ -1240,8 +1243,8 @@ func (s *Service) insertAndReadbackSnapshot(ctx context.Context, topology map[st
 	resourceSettings := `, max_threads = 1, max_memory_usage = 536870912,
 		max_bytes_before_external_group_by = 67108864, max_bytes_before_external_sort = 67108864,
 		max_execution_time = 180`
-	if evidence.Surface == "statground" {
-		resourceSettings = ", max_threads = 1, max_execution_time = 180, " + statgroundProjectionResources
+	if evidence.Surface == "statground" || evidence.Surface == "mirtype" {
+		resourceSettings = ", max_threads = 1, max_execution_time = 180, " + lectureProjectionResources
 	}
 	sql += fmt.Sprintf(` SETTINGS distributed_foreground_insert = 1, insert_distributed_sync = 1, async_insert = 0,
 		insert_quorum = 4, insert_quorum_parallel = 0, insert_quorum_timeout = 60000,
@@ -1302,7 +1305,7 @@ func (s *Service) runPublicationCandidatePreflight(ctx context.Context, generati
 		return nil, err
 	}
 	query := renderPublicationCandidatePreflightSQL(generations, lease.FenceEpoch, lease.LeaseUUID)
-	rows, err := s.CHQueryRows(ctx, query+", max_execution_time = 120, "+statgroundProjectionResources)
+	rows, err := s.CHQueryRows(ctx, query+", max_execution_time = 120, "+lectureProjectionResources)
 	if err != nil {
 		return nil, newUpdateReadStateError("public_candidate_preflight", err)
 	}

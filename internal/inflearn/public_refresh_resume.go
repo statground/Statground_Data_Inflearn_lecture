@@ -7,8 +7,8 @@ import (
 
 const firstPublicationResumePhase = "public_first_publication_resume"
 
-// FirstPublicationCheckpoint identifies the existing lease and Web-R candidate
-// from a first publication that stopped before writing serving snapshots.
+// FirstPublicationCheckpoint identifies the initial lease and completed work
+// from a first publication that stopped before creating any generation marker.
 type FirstPublicationCheckpoint struct {
 	LeaseUUID               string                    `json:"lease_uuid"`
 	FenceEpoch              uint64                    `json:"fence_epoch"`
@@ -23,6 +23,7 @@ type FirstPublicationCheckpoint struct {
 	WebRRows                uint64                    `json:"webr_rows"`
 	WebRFingerprintSum      uint64                    `json:"webr_fingerprint_sum"`
 	WebRFingerprintXOR      uint64                    `json:"webr_fingerprint_xor"`
+	WebRSnapshot            bool                      `json:"webr_snapshot,omitempty"`
 	MirType                 *LectureRefreshCheckpoint `json:"mirtype,omitempty"`
 }
 
@@ -38,6 +39,7 @@ type LectureRefreshCheckpoint struct {
 type firstPublicationResume struct {
 	lease             publicationLease
 	candidates        map[string]generationEvidence
+	webrSnapshot      bool
 	inventoryRevision uint64
 	inventoryUUID     string
 	authorityRevision uint64
@@ -68,7 +70,8 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 		GenerationMS: cp.WebRGenerationMS, SuccessMS: cp.WebRSuccessMS, RefreshMS: cp.WebRRefreshMS,
 		Rows: cp.WebRRows, FingerprintSum: cp.WebRFingerprintSum, FingerprintXOR: cp.WebRFingerprintXOR,
 	}
-	if !web.within(cp.AcquiredMS, cp.ExpiresMS) || (cp.MirType != nil && !cp.MirType.within(cp.AcquiredMS, cp.ExpiresMS)) {
+	if !web.within(cp.AcquiredMS, cp.ExpiresMS) || (cp.WebRSnapshot && cp.MirType == nil) ||
+		(cp.MirType != nil && !cp.MirType.within(cp.AcquiredMS, cp.ExpiresMS)) {
 		return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "invalid_checkpoint")
 	}
 	if err := s.validatePublicRefreshWriteSafety(ctx); err != nil {
@@ -100,15 +103,17 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 	if revision != 0 {
 		return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "first_activation_already_started")
 	}
-	// A marker or a serving snapshot means the interrupted attempt advanced
-	// beyond this checkpoint and needs its own reconciliation.
-	for _, source := range []struct{ table, column string }{
-		{lectureMarkerLocalTable, "marker_uuid"},
-		{lectureTransitionReleaseLocalTable, "activation_uuid"},
-		{lectureProjectionSnapshotLocalView, "generation"},
+	snapshotFilter := ""
+	if cp.WebRSnapshot {
+		snapshotFilter = fmt.Sprintf("WHERE surface != 'webr' OR generation != fromUnixTimestamp64Milli(%d)", cp.WebRGenerationMS)
+	}
+	for _, source := range []struct{ table, column, filter string }{
+		{lectureMarkerLocalTable, "marker_uuid", ""},
+		{lectureTransitionReleaseLocalTable, "activation_uuid", ""},
+		{lectureProjectionSnapshotLocalView, "generation", snapshotFilter},
 	} {
-		rows, err := s.CHQueryRows(ctx, fmt.Sprintf(`SELECT %s FROM clusterAllReplicas(%s, %s) LIMIT 1
-			SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 15`, source.column, QuoteSQLString(s.Cfg.CHCluster), source.table))
+		rows, err := s.CHQueryRows(ctx, fmt.Sprintf(`SELECT %s FROM clusterAllReplicas(%s, %s) %s LIMIT 1
+			SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 15`, source.column, QuoteSQLString(s.Cfg.CHCluster), source.table, source.filter))
 		if err != nil {
 			return firstPublicationResume{}, newUpdateReadStateError(firstPublicationResumePhase, err)
 		}
@@ -150,7 +155,12 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 		}
 		candidates[view.Surface] = evidence
 	}
-	return firstPublicationResume{lease: lease, candidates: candidates, inventoryRevision: cp.InventoryRevision,
+	if cp.WebRSnapshot {
+		if err := s.readbackSnapshot(ctx, topology, candidates["webr"]); err != nil {
+			return firstPublicationResume{}, err
+		}
+	}
+	return firstPublicationResume{lease: lease, candidates: candidates, webrSnapshot: cp.WebRSnapshot, inventoryRevision: cp.InventoryRevision,
 		inventoryUUID: cp.InventoryUUID, authorityRevision: authority}, nil
 }
 
