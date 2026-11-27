@@ -565,8 +565,11 @@ func (s *Service) validatePublicRefreshWriteSafety(ctx context.Context) error {
 	if table == "" {
 		table = "inflearn_direct_insert_outbox"
 	}
+	// Keep the NULL check on the column granted to the publication role.
+	// ClickHouse can otherwise require access to its generated null subcolumn.
 	rows, err := s.CHQueryRows(ctx, fmt.Sprintf(`SELECT count() AS pending FROM %s.%s
-		WHERE replayed_at IS NULL SETTINGS max_threads = 1, max_execution_time = 15`, chIdent(database), chIdent(table)))
+		WHERE replayed_at IS NULL
+		SETTINGS max_threads = 1, max_execution_time = 15, optimize_functions_to_subcolumns = 0`, chIdent(database), chIdent(table)))
 	if err != nil {
 		return newUpdateReadStateError("public_refresh_outbox_preflight", err)
 	}

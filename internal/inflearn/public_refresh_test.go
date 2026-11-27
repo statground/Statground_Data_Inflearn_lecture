@@ -530,7 +530,14 @@ func TestRefreshPublicLectureViewsRequiresReaderRefreshConfigForLoadedRollout(t 
 }
 
 func TestRefreshPublicLectureViewsDefersForPendingOutbox(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { writeCHRows(w, []map[string]any{{"pending": 1}}) }))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query, err := io.ReadAll(r.Body)
+		if err != nil || !strings.Contains(string(query), "WHERE replayed_at IS NULL") ||
+			!strings.Contains(string(query), "optimize_functions_to_subcolumns = 0") {
+			t.Errorf("outbox preflight must read the granted nullable column: %s (%v)", query, err)
+		}
+		writeCHRows(w, []map[string]any{{"pending": 1}})
+	}))
 	defer server.Close()
 	_, err := publicRefreshTestService(t, server).RefreshPublicLectureViews(context.Background())
 	assertUpdateStateError(t, err, "deferred", "public_refresh_outbox_preflight", "pending_direct_outbox")
