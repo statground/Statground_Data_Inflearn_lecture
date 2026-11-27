@@ -283,7 +283,7 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 		if err := validateAdvancedPublicRefreshState(preByName[view.qualifiedName()], post, phase+"_receipt"); err != nil {
 			return PublicRefreshReceipt{}, err
 		}
-		evidence, err := s.validateCandidateGeneration(ctx, topology, view.Surface, post, priorPointers[view.Surface])
+		evidence, err := s.waitForCandidateReplicaParity(ctx, topology, view.Surface, post, priorPointers[view.Surface])
 		if err != nil {
 			return PublicRefreshReceipt{}, err
 		}
@@ -984,6 +984,27 @@ func (s *Service) readRawActivationRevision(ctx context.Context, topology map[st
 		seen[host] = true
 	}
 	return revision, nil
+}
+
+// A refresh receipt can precede the arrival of its parts on the other replicas.
+// Recheck the same generation without refreshing the source view again.
+func (s *Service) waitForCandidateReplicaParity(ctx context.Context, topology map[string]int, surface string, refresh publicRefreshState, prior publicationPointer) (generationEvidence, error) {
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		evidence, err := s.validateCandidateGeneration(ctx, topology, surface, refresh, prior)
+		state, ok := err.(*updateRunStateError)
+		if !ok || (state.Category != "partial_replica_set" && state.Category != "same_shard_replica_drift") {
+			return evidence, err
+		}
+		select {
+		case <-ctx.Done():
+			return generationEvidence{}, err
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Service) validateCandidateGeneration(ctx context.Context, topology map[string]int, surface string, refresh publicRefreshState, prior publicationPointer) (generationEvidence, error) {

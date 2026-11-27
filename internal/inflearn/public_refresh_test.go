@@ -18,7 +18,7 @@ var leaseInsertPattern = regexp.MustCompile(`(?s)SELECT toUInt64\(([0-9]+)\), to
 var markerSurfacePattern = regexp.MustCompile(`(?s)SELECT '([^']+)', fromUnixTimestamp64Milli`)
 
 func TestRefreshPublicLectureViewsPublishesThreeEndpointLocalSurfacesThenOneActivation(t *testing.T) {
-	h := &publicationHappyHarness{t: t, markers: map[string]string{}, snapshotSafe: map[string]bool{}, snapshotReadbackBounded: map[string]bool{}}
+	h := &publicationHappyHarness{t: t, markers: map[string]string{}, snapshotSafe: map[string]bool{}, snapshotReadbackBounded: map[string]bool{}, webrReplicaDelay: true}
 	server := httptest.NewServer(http.HandlerFunc(h.serveHTTP))
 	defer server.Close()
 	svc := publicRefreshTestService(t, server)
@@ -52,6 +52,9 @@ func TestRefreshPublicLectureViewsPublishesThreeEndpointLocalSurfacesThenOneActi
 		"SYSTEM REFRESH VIEW mirtype_lecture.mv_inflearn_language_lecture_catalog_refresh",
 		"SYSTEM WAIT VIEW mirtype_lecture.mv_inflearn_language_lecture_catalog_refresh",
 	}
+	if h.webrReplicaReads != 2 {
+		t.Fatalf("Web-R replica reads=%d, want 2", h.webrReplicaReads)
+	}
 	if strings.Join(h.systemCommands, "\n") != strings.Join(wantCommands, "\n") {
 		t.Fatalf("commands=%q, want=%q", h.systemCommands, wantCommands)
 	}
@@ -81,6 +84,8 @@ type publicationHappyHarness struct {
 	systemCommands, snapshotSurfaces                                                                   []string
 	authorityRevisions                                                                                 []uint64
 	statgroundProjectionBounded, statgroundSnapshotBounded                                             bool
+	webrReplicaDelay                                                                                   bool
+	webrReplicaReads                                                                                   int
 }
 
 func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -145,7 +150,15 @@ func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Reque
 		h.preflightReads++
 		writeCHRows(w, preflightRows())
 	case strings.Contains(query, lectureCandidateLocalView):
-		writeCHRows(w, candidateReplicaRows(surfaceGeneration(querySurface(query))))
+		surface := querySurface(query)
+		rows := candidateReplicaRows(surfaceGeneration(surface))
+		if surface == "webr" {
+			h.webrReplicaReads++
+			if h.webrReplicaDelay && h.webrReplicaReads == 1 {
+				rows = rows[:3]
+			}
+		}
+		writeCHRows(w, rows)
 	case strings.Contains(query, "FROM "+lectureCandidateView):
 		writeCHRows(w, []map[string]any{candidateStatsRow(12, 12, 120, 30, surfaceGeneration(querySurface(query)))})
 	case strings.Contains(query, "FROM "+lectureProjectionCandidateView):
