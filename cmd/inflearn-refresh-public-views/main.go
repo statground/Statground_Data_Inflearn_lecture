@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -14,8 +15,9 @@ import (
 func main() {
 	checkOnly := flag.Bool("check-only", false, "read publication prerequisites without writing or refreshing")
 	checkReadersOnly := flag.Bool("check-readers-only", false, "read the DB reader inventory and authenticated process states")
+	resumePath := flag.String("resume-first-publication", "", "private checkpoint for an interrupted first publication")
 	flag.Parse()
-	if flag.NArg() != 0 || (*checkOnly && *checkReadersOnly) {
+	if flag.NArg() != 0 || (*checkReadersOnly && (*checkOnly || *resumePath != "")) {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -25,6 +27,14 @@ func main() {
 		os.Exit(1)
 	}
 	svc := inflearn.NewService(cfg)
+	var checkpoint inflearn.FirstPublicationCheckpoint
+	if *resumePath != "" {
+		checkpoint, err = readCheckpoint(*resumePath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 	if *checkOnly || *checkReadersOnly {
 		var preflight any
 		var checkErr error
@@ -32,6 +42,8 @@ func main() {
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			preflight, checkErr = svc.CheckPublicationReaders(ctx)
 			cancel()
+		} else if *resumePath != "" {
+			preflight, checkErr = svc.CheckFirstPublicationResume(context.Background(), checkpoint)
 		} else {
 			preflight, checkErr = svc.CheckPublicLectureViews(context.Background())
 		}
@@ -45,7 +57,12 @@ func main() {
 		}
 		return
 	}
-	receipt, err := svc.RefreshPublicLectureViews(context.Background())
+	var receipt inflearn.PublicRefreshReceipt
+	if *resumePath != "" {
+		receipt, err = svc.ResumeFirstPublicLectureViews(context.Background(), checkpoint)
+	} else {
+		receipt, err = svc.RefreshPublicLectureViews(context.Background())
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -67,4 +84,30 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+func readCheckpoint(path string) (inflearn.FirstPublicationCheckpoint, error) {
+	var checkpoint inflearn.FirstPublicationCheckpoint
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > 4096 {
+		return checkpoint, fmt.Errorf("invalid first-publication checkpoint file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return checkpoint, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		return checkpoint, fmt.Errorf("first-publication checkpoint changed during open")
+	}
+	decoder := json.NewDecoder(io.LimitReader(file, 4097))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&checkpoint); err != nil {
+		return checkpoint, fmt.Errorf("invalid first-publication checkpoint JSON")
+	}
+	if decoder.Decode(new(json.RawMessage)) != io.EOF {
+		return checkpoint, fmt.Errorf("unexpected content after first-publication checkpoint")
+	}
+	return checkpoint, nil
 }

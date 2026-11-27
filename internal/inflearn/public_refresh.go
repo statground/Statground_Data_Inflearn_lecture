@@ -191,6 +191,10 @@ func (s *Service) CheckPublicLectureViews(ctx context.Context) (PublicRefreshPre
 }
 
 func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshReceipt, error) {
+	return s.refreshPublicLectureViews(ctx, nil)
+}
+
+func (s *Service) refreshPublicLectureViews(ctx context.Context, resume *firstPublicationResume) (PublicRefreshReceipt, error) {
 	if !s.Cfg.PublicationV2Enabled {
 		return PublicRefreshReceipt{}, stateError("degraded", "public_refresh_activation", "publication_v2_inactive")
 	}
@@ -216,11 +220,16 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 	if err != nil {
 		return PublicRefreshReceipt{}, err
 	}
-	lease, err := s.acquirePublicationLease(ctx, topology)
-	if err != nil {
-		return PublicRefreshReceipt{}, err
+	var lease publicationLease
+	if resume != nil {
+		lease = resume.lease
+	} else {
+		lease, err = s.acquirePublicationLease(ctx, topology)
+		if err != nil {
+			return PublicRefreshReceipt{}, err
+		}
 	}
-	if readerRefreshEnabled {
+	if readerRefreshEnabled && resume == nil {
 		if err := s.reconcilePublicationTransitionReaders(ctx, topology, readerConfig, lease); err != nil {
 			return PublicRefreshReceipt{}, err
 		}
@@ -236,6 +245,9 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 	initialAuthorityRevision, _, err := s.readSourceAuthorityRevision(ctx, topology, "public_refresh_source_authority_preflight")
 	if err != nil {
 		return PublicRefreshReceipt{}, err
+	}
+	if resume != nil && (len(priorPointers) != 0 || initialRevision != 0 || initialAuthorityRevision != resume.authorityRevision) {
+		return PublicRefreshReceipt{}, stateError("degraded", firstPublicationResumePhase, "publication_baseline_changed")
 	}
 	preStates, err := s.readPublicRefreshStates(ctx, nil)
 	if err != nil {
@@ -265,6 +277,13 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 		phase := "public_refresh_" + view.Surface
 		if err := s.requireCurrentPublicationLease(ctx, lease, phase+"_lease"); err != nil {
 			return PublicRefreshReceipt{}, err
+		}
+		if resume != nil && view.Surface == "webr" {
+			if !matchesResumeRefresh(preByName[view.qualifiedName()], resume.webr) {
+				return PublicRefreshReceipt{}, stateError("degraded", firstPublicationResumePhase, "refresh_checkpoint_changed")
+			}
+			evidenceBySurface[view.Surface] = resume.webr
+			continue
 		}
 		if err := s.execPublicRefreshCommand(ctx, "SYSTEM REFRESH VIEW "+view.qualifiedName(), 2*time.Minute); err != nil {
 			return PublicRefreshReceipt{}, newUpdateReadStateError(phase, err)
@@ -442,6 +461,10 @@ func (s *Service) RefreshPublicLectureViews(ctx context.Context) (PublicRefreshR
 		return PublicRefreshReceipt{}, failBeforePublicationActivation(ctx, preparedTransition, cause)
 	}
 	if readerRefreshEnabled {
+		if resume != nil && (preparedTransition.Inventory.Revision != resume.inventoryRevision ||
+			preparedTransition.Inventory.UUID != resume.inventoryUUID) {
+			return failPrepared(stateError("degraded", firstPublicationResumePhase, "reader_inventory_changed"))
+		}
 		if err := s.requireCurrentPublicationLease(ctx, lease, "public_activation_post_prepare_lease"); err != nil {
 			return failPrepared(err)
 		}
