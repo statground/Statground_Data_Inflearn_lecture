@@ -10,24 +10,34 @@ const firstPublicationResumePhase = "public_first_publication_resume"
 // FirstPublicationCheckpoint identifies the existing lease and Web-R candidate
 // from a first publication that stopped before writing serving snapshots.
 type FirstPublicationCheckpoint struct {
-	LeaseUUID               string `json:"lease_uuid"`
-	FenceEpoch              uint64 `json:"fence_epoch"`
-	AcquiredMS              int64  `json:"acquired_ms"`
-	ExpiresMS               int64  `json:"expires_ms"`
-	InventoryRevision       uint64 `json:"inventory_revision"`
-	InventoryUUID           string `json:"inventory_uuid"`
-	SourceAuthorityRevision uint64 `json:"source_authority_revision"`
-	WebRGenerationMS        int64  `json:"webr_generation_ms"`
-	WebRSuccessMS           int64  `json:"webr_success_ms"`
-	WebRRefreshMS           int64  `json:"webr_refresh_ms"`
-	WebRRows                uint64 `json:"webr_rows"`
-	WebRFingerprintSum      uint64 `json:"webr_fingerprint_sum"`
-	WebRFingerprintXOR      uint64 `json:"webr_fingerprint_xor"`
+	LeaseUUID               string                    `json:"lease_uuid"`
+	FenceEpoch              uint64                    `json:"fence_epoch"`
+	AcquiredMS              int64                     `json:"acquired_ms"`
+	ExpiresMS               int64                     `json:"expires_ms"`
+	InventoryRevision       uint64                    `json:"inventory_revision"`
+	InventoryUUID           string                    `json:"inventory_uuid"`
+	SourceAuthorityRevision uint64                    `json:"source_authority_revision"`
+	WebRGenerationMS        int64                     `json:"webr_generation_ms"`
+	WebRSuccessMS           int64                     `json:"webr_success_ms"`
+	WebRRefreshMS           int64                     `json:"webr_refresh_ms"`
+	WebRRows                uint64                    `json:"webr_rows"`
+	WebRFingerprintSum      uint64                    `json:"webr_fingerprint_sum"`
+	WebRFingerprintXOR      uint64                    `json:"webr_fingerprint_xor"`
+	MirType                 *LectureRefreshCheckpoint `json:"mirtype,omitempty"`
+}
+
+type LectureRefreshCheckpoint struct {
+	GenerationMS   int64  `json:"generation_ms"`
+	SuccessMS      int64  `json:"success_ms"`
+	RefreshMS      int64  `json:"refresh_ms"`
+	Rows           uint64 `json:"rows"`
+	FingerprintSum uint64 `json:"fingerprint_sum"`
+	FingerprintXOR uint64 `json:"fingerprint_xor"`
 }
 
 type firstPublicationResume struct {
 	lease             publicationLease
-	webr              generationEvidence
+	candidates        map[string]generationEvidence
 	inventoryRevision uint64
 	inventoryUUID     string
 	authorityRevision uint64
@@ -51,9 +61,14 @@ func (s *Service) ResumeFirstPublicLectureViews(ctx context.Context, checkpoint 
 func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPublicationCheckpoint) (firstPublicationResume, error) {
 	if !s.Cfg.PublicationV2Enabled || s.Cfg.PublicationReaderConfig == "" || s.Cfg.PublicationWriterID == "" ||
 		!isCanonicalUUID(cp.LeaseUUID) || !isCanonicalUUID(cp.InventoryUUID) || cp.FenceEpoch == 0 ||
-		cp.InventoryRevision == 0 || cp.SourceAuthorityRevision == 0 || cp.AcquiredMS <= 0 ||
-		cp.WebRSuccessMS < cp.AcquiredMS || cp.WebRRefreshMS < cp.WebRSuccessMS || cp.WebRRefreshMS >= cp.ExpiresMS ||
-		cp.WebRGenerationMS < cp.WebRSuccessMS || cp.WebRGenerationMS-cp.WebRRefreshMS >= 1000 || cp.WebRRows == 0 {
+		cp.InventoryRevision == 0 || cp.SourceAuthorityRevision == 0 || cp.AcquiredMS <= 0 {
+		return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "invalid_checkpoint")
+	}
+	web := LectureRefreshCheckpoint{
+		GenerationMS: cp.WebRGenerationMS, SuccessMS: cp.WebRSuccessMS, RefreshMS: cp.WebRRefreshMS,
+		Rows: cp.WebRRows, FingerprintSum: cp.WebRFingerprintSum, FingerprintXOR: cp.WebRFingerprintXOR,
+	}
+	if !web.within(cp.AcquiredMS, cp.ExpiresMS) || (cp.MirType != nil && !cp.MirType.within(cp.AcquiredMS, cp.ExpiresMS)) {
 		return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "invalid_checkpoint")
 	}
 	if err := s.validatePublicRefreshWriteSafety(ctx); err != nil {
@@ -120,27 +135,50 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 			return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "reader_admission_unsettled")
 		}
 	}
-	view := publicLectureRefreshViews[0]
+	candidates := make(map[string]generationEvidence, 2)
+	for _, view := range publicLectureRefreshViews {
+		reused := &web
+		if view.Surface == "mirtype" {
+			reused = cp.MirType
+		}
+		if reused == nil {
+			continue
+		}
+		evidence, err := s.verifyResumeCandidate(ctx, topology, view, *reused)
+		if err != nil {
+			return firstPublicationResume{}, err
+		}
+		candidates[view.Surface] = evidence
+	}
+	return firstPublicationResume{lease: lease, candidates: candidates, inventoryRevision: cp.InventoryRevision,
+		inventoryUUID: cp.InventoryUUID, authorityRevision: authority}, nil
+}
+
+func (cp LectureRefreshCheckpoint) within(acquiredMS, expiresMS int64) bool {
+	return cp.SuccessMS >= acquiredMS && cp.RefreshMS >= cp.SuccessMS && cp.RefreshMS < expiresMS &&
+		cp.GenerationMS >= cp.SuccessMS && cp.GenerationMS-cp.RefreshMS < 1000 && cp.Rows > 0
+}
+
+func (s *Service) verifyResumeCandidate(ctx context.Context, topology map[string]int, view publicLectureRefreshView, cp LectureRefreshCheckpoint) (generationEvidence, error) {
 	refreshes, err := s.readPublicRefreshStates(ctx, &view)
 	if err != nil {
-		return firstPublicationResume{}, newUpdateReadStateError(firstPublicationResumePhase, err)
+		return generationEvidence{}, newUpdateReadStateError(firstPublicationResumePhase, err)
 	}
-	if len(refreshes) != 1 || refreshes[0].LastSuccessMS != cp.WebRSuccessMS || refreshes[0].LastRefreshMS != cp.WebRRefreshMS {
-		return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "refresh_checkpoint_changed")
+	if len(refreshes) != 1 || refreshes[0].LastSuccessMS != cp.SuccessMS || refreshes[0].LastRefreshMS != cp.RefreshMS {
+		return generationEvidence{}, stateError("degraded", firstPublicationResumePhase, "refresh_checkpoint_changed")
 	}
 	if err := validateIdlePublicRefreshState(refreshes[0], firstPublicationResumePhase); err != nil {
-		return firstPublicationResume{}, err
+		return generationEvidence{}, err
 	}
 	evidence, err := s.validateCandidateGeneration(ctx, topology, view.Surface, refreshes[0], publicationPointer{})
 	if err != nil {
-		return firstPublicationResume{}, err
+		return generationEvidence{}, err
 	}
-	if evidence.GenerationMS != cp.WebRGenerationMS || evidence.TargetRows != cp.WebRRows ||
-		evidence.TargetFingerprintSum != cp.WebRFingerprintSum || evidence.TargetFingerprintXOR != cp.WebRFingerprintXOR {
-		return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "candidate_checkpoint_changed")
+	if evidence.GenerationMS != cp.GenerationMS || evidence.TargetRows != cp.Rows ||
+		evidence.TargetFingerprintSum != cp.FingerprintSum || evidence.TargetFingerprintXOR != cp.FingerprintXOR {
+		return generationEvidence{}, stateError("degraded", firstPublicationResumePhase, "candidate_checkpoint_changed")
 	}
-	return firstPublicationResume{lease: lease, webr: evidence, inventoryRevision: cp.InventoryRevision,
-		inventoryUUID: cp.InventoryUUID, authorityRevision: authority}, nil
+	return evidence, nil
 }
 
 func matchesResumeRefresh(state publicRefreshState, evidence generationEvidence) bool {

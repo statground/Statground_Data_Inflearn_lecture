@@ -99,7 +99,9 @@ func TestResumeSkipsWebRRefreshAndKeepsOriginalLease(t *testing.T) {
 	svc := publicRefreshTestService(t, server)
 	resume := firstPublicationResume{
 		lease: lease, authorityRevision: 1,
-		webr: generationEvidence{RefreshSuccessMS: 200000, RefreshEndMS: 201000, RefreshReadRows: 20, RefreshWriteRows: 12},
+		candidates: map[string]generationEvidence{
+			"webr": {RefreshSuccessMS: 200000, RefreshEndMS: 201000, RefreshReadRows: 20, RefreshWriteRows: 12},
+		},
 	}
 	_, err := svc.refreshPublicLectureViews(context.Background(), &resume)
 	assertUpdateStateError(t, err, "degraded", "public_refresh_mirtype_receipt", "refresh_coordinator_unavailable")

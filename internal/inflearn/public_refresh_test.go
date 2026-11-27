@@ -193,7 +193,7 @@ func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Reque
 		w.WriteHeader(http.StatusBadRequest)
 	case strings.Contains(query, lectureProjectionSnapshotLocalView):
 		surface := querySurface(query)
-		h.snapshotReadbackBounded[surface] = hasStatgroundProjectionBounds(query)
+		h.snapshotReadbackBounded[surface] = hasSnapshotReadbackBounds(query)
 		writeCHRows(w, snapshotReplicaRows(surface, surfaceGeneration(surface)))
 	case strings.HasPrefix(query, "INSERT INTO "+lectureMarkerTable):
 		if !strings.Contains(query, "insert_quorum = 4") || !strings.Contains(query, "insert_deduplication_token") {
@@ -231,9 +231,19 @@ func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Reque
 }
 
 func hasStatgroundProjectionBounds(query string) bool {
+	return strings.Contains(query, "max_memory_usage = 1610612736") &&
+		strings.Contains(query, "max_block_size = 8192") &&
+		strings.Contains(query, "max_temporary_data_on_disk_size_for_query = 2147483648") &&
+		hasPublicationQueryBounds(query)
+}
+
+func hasSnapshotReadbackBounds(query string) bool {
+	return strings.Contains(query, "max_memory_usage = 536870912") && hasPublicationQueryBounds(query)
+}
+
+func hasPublicationQueryBounds(query string) bool {
 	for _, required := range []string{
 		"max_threads = 1",
-		"max_memory_usage = 536870912",
 		"max_bytes_before_external_group_by = 67108864",
 		"max_bytes_before_external_sort = 67108864",
 	} {
@@ -259,7 +269,7 @@ func hasSnapshotSafetySettings(query string) bool {
 			return false
 		}
 	}
-	return hasStatgroundProjectionBounds(query)
+	return hasSnapshotReadbackBounds(query) || hasStatgroundProjectionBounds(query)
 }
 
 func TestInsertAndReadbackSnapshotReconcilesAmbiguousACKFromQuorumReadback(t *testing.T) {
