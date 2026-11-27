@@ -307,8 +307,8 @@ func (s *Service) readLectureReaderInventory(ctx context.Context, topology map[s
 	rows, err := s.CHQueryRows(ctx, fmt.Sprintf(`SELECT hostName() AS hostname,
 		toString(inventory_revision) AS inventory_revision,toString(inventory_uuid) AS inventory_uuid,
 		toString(app_service) AS app_service,reader_instance,toString(endpoint_sha256) AS endpoint_sha256
-		FROM clusterAllReplicas(%s,'Data_Book_Service','v_book_publication_reader_inventory_current')
-		WHERE inventory_revision=%d AND inventory_uuid=toUUID(%s)
+		FROM clusterAllReplicas(%s,'Data_Book_Service','v_book_publication_reader_inventory_current') AS registry
+		WHERE registry.inventory_revision=%d AND registry.inventory_uuid=toUUID(%s)
 		ORDER BY hostname,app_service,reader_instance
 		SETTINGS skip_unavailable_shards=0,max_threads=1,max_execution_time=30`,
 		QuoteSQLString(s.Cfg.CHCluster), cfg.ReaderInventoryRevision, QuoteSQLString(inventoryUUID)))

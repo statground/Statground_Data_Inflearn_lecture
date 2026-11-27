@@ -491,6 +491,10 @@ func TestCheckPublicationReadersUsesOnlySelectsAndAuthenticatedInventoryGETs(t *
 							"inventory_uuid": revisionUUID, "reader_count": "4", "complete": "1"})
 					}
 				case strings.Contains(query, "'v_book_publication_reader_inventory_current'"):
+					if !strings.Contains(query, "'v_book_publication_reader_inventory_current') AS registry") ||
+						!strings.Contains(query, "WHERE registry.inventory_revision=2 AND registry.inventory_uuid=toUUID(") {
+						t.Errorf("inventory filters must use the typed source columns: %s", query)
+					}
 					revisionUUID := testInventoryUUID
 					if authorityReads.Load() == 2 && changed {
 						revisionUUID = laterInventory
