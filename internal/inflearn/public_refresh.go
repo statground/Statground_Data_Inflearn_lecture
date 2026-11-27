@@ -676,7 +676,8 @@ func (s *Service) acquirePublicationLease(ctx context.Context, topology map[stri
 
 // An empty history has no GROUP BY rows. Include the exact replica inventory
 // so that a verified empty endpoint contributes zero and an absent replica
-// still fails the caller's endpoint checks.
+// still fails the caller's endpoint checks. Project the metadata at each
+// replica so the query can use the publisher's column-level grants.
 func publicationHistoryMaximumSQL(cluster, table, field, alias string) string {
 	return fmt.Sprintf(`SELECT hostname, toString(max(value)) AS %[4]s
 		FROM
@@ -685,9 +686,11 @@ func publicationHistoryMaximumSQL(cluster, table, field, alias string) string {
 			FROM clusterAllReplicas(%[1]s, lecture_publication.%[2]s)
 			GROUP BY hostname
 			UNION ALL
-			SELECT hostName() AS hostname, toUInt64(0) AS value, toUInt8(1) AS observed_replica
-			FROM clusterAllReplicas(%[1]s, 'system', 'replicas')
-			WHERE database = 'lecture_publication' AND table = '%[2]s'
+			SELECT hostname, toUInt64(0) AS value, toUInt8(1) AS observed_replica
+			FROM clusterAllReplicas(%[1]s, view(
+				SELECT hostName() AS hostname FROM system.replicas
+				WHERE database = 'lecture_publication' AND table = '%[2]s'
+			))
 		)
 		GROUP BY hostname HAVING countIf(observed_replica = 1) = 1 ORDER BY hostname
 		SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 30`,

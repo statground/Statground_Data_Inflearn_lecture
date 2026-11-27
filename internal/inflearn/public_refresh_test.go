@@ -461,13 +461,13 @@ func TestCheckPublicLectureViewsReadsEmptyHistoryWithoutWriting(t *testing.T) {
 				case strings.Contains(query, "FROM "+lectureCurrentLeaseView):
 					writeCHRows(w, nil)
 				case strings.Contains(query, "maxOrDefault(fence_epoch)"):
-					if !strings.Contains(query, "'system', 'replicas'") ||
+					if !strings.Contains(query, "view(") || !strings.Contains(query, "SELECT hostName() AS hostname FROM system.replicas") ||
 						!strings.Contains(query, "table = 'inflearn_public_catalog_publish_lease_local'") {
 						t.Errorf("missing exact lease replica inventory")
 					}
 					writeCHRows(w, rawLeaseEpochRows(0))
 				case strings.Contains(query, "maxOrDefault(activation_revision)"):
-					if !strings.Contains(query, "'system', 'replicas'") ||
+					if !strings.Contains(query, "view(") || !strings.Contains(query, "SELECT hostName() AS hostname FROM system.replicas") ||
 						!strings.Contains(query, "table = 'inflearn_public_catalog_activation_local'") {
 						t.Errorf("missing exact activation replica inventory")
 					}
