@@ -314,13 +314,19 @@ func (s *Service) refreshPublicLectureViews(ctx context.Context, resume *firstPu
 		evidenceBySurface[view.Surface] = evidence
 	}
 
-	statgroundStartMS, err := s.readServerTimeMS(ctx)
-	if err != nil {
-		return PublicRefreshReceipt{}, newUpdateReadStateError("public_candidate_statground_time", err)
+	var statground generationEvidence
+	if resume != nil {
+		statground = resume.snapshots["statground"]
 	}
-	statground, err := s.validateStatgroundProjectionCandidate(ctx, statgroundStartMS, priorPointers["statground"])
-	if err != nil {
-		return PublicRefreshReceipt{}, err
+	if statground.Surface == "" {
+		statgroundStartMS, err := s.readServerTimeMS(ctx)
+		if err != nil {
+			return PublicRefreshReceipt{}, newUpdateReadStateError("public_candidate_statground_time", err)
+		}
+		statground, err = s.validateStatgroundProjectionCandidate(ctx, statgroundStartMS, priorPointers["statground"])
+		if err != nil {
+			return PublicRefreshReceipt{}, err
+		}
 	}
 	evidenceBySurface["statground"] = statground
 
@@ -328,24 +334,27 @@ func (s *Service) refreshPublicLectureViews(ctx context.Context, resume *firstPu
 		if err := s.requireCurrentPublicationLease(ctx, lease, "public_snapshot_"+surface+"_lease"); err != nil {
 			return PublicRefreshReceipt{}, err
 		}
-		if resume != nil && surface == "webr" && resume.webrSnapshot {
-			continue
+		if resume != nil {
+			if _, ok := resume.snapshots[surface]; ok {
+				continue
+			}
 		}
 		if err := s.insertAndReadbackSnapshot(ctx, topology, evidenceBySurface[surface], runUUID); err != nil {
 			return PublicRefreshReceipt{}, err
 		}
 	}
-	statgroundEndMS, err := s.readServerTimeMS(ctx)
-	if err != nil {
-		return PublicRefreshReceipt{}, newUpdateReadStateError("public_candidate_statground_end_time", err)
+	if statground.RefreshEndMS == 0 {
+		statgroundEndMS, err := s.readServerTimeMS(ctx)
+		if err != nil {
+			return PublicRefreshReceipt{}, newUpdateReadStateError("public_candidate_statground_end_time", err)
+		}
+		if statgroundEndMS < statground.GenerationMS || statgroundEndMS-statground.GenerationMS > maxPublicRefreshMillis {
+			return PublicRefreshReceipt{}, stateError("degraded", "public_candidate_statground", "invalid_snapshot_interval")
+		}
+		statground.RefreshEndMS = statgroundEndMS
+		statground.RefreshWriteRows = statground.Rows
+		evidenceBySurface["statground"] = statground
 	}
-	if statgroundEndMS < statgroundStartMS || statgroundEndMS-statgroundStartMS > maxPublicRefreshMillis {
-		return PublicRefreshReceipt{}, stateError("degraded", "public_candidate_statground", "invalid_snapshot_interval")
-	}
-	statground = evidenceBySurface["statground"]
-	statground.RefreshEndMS = statgroundEndMS
-	statground.RefreshWriteRows = statground.Rows
-	evidenceBySurface["statground"] = statground
 
 	generations := map[string]int64{
 		"webr":       evidenceBySurface["webr"].GenerationMS,

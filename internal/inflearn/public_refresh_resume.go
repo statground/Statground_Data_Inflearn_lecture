@@ -10,21 +10,27 @@ const firstPublicationResumePhase = "public_first_publication_resume"
 // FirstPublicationCheckpoint identifies the initial lease and completed work
 // from a first publication that stopped before creating any generation marker.
 type FirstPublicationCheckpoint struct {
-	LeaseUUID               string                    `json:"lease_uuid"`
-	FenceEpoch              uint64                    `json:"fence_epoch"`
-	AcquiredMS              int64                     `json:"acquired_ms"`
-	ExpiresMS               int64                     `json:"expires_ms"`
-	InventoryRevision       uint64                    `json:"inventory_revision"`
-	InventoryUUID           string                    `json:"inventory_uuid"`
-	SourceAuthorityRevision uint64                    `json:"source_authority_revision"`
-	WebRGenerationMS        int64                     `json:"webr_generation_ms"`
-	WebRSuccessMS           int64                     `json:"webr_success_ms"`
-	WebRRefreshMS           int64                     `json:"webr_refresh_ms"`
-	WebRRows                uint64                    `json:"webr_rows"`
-	WebRFingerprintSum      uint64                    `json:"webr_fingerprint_sum"`
-	WebRFingerprintXOR      uint64                    `json:"webr_fingerprint_xor"`
-	WebRSnapshot            bool                      `json:"webr_snapshot,omitempty"`
-	MirType                 *LectureRefreshCheckpoint `json:"mirtype,omitempty"`
+	LeaseUUID               string                        `json:"lease_uuid"`
+	FenceEpoch              uint64                        `json:"fence_epoch"`
+	AcquiredMS              int64                         `json:"acquired_ms"`
+	ExpiresMS               int64                         `json:"expires_ms"`
+	InventoryRevision       uint64                        `json:"inventory_revision"`
+	InventoryUUID           string                        `json:"inventory_uuid"`
+	SourceAuthorityRevision uint64                        `json:"source_authority_revision"`
+	WebRGenerationMS        int64                         `json:"webr_generation_ms"`
+	WebRSuccessMS           int64                         `json:"webr_success_ms"`
+	WebRRefreshMS           int64                         `json:"webr_refresh_ms"`
+	WebRRows                uint64                        `json:"webr_rows"`
+	WebRFingerprintSum      uint64                        `json:"webr_fingerprint_sum"`
+	WebRFingerprintXOR      uint64                        `json:"webr_fingerprint_xor"`
+	WebRSnapshot            bool                          `json:"webr_snapshot,omitempty"`
+	MirType                 *LectureRefreshCheckpoint     `json:"mirtype,omitempty"`
+	StatgroundSnapshot      *StatgroundSnapshotCheckpoint `json:"statground_snapshot,omitempty"`
+}
+
+type StatgroundSnapshotCheckpoint struct {
+	GenerationMS int64 `json:"generation_ms"`
+	CompletedMS  int64 `json:"completed_ms"`
 }
 
 type LectureRefreshCheckpoint struct {
@@ -39,7 +45,7 @@ type LectureRefreshCheckpoint struct {
 type firstPublicationResume struct {
 	lease             publicationLease
 	candidates        map[string]generationEvidence
-	webrSnapshot      bool
+	snapshots         map[string]generationEvidence
 	inventoryRevision uint64
 	inventoryUUID     string
 	authorityRevision uint64
@@ -74,6 +80,14 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 		(cp.MirType != nil && !cp.MirType.within(cp.AcquiredMS, cp.ExpiresMS)) {
 		return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "invalid_checkpoint")
 	}
+	if cp.StatgroundSnapshot != nil {
+		if !cp.WebRSnapshot || cp.StatgroundSnapshot.GenerationMS < cp.MirType.RefreshMS ||
+			cp.StatgroundSnapshot.CompletedMS < cp.StatgroundSnapshot.GenerationMS ||
+			cp.StatgroundSnapshot.CompletedMS >= cp.ExpiresMS ||
+			cp.StatgroundSnapshot.CompletedMS-cp.StatgroundSnapshot.GenerationMS > maxPublicRefreshMillis {
+			return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "invalid_snapshot_checkpoint")
+		}
+	}
 	if err := s.validatePublicRefreshWriteSafety(ctx); err != nil {
 		return firstPublicationResume{}, err
 	}
@@ -106,6 +120,13 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 	snapshotFilter := ""
 	if cp.WebRSnapshot {
 		snapshotFilter = fmt.Sprintf("WHERE surface != 'webr' OR generation != fromUnixTimestamp64Milli(%d)", cp.WebRGenerationMS)
+	}
+	if cp.StatgroundSnapshot != nil {
+		snapshotFilter = fmt.Sprintf(`WHERE NOT (
+			(surface = 'webr' AND generation = fromUnixTimestamp64Milli(%d)) OR
+			(surface = 'mirtype' AND generation = fromUnixTimestamp64Milli(%d)) OR
+			(surface = 'statground' AND generation = fromUnixTimestamp64Milli(%d)))`,
+			cp.WebRGenerationMS, cp.MirType.GenerationMS, cp.StatgroundSnapshot.GenerationMS)
 	}
 	for _, source := range []struct{ table, column, filter string }{
 		{lectureMarkerLocalTable, "marker_uuid", ""},
@@ -155,12 +176,27 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 		}
 		candidates[view.Surface] = evidence
 	}
+	snapshots := make(map[string]generationEvidence, 3)
 	if cp.WebRSnapshot {
-		if err := s.readbackSnapshot(ctx, topology, candidates["webr"]); err != nil {
+		snapshots["webr"] = candidates["webr"]
+	}
+	if cp.StatgroundSnapshot != nil {
+		statground, err := s.validateStatgroundProjectionCandidate(ctx, cp.StatgroundSnapshot.GenerationMS, publicationPointer{})
+		if err != nil {
 			return firstPublicationResume{}, err
 		}
+		statground.RefreshEndMS = cp.StatgroundSnapshot.CompletedMS
+		statground.RefreshWriteRows = statground.Rows
+		snapshots["statground"], snapshots["mirtype"] = statground, candidates["mirtype"]
 	}
-	return firstPublicationResume{lease: lease, candidates: candidates, webrSnapshot: cp.WebRSnapshot, inventoryRevision: cp.InventoryRevision,
+	for _, surface := range expectedPublicationSurfaces {
+		if evidence, ok := snapshots[surface]; ok {
+			if err := s.readbackSnapshot(ctx, topology, evidence); err != nil {
+				return firstPublicationResume{}, err
+			}
+		}
+	}
+	return firstPublicationResume{lease: lease, candidates: candidates, snapshots: snapshots, inventoryRevision: cp.InventoryRevision,
 		inventoryUUID: cp.InventoryUUID, authorityRevision: authority}, nil
 }
 

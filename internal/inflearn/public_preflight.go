@@ -72,10 +72,10 @@ source_authority_endpoints AS
 ),
 source_authority AS
 (
-    SELECT count() AS endpoint_count,uniqExact(authority_revision) AS revision_count,
-      min(authority_revision) AS authority_revision,
+    SELECT count() AS endpoint_count,uniqExact(sa.authority_revision) AS revision_count,
+      min(sa.authority_revision) AS authority_revision,
       countIf(fence_rows=1 AND versions=1) AS exact_endpoints
-    FROM source_authority_endpoints
+    FROM source_authority_endpoints AS sa
 ),
 replica_inventory AS
 (
@@ -153,10 +153,10 @@ raw_shards AS
 (
     SELECT surface,shard_name,count() AS endpoint_count,
       uniqExact(replica_name) AS replica_count,
-      uniqExact(tuple(row_count,logical_key_count,fingerprint_sum,fingerprint_xor)) AS versions,
-      any(row_count) AS row_count,any(logical_key_count) AS logical_key_count,
-      any(fingerprint_sum) AS fingerprint_sum,any(fingerprint_xor) AS fingerprint_xor
-    FROM raw_endpoints GROUP BY surface,shard_name
+      uniqExact(tuple(re.row_count,re.logical_key_count,re.fingerprint_sum,re.fingerprint_xor)) AS versions,
+      any(re.row_count) AS row_count,any(re.logical_key_count) AS logical_key_count,
+      any(re.fingerprint_sum) AS fingerprint_sum,any(re.fingerprint_xor) AS fingerprint_xor
+    FROM raw_endpoints AS re GROUP BY surface,shard_name
 ),
 statground_raw_endpoints AS
 (
@@ -173,20 +173,20 @@ statground_raw_endpoints AS
 statground_raw_shards AS
 (
     SELECT shard_name,count() AS endpoint_count,uniqExact(replica_name) AS replica_count,
-      uniqExact(tuple(row_count,logical_key_count,fingerprint_sum,fingerprint_xor,component_count)) AS versions,
-      any(row_count) AS row_count,any(logical_key_count) AS logical_key_count,
-      any(fingerprint_sum) AS fingerprint_sum,any(fingerprint_xor) AS fingerprint_xor,
-      any(component_count) AS component_count
-    FROM statground_raw_endpoints GROUP BY shard_name
+      uniqExact(tuple(re.row_count,re.logical_key_count,re.fingerprint_sum,re.fingerprint_xor,re.component_count)) AS versions,
+      any(re.row_count) AS row_count,any(re.logical_key_count) AS logical_key_count,
+      any(re.fingerprint_sum) AS fingerprint_sum,any(re.fingerprint_xor) AS fingerprint_xor,
+      any(re.component_count) AS component_count
+    FROM statground_raw_endpoints AS re GROUP BY shard_name
 ),
 raw_physical AS
 (
-    SELECT surface,count() AS shard_count,sum(endpoint_count) AS endpoint_count,
-      countIf(endpoint_count=2 AND replica_count=2 AND versions=1) AS peer_groups,
-      sum(row_count) AS row_count,sum(logical_key_count) AS logical_key_count,
-      sumWithOverflow(fingerprint_sum) AS fingerprint_sum,
-      groupBitXor(fingerprint_xor) AS fingerprint_xor
-    FROM raw_shards GROUP BY surface
+    SELECT surface,count() AS shard_count,sum(rs.endpoint_count) AS endpoint_count,
+      countIf(rs.endpoint_count=2 AND replica_count=2 AND versions=1) AS peer_groups,
+      sum(rs.row_count) AS row_count,sum(rs.logical_key_count) AS logical_key_count,
+      sumWithOverflow(rs.fingerprint_sum) AS fingerprint_sum,
+      groupBitXor(rs.fingerprint_xor) AS fingerprint_xor
+    FROM raw_shards AS rs GROUP BY surface
     UNION ALL
     SELECT toLowCardinality('statground'),count(),sum(endpoint_count),
       countIf(endpoint_count=2 AND replica_count=2 AND versions=1 AND component_count=3),
@@ -236,18 +236,19 @@ snapshot_endpoints AS
 snapshot AS
 (
     SELECT surface,count() AS endpoint_rows,
-      uniqExact(tuple(row_count,logical_key_count,fingerprint_sum,fingerprint_xor,generation_count,generation)) AS versions,
-      any(row_count) AS row_count,any(logical_key_count) AS logical_key_count,
-      any(fingerprint_sum) AS fingerprint_sum,any(fingerprint_xor) AS fingerprint_xor,
-      countIf(generation_count=1) AS exact_generation_endpoints
-    FROM snapshot_endpoints GROUP BY surface
+      uniqExact(tuple(se.row_count,se.logical_key_count,se.fingerprint_sum,se.fingerprint_xor,se.generation_count,se.generation)) AS versions,
+      any(se.row_count) AS row_count,any(se.logical_key_count) AS logical_key_count,
+      any(se.fingerprint_sum) AS fingerprint_sum,any(se.fingerprint_xor) AS fingerprint_xor,
+      countIf(se.generation_count=1) AS exact_generation_endpoints
+    FROM snapshot_endpoints AS se GROUP BY surface
 ),
 proof AS
 (
-    SELECT g.surface,g.generation,
+    SELECT g.surface AS surface,g.generation AS generation,
       r.row_count AS target_row_count,r.logical_key_count AS target_logical_key_count,
       r.fingerprint_sum AS target_fingerprint_sum,r.fingerprint_xor AS target_fingerprint_xor,
-      p.row_count,p.logical_key_count,p.fingerprint_sum,p.fingerprint_xor,p.source_fetched_max,
+      p.row_count AS row_count,p.logical_key_count AS logical_key_count,
+      p.fingerprint_sum AS fingerprint_sum,p.fingerprint_xor AS fingerprint_xor,p.source_fetched_max AS source_fetched_max,
       count() OVER () AS surface_count,
       countIf(r.shard_count=2 AND r.endpoint_count=4 AND r.peer_groups=2
         AND r.row_count>0 AND r.row_count=r.logical_key_count
@@ -283,17 +284,20 @@ SELECT
       OR (SELECT count() FROM statground_raw_shards)!=2
       OR (SELECT countIf(component_count=3) FROM statground_raw_endpoints)!=4
       OR (SELECT count() FROM snapshot_endpoints)!=12
-      OR surface_count!=3 OR matching_surface_count!=3,
+      OR proof.surface_count!=3 OR proof.matching_surface_count!=3,
       'Lecture candidate blocked before marker: fence, advancement, queue, 2x2 raw, Distributed, local snapshot, or source freshness proof failed'
     ) AS candidate_preflight_ok,
-    surface,generation,target_row_count,target_logical_key_count,
-    target_fingerprint_sum,target_fingerprint_xor,row_count,logical_key_count,
-    fingerprint_sum,fingerprint_xor,source_fetched_max,source_authority.authority_revision
+    proof.surface AS surface,proof.generation AS generation,
+    proof.target_row_count AS target_row_count,proof.target_logical_key_count AS target_logical_key_count,
+    proof.target_fingerprint_sum AS target_fingerprint_sum,proof.target_fingerprint_xor AS target_fingerprint_xor,
+    proof.row_count AS row_count,proof.logical_key_count AS logical_key_count,
+    proof.fingerprint_sum AS fingerprint_sum,proof.fingerprint_xor AS fingerprint_xor,
+    proof.source_fetched_max AS source_fetched_max,source_authority.authority_revision AS authority_revision
 FROM proof
 CROSS JOIN replicas
 CROSS JOIN queue
 CROSS JOIN source_authority
-ORDER BY surface
+ORDER BY proof.surface
 SETTINGS skip_unavailable_shards=0,max_threads=1`
 
 func renderPublicationCandidatePreflightSQL(generations map[string]int64, fenceEpoch uint64, leaseUUID string) string {
