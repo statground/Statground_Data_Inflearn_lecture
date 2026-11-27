@@ -6,14 +6,16 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"statground_inflearn/internal/inflearn"
 )
 
 func main() {
 	checkOnly := flag.Bool("check-only", false, "read publication prerequisites without writing or refreshing")
+	checkReadersOnly := flag.Bool("check-readers-only", false, "read the DB reader inventory and authenticated process states")
 	flag.Parse()
-	if flag.NArg() != 0 {
+	if flag.NArg() != 0 || (*checkOnly && *checkReadersOnly) {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -23,8 +25,16 @@ func main() {
 		os.Exit(1)
 	}
 	svc := inflearn.NewService(cfg)
-	if *checkOnly {
-		preflight, checkErr := svc.CheckPublicLectureViews(context.Background())
+	if *checkOnly || *checkReadersOnly {
+		var preflight any
+		var checkErr error
+		if *checkReadersOnly {
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			preflight, checkErr = svc.CheckPublicationReaders(ctx)
+			cancel()
+		} else {
+			preflight, checkErr = svc.CheckPublicLectureViews(context.Background())
+		}
 		if checkErr != nil {
 			fmt.Fprintln(os.Stderr, checkErr)
 			os.Exit(1)

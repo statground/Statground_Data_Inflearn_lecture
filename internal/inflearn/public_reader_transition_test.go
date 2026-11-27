@@ -3,10 +3,12 @@ package inflearn
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -291,5 +293,247 @@ func TestPublicationTransitionAbortRequiresPreparedProof(t *testing.T) {
 	inventory.Phase = "committed"
 	if _, err := abortPublicationTransitionReader(context.Background(), inventory); err == nil {
 		t.Fatal("post-COMMIT abort was accepted")
+	}
+}
+
+func TestPublicationTransitionInventoryDriftAbortsEveryPreparedReader(t *testing.T) {
+	for _, interrupted := range []bool{false, true} {
+		name := "inventory_drift"
+		if interrupted {
+			name = "canceled_proof_and_first_abort_rejected"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var preparedCount, abortAttempts, abortSuccesses atomic.Int32
+			cfg := lectureReaderConfigFile{ReaderInventoryRevision: 2}
+			for _, service := range []string{"web-r", "mirtype", "statground"} {
+				reader := lectureReaderConfig{AppService: service, ReaderInstance: service + "-1", BearerToken: testReaderBearer}
+				old := oldTransitionAuthorityForReader(publicationPointer{}, 0, service)
+				oldDigest, _ := canonicalJSONSHA256(old.jsonValue())
+				oldProof := strings.Repeat("b", 64)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					now := time.Now().UTC().Format(time.RFC3339Nano)
+					response := map[string]any{
+						"app_service": service, "domain": "lecture", "reader_instance": reader.ReaderInstance,
+						"reader_epoch_uuid": testReaderEpoch,
+					}
+					if r.Method == http.MethodGet && r.URL.Path == publicationTransitionRoot {
+						response["format"], response["inventory_nonce"] = publicationTransitionInventoryFormat, r.URL.Query().Get("inventory_nonce")
+						response["phase"], response["admission_open"], response["inflight"], response["observed_at"] = "steady", true, 0, now
+						response["serving_authority_sha256"] = oldDigest
+						for _, key := range []string{"transition_id", "old_authority_sha256", "candidate_authority_sha256",
+							"prepare_receipt_sha256", "commit_receipt_sha256", "old_state_proof_sha256",
+							"last_finalized_transition_id", "last_finalize_receipt_sha256"} {
+							response[key] = ""
+						}
+						_ = json.NewEncoder(w).Encode(response)
+						return
+					}
+					request := decodeTransitionRequest(t, r)
+					response["inventory_nonce"], response["transition_id"] = request["inventory_nonce"], request["transition_id"]
+					response["old_authority_sha256"], response["old_state_proof_sha256"] = oldDigest, oldProof
+					switch r.URL.Path {
+					case publicationTransitionRoot + "/prepare":
+						preparedCount.Add(1)
+						candidateDigest, _ := canonicalJSONSHA256(request["candidate_authority"])
+						response["format"], response["phase"] = publicationTransitionPrepareReceipt, "prepared"
+						response["prepare_nonce"], response["candidate_authority_sha256"] = request["prepare_nonce"], candidateDigest
+						response["inflight_before"], response["inflight_after"], response["prepared_at"] = 0, 0, now
+					case publicationTransitionRoot + "/abort":
+						abortAttempts.Add(1)
+						if interrupted && service == "web-r" {
+							http.Error(w, "old authority no longer matches", http.StatusConflict)
+							return
+						}
+						abortSuccesses.Add(1)
+						response["format"], response["phase"] = publicationTransitionAbortReceipt, "steady"
+						response["abort_nonce"], response["aborted_at"] = request["abort_nonce"], now
+					default:
+						t.Errorf("unexpected reader action %s", r.URL.Path)
+						http.Error(w, "unexpected reader action", http.StatusBadRequest)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(hashedTransitionReceipt(t, response))
+				}))
+				t.Cleanup(server.Close)
+				reader.InventoryEndpoint = server.URL + "/internal/book-publication/drain"
+				reader.inventoryEndpointSHA, _ = canonicalJSONSHA256(reader.InventoryEndpoint)
+				cfg.Readers = append(cfg.Readers, reader)
+			}
+			topology := make(map[string]int)
+			var authorityRows, inventoryRows []map[string]any
+			for i, host := range publicationHosts() {
+				topology[host] = i + 1
+				authorityRows = append(authorityRows, map[string]any{
+					"hostname": host, "inventory_revision": "2", "inventory_uuid": testInventoryUUID,
+					"reader_count": "3", "complete": "1",
+				})
+				for _, reader := range cfg.Readers {
+					inventoryRows = append(inventoryRows, map[string]any{
+						"hostname": host, "inventory_revision": "2", "inventory_uuid": testInventoryUUID,
+						"app_service": reader.AppService, "reader_instance": reader.ReaderInstance,
+						"endpoint_sha256": reader.inventoryEndpointSHA,
+					})
+				}
+			}
+			var inventoryReads atomic.Int32
+			db := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				query := strings.TrimSpace(string(body))
+				switch {
+				case query == "SYSTEM SYNC REPLICA "+readerInventoryLocalTable+" STRICT",
+					query == "SYSTEM SYNC REPLICA "+readerInventoryMarkerTable+" STRICT":
+					w.WriteHeader(http.StatusOK)
+				case strings.Contains(query, "'v_book_publication_reader_inventory_authority'"):
+					if inventoryReads.Add(1) > 1 {
+						if interrupted {
+							cancel()
+						}
+						writeCHRows(w, nil)
+						return
+					}
+					writeCHRows(w, authorityRows)
+				case strings.Contains(query, "'v_book_publication_reader_inventory_current'"):
+					writeCHRows(w, inventoryRows)
+				default:
+					t.Errorf("unexpected database statement: %s", query)
+					http.Error(w, "unexpected SQL", http.StatusBadRequest)
+				}
+			}))
+			t.Cleanup(db.Close)
+			activation := activationEvidence{
+				Revision: 1, ActivationUUID: testActivationUUID, RunUUID: testActivationRun,
+				WebRGenerationMS: 1700000000123, MirGenerationMS: 1700000000123, StatgroundGenerationMS: 1700000000123,
+			}
+			_, err := publicRefreshTestService(t, db).preparePublicationTransitionReaders(ctx, topology, cfg, nil, activation, 1)
+			if interrupted {
+				assertUpdateStateError(t, err, "degraded", "public_reader_transition_abort", "preactivation_abort_failed")
+			} else {
+				assertUpdateStateError(t, err, "degraded", "public_reader_transition_prepare", "reader_inventory_changed")
+			}
+			wantSuccesses := int32(3)
+			if interrupted {
+				wantSuccesses = 2
+			}
+			if preparedCount.Load() != 3 || abortAttempts.Load() != 3 || abortSuccesses.Load() != wantSuccesses {
+				t.Fatalf("prepared=%d aborts=%d successful aborts=%d", preparedCount.Load(), abortAttempts.Load(), abortSuccesses.Load())
+			}
+		})
+	}
+}
+
+func TestCheckPublicationReadersUsesOnlySelectsAndAuthenticatedInventoryGETs(t *testing.T) {
+	const laterInventory = "01994602-0000-7000-8000-000000000116"
+	for _, changed := range []bool{false, true} {
+		name := "four_registered_readers"
+		if changed {
+			name = "inventory_changed_during_check"
+		}
+		t.Run(name, func(t *testing.T) {
+			var gets, authorityReads atomic.Int32
+			cfg := lectureReaderConfigFile{ReaderInventoryRevision: 2}
+			services := map[string]string{"web-r-1": "web-r", "web-r-2": "web-r", "mirtype-1": "mirtype", "statground-1": "statground"}
+			for instance, service := range services {
+				reader := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					nonce := r.URL.Query().Get("inventory_nonce")
+					if r.Method != http.MethodGet || r.URL.Path != publicationTransitionRoot ||
+						r.Header.Get("Authorization") != "Bearer "+testReaderBearer || !isCanonicalUUID(nonce) {
+						t.Error("unexpected reader inventory request")
+						http.Error(w, "unexpected request", http.StatusBadRequest)
+						return
+					}
+					gets.Add(1)
+					phase := "steady"
+					if service == "mirtype" {
+						phase = "recovery_hold"
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"format": publicationTransitionInventoryFormat, "app_service": service, "domain": "lecture",
+						"reader_instance": instance, "reader_epoch_uuid": testReaderEpoch, "inventory_nonce": nonce,
+						"phase": phase, "admission_open": phase == "steady", "inflight": 0,
+						"observed_at": time.Now().UTC().Format(time.RFC3339Nano), "transition_id": "",
+						"serving_authority_sha256": "", "old_authority_sha256": "", "candidate_authority_sha256": "",
+						"prepare_receipt_sha256": "", "commit_receipt_sha256": "", "old_state_proof_sha256": "",
+						"last_finalized_transition_id": "", "last_finalize_receipt_sha256": "",
+					})
+				}))
+				t.Cleanup(reader.Close)
+				cfg.Readers = append(cfg.Readers, lectureReaderConfig{
+					AppService: service, ReaderInstance: instance, BearerToken: testReaderBearer,
+					InventoryEndpoint: reader.URL + "/internal/book-publication/drain", RefreshEndpoint: reader.URL + lectureReaderRefreshPath,
+				})
+			}
+			path := writeReaderConfig(t, 0o600, cfg)
+			configured, err := loadLectureReaderConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				query := strings.TrimSpace(string(body))
+				if !strings.HasPrefix(query, "SELECT ") {
+					t.Errorf("read-only check issued non-SELECT SQL: %s", query)
+					http.Error(w, "unexpected SQL", http.StatusBadRequest)
+					return
+				}
+				var rows []map[string]any
+				switch {
+				case strings.Contains(query, "FROM system.clusters"):
+					rows = publicationTopologyRows()
+				case strings.Contains(query, "'v_book_publication_reader_inventory_authority'"):
+					revisionUUID := testInventoryUUID
+					if authorityReads.Add(1) == 2 && changed {
+						revisionUUID = laterInventory
+					}
+					for _, host := range publicationHosts() {
+						rows = append(rows, map[string]any{"hostname": host, "inventory_revision": "2",
+							"inventory_uuid": revisionUUID, "reader_count": "4", "complete": "1"})
+					}
+				case strings.Contains(query, "'v_book_publication_reader_inventory_current'"):
+					revisionUUID := testInventoryUUID
+					if authorityReads.Load() == 2 && changed {
+						revisionUUID = laterInventory
+					}
+					for _, host := range publicationHosts() {
+						for _, reader := range configured.Readers {
+							rows = append(rows, map[string]any{"hostname": host, "inventory_revision": "2",
+								"inventory_uuid": revisionUUID, "app_service": reader.AppService, "reader_instance": reader.ReaderInstance,
+								"endpoint_sha256": reader.inventoryEndpointSHA})
+						}
+					}
+				default:
+					t.Errorf("unexpected SQL: %s", query)
+					http.Error(w, "unexpected SQL", http.StatusBadRequest)
+					return
+				}
+				writeCHRows(w, rows)
+			}))
+			t.Cleanup(db.Close)
+			svc := publicRefreshTestService(t, db)
+			svc.Cfg.PublicationReaderConfig = path
+			got, err := svc.CheckPublicationReaders(context.Background())
+			if gets.Load() != 4 || authorityReads.Load() != 2 {
+				t.Fatalf("observed %d readers and %d inventory readbacks", gets.Load(), authorityReads.Load())
+			}
+			if changed {
+				assertUpdateStateError(t, err, "degraded", "public_reader_transition_inventory", "reader_inventory_changed")
+				return
+			}
+			if err != nil || got.InventoryRevision != 2 || got.InventoryUUID != testInventoryUUID || len(got.Readers) != 4 {
+				t.Fatalf("preflight=%+v, err=%v", got, err)
+			}
+			for _, row := range got.Readers {
+				admitted := row.AppService != "mirtype"
+				if row.EpochUUID != testReaderEpoch || row.AdmissionOpen != admitted ||
+					(admitted && row.Phase != "steady") || (!admitted && row.Phase != "recovery_hold") {
+					t.Fatalf("unexpected observation %+v", row)
+				}
+			}
+			output, marshalErr := json.Marshal(got)
+			if marshalErr != nil || strings.Contains(string(output), testReaderBearer) || strings.Contains(string(output), "endpoint") {
+				t.Fatal("reader preflight must emit process evidence without credentials or endpoint URLs")
+			}
+		})
 	}
 }

@@ -213,6 +213,22 @@ class ClickHousePressureGateTest(unittest.TestCase):
                     workflow,
                 )
 
+    def test_reader_preflight_dispatch_excludes_collection_and_publication(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_collect_all.yml").read_text()
+        collector, preflight = workflow.split("\n  reader_preflight:\n")
+        self.assertIn("if: github.event_name != 'workflow_dispatch' || !inputs.check_readers_only", collector)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.check_readers_only", preflight)
+        self.assertIn("github.ref_name != github.event.repository.default_branch", preflight)
+        self.assertIn('test "$CH_USER" = "inflearn_lecture_generation_publisher"', preflight)
+        self.assertEqual(
+            [line.strip() for line in preflight.splitlines() if "go run " in line],
+            ['proof="$(go run -mod=mod ./cmd/inflearn-refresh-public-views --check-readers-only)"'],
+        )
+        self.assertIn("unset READER_REFRESH_CONFIG_JSON", preflight)
+        self.assertNotIn('echo "$proof"', preflight)
+        self.assertIn('CH_DIRECT_REPLICA_FALLBACK: "false"', preflight)
+        self.assertIn('CH_DIRECT_OUTBOX_FALLBACK: "false"', preflight)
+
     def test_contract_workflow_is_secret_free_and_read_only(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_contract_tests.yml").read_text()
         self.assertIn("push:\n    branches: [main]", workflow)

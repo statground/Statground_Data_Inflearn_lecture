@@ -8,6 +8,10 @@ on:
       - "inflearn-runtime-check-*"
   workflow_dispatch:
     inputs:
+      check_readers_only:
+        description: "Verify protected publication readers without collection or publication"
+        type: boolean
+        default: false
       languages:
         description: "Comma-separated Statground UI language codes"
         required: false
@@ -29,11 +33,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: inflearn-collector-all
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.check_readers_only && 'inflearn-reader-preflight' || 'inflearn-collector-all' }}
   cancel-in-progress: false
 
 jobs:
   collect_all:
+    if: github.event_name != 'workflow_dispatch' || !inputs.check_readers_only
     runs-on: ubuntu-latest
     timeout-minutes: 100
     env:
@@ -417,3 +422,70 @@ jobs:
           INFLEARN_PUBLICATION_OUTCOME: ${{ steps.refresh_public_lecture_views.outcome }}
           INFLEARN_FRESHNESS_OUTCOME: ${{ steps.verify_public_freshness.outcome }}
         run: python3 scripts/inflearn_workflow_status.py
+
+  reader_preflight:
+    if: github.event_name == 'workflow_dispatch' && inputs.check_readers_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require the default branch for the protected check
+        if: github.ref_type != 'branch' || github.ref_name != github.event.repository.default_branch
+        run: |
+          echo "::error::Run the protected reader preflight from the default branch."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify protected publication readers
+        env:
+          STATE_BACKEND: clickhouse
+          INGEST_MODE: clickhouse
+          CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
+          CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
+          CH_USER: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER }}
+          CH_PASSWORD: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_PASSWORD }}
+          CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE }}
+          CH_DIRECT_REPLICA_FALLBACK: "false"
+          CH_DIRECT_OUTBOX_FALLBACK: "false"
+          READER_REFRESH_CONFIG_JSON: ${{ secrets.INFLEARN_LECTURE_READER_REFRESH_CONFIG_JSON }}
+        run: |
+          test -n "$CH_HOST" && test -n "$CH_USER" && test -n "$CH_PASSWORD" &&
+            test -n "$READER_REFRESH_CONFIG_JSON" || {
+            echo "::error::Protected ClickHouse or reader configuration is missing."
+            exit 1
+          }
+          test "$CH_USER" = "inflearn_lecture_generation_publisher" || {
+            echo "::error::The protected preflight requires the dedicated publication account."
+            exit 1
+          }
+          if [[ "${CH_SECURE,,}" != "true" && "$CH_SECURE" != "1" ]]; then
+            echo "::error::The protected preflight requires the verified ClickHouse HTTPS endpoint."
+            exit 1
+          fi
+          umask 077
+          READER_REFRESH_CONFIG_FILE="$(mktemp)"
+          trap 'rm -f -- "$READER_REFRESH_CONFIG_FILE"' EXIT
+          printf '%s' "$READER_REFRESH_CONFIG_JSON" > "$READER_REFRESH_CONFIG_FILE"
+          unset READER_REFRESH_CONFIG_JSON
+          export INFLEARN_LECTURE_READER_REFRESH_CONFIG_FILE="$READER_REFRESH_CONFIG_FILE"
+          proof="$(go run -mod=mod ./cmd/inflearn-refresh-public-views --check-readers-only)"
+          python3 -c '
+          import json
+          import sys
+
+          result = json.load(sys.stdin)
+          readers = result["readers"]
+          count = sum(reader["phase"] == "steady" and reader["admission_open"] is True for reader in readers)
+          print(json.dumps({"inventory_revision": result["inventory_revision"],
+                            "reader_count": len(readers), "steady_open_count": count}))
+          sys.exit(0 if readers and count == len(readers) else 1)
+          ' <<< "$proof"
