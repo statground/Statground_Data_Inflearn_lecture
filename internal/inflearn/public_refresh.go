@@ -652,26 +652,32 @@ func (s *Service) acquirePublicationLease(ctx context.Context, topology map[stri
 		 insert_deduplicate = 1, insert_deduplication_token = %s`,
 		lectureLeaseTable, lease.FenceEpoch, QuoteSQLString(lease.LeaseUUID), QuoteSQLString(lease.WriterID),
 		lease.AcquiredMS, lease.ExpiresMS, QuoteSQLString(token))
-	var insertErr error
+	insertErr := s.execPublicRefreshCommand(ctx, sql, 2*time.Minute)
+	if err := reconcilePublicationWrite("public_refresh_lease_insert", insertErr, func() error {
+		return s.readbackPublicationLease(ctx, topology, lease)
+	}); err != nil {
+		return publicationLease{}, err
+	}
+	if err := s.requireCurrentPublicationLease(ctx, lease, "public_refresh_lease_current"); err != nil {
+		return publicationLease{}, err
+	}
+	return lease, nil
+}
+
+// A failed proof does not establish that the write was absent. A repeated
+// Distributed insert can add a second physical record even with the same token.
+func reconcilePublicationWrite(phase string, insertErr error, readback func() error) error {
+	var readbackErr error
 	for attempt := 0; attempt < publicationMutationReconcileAttempts; attempt++ {
-		// Reissue the exact fenced operation after either an insert timeout or an
-		// incomplete readback. The stable deduplication token makes this retry
-		// idempotent while allowing a partially delivered Distributed insert to
-		// converge on all four replicas.
-		insertErr = s.execPublicRefreshCommand(ctx, sql, 2*time.Minute)
-		if err := s.readbackPublicationLease(ctx, topology, lease); err == nil {
-			if err := s.requireCurrentPublicationLease(ctx, lease, "public_refresh_lease_current"); err != nil {
-				return publicationLease{}, err
-			}
-			return lease, nil
-		} else if attempt+1 == publicationMutationReconcileAttempts {
-			if insertErr != nil {
-				return publicationLease{}, newUpdateReadStateError("public_refresh_lease_insert", insertErr)
-			}
-			return publicationLease{}, err
+		readbackErr = readback()
+		if readbackErr == nil {
+			return nil
 		}
 	}
-	return publicationLease{}, stateError("degraded", "public_refresh_lease", "lease_reconcile_failed")
+	if insertErr != nil {
+		return newUpdateReadStateError(phase, insertErr)
+	}
+	return readbackErr
 }
 
 // An empty history has no GROUP BY rows. Include the exact replica inventory
@@ -728,8 +734,8 @@ func (s *Service) readbackPublicationLease(ctx context.Context, topology map[str
 		toString(fence_epoch) AS fence_epoch, toString(lease_uuid) AS lease_uuid, writer_id,
 		toUnixTimestamp64Milli(acquired_at) AS acquired_ms,
 		toUnixTimestamp64Milli(expires_at) AS expires_ms
-		FROM clusterAllReplicas(%s, lecture_publication.inflearn_public_catalog_publish_lease_local)
-		WHERE fence_epoch = toUInt64(%d)
+		FROM clusterAllReplicas(%s, lecture_publication.inflearn_public_catalog_publish_lease_local) AS lease
+		WHERE lease.fence_epoch = toUInt64(%d)
 		ORDER BY hostname
 		SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 30`,
 		QuoteSQLString(s.Cfg.CHCluster), lease.FenceEpoch))
@@ -1364,19 +1370,10 @@ func (s *Service) insertAndReadbackGeneration(ctx context.Context, topology map[
 		evidence.FingerprintSum, evidence.FingerprintXOR, evidence.SourceFetchedMaxMS,
 		evidence.RefreshReadRows, evidence.RefreshWriteRows, evidence.RefreshSuccessMS, evidence.RefreshEndMS, evidence.CompletedMS,
 		QuoteSQLString(token))
-	var insertErr error
-	for attempt := 0; attempt < publicationMutationReconcileAttempts; attempt++ {
-		insertErr = s.execPublicRefreshCommand(ctx, sql, 2*time.Minute)
-		if err := s.readbackGeneration(ctx, topology, evidence); err == nil {
-			return nil
-		} else if attempt+1 == publicationMutationReconcileAttempts {
-			if insertErr != nil {
-				return newUpdateReadStateError(phase+"_insert", insertErr)
-			}
-			return err
-		}
-	}
-	return stateError("degraded", phase, "marker_reconcile_failed")
+	insertErr := s.execPublicRefreshCommand(ctx, sql, 2*time.Minute)
+	return reconcilePublicationWrite(phase+"_insert", insertErr, func() error {
+		return s.readbackGeneration(ctx, topology, evidence)
+	})
 }
 
 func (s *Service) readbackGeneration(ctx context.Context, topology map[string]int, evidence generationEvidence) error {
@@ -1393,8 +1390,8 @@ func (s *Service) readbackGeneration(ctx context.Context, topology map[string]in
 		toUnixTimestamp64Milli(refresh_success_time) AS refresh_success_ms,
 		toUnixTimestamp64Milli(refresh_end_time) AS refresh_end_ms,
 		toUnixTimestamp64Milli(completed_at) AS completed_ms
-		FROM clusterAllReplicas(%s, lecture_publication.inflearn_public_catalog_generation_local)
-		WHERE marker_uuid = toUUID(%s) AND run_uuid = toUUID(%s)
+		FROM clusterAllReplicas(%s, lecture_publication.inflearn_public_catalog_generation_local) AS marker
+		WHERE marker.marker_uuid = toUUID(%s) AND marker.run_uuid = toUUID(%s)
 		SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 30`,
 		QuoteSQLString(s.Cfg.CHCluster), QuoteSQLString(evidence.MarkerUUID), QuoteSQLString(evidence.RunUUID)))
 	if err != nil {
@@ -1453,19 +1450,10 @@ func (s *Service) insertAndReadbackActivation(ctx context.Context, topology map[
 		QuoteSQLString(activation.WebRMarkerUUID), activation.MirGenerationMS, QuoteSQLString(activation.MirMarkerUUID),
 		activation.StatgroundGenerationMS, QuoteSQLString(activation.StatgroundMarkerUUID),
 		QuoteSQLString(activation.Kind), activation.ActivatedMS, QuoteSQLString(token))
-	var insertErr error
-	for attempt := 0; attempt < publicationMutationReconcileAttempts; attempt++ {
-		insertErr = s.execPublicRefreshCommand(ctx, sql, 2*time.Minute)
-		if err := s.readbackActivation(ctx, topology, activation); err == nil {
-			return nil
-		} else if attempt+1 == publicationMutationReconcileAttempts {
-			if insertErr != nil {
-				return newUpdateReadStateError("public_activation_insert", insertErr)
-			}
-			return err
-		}
-	}
-	return stateError("degraded", "public_activation_insert", "activation_reconcile_failed")
+	insertErr := s.execPublicRefreshCommand(ctx, sql, 2*time.Minute)
+	return reconcilePublicationWrite("public_activation_insert", insertErr, func() error {
+		return s.readbackActivation(ctx, topology, activation)
+	})
 }
 
 func (s *Service) readbackActivation(ctx context.Context, topology map[string]int, activation activationEvidence) error {
@@ -1476,8 +1464,8 @@ func (s *Service) readbackActivation(ctx context.Context, topology map[string]in
 		toUnixTimestamp64Milli(mirtype_generation) AS mirtype_generation_ms, toString(mirtype_marker_uuid) AS mirtype_marker_uuid,
 		toUnixTimestamp64Milli(statground_generation) AS statground_generation_ms, toString(statground_marker_uuid) AS statground_marker_uuid,
 		toString(activation_kind) AS activation_kind, toUnixTimestamp64Milli(activated_at) AS activated_ms
-		FROM clusterAllReplicas(%s, lecture_publication.inflearn_public_catalog_activation_local)
-		WHERE activation_uuid = toUUID(%s) AND run_uuid = toUUID(%s)
+		FROM clusterAllReplicas(%s, lecture_publication.inflearn_public_catalog_activation_local) AS activation
+		WHERE activation.activation_uuid = toUUID(%s) AND activation.run_uuid = toUUID(%s)
 		SETTINGS skip_unavailable_shards = 0, max_threads = 1, max_execution_time = 30`,
 		QuoteSQLString(s.Cfg.CHCluster), QuoteSQLString(activation.ActivationUUID), QuoteSQLString(activation.RunUUID)))
 	if err != nil {

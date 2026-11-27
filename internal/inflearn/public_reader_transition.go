@@ -1035,22 +1035,17 @@ func (s *Service) appendAndReadbackPublicationTransitionRelease(ctx context.Cont
 		SETTINGS insert_distributed_sync=1,insert_quorum=4,insert_quorum_parallel=0,
 		insert_deduplicate=1,insert_deduplication_token=%s FORMAT JSONEachRow`,
 		lectureTransitionReleaseTable, clickHouseColumnList(columns), QuoteSQLString(token))
-	var insertErr error
-	for attempt := 0; attempt <= publicationMutationReconcileAttempts; attempt++ {
-		_, insertErr = s.chPost(ctx, sql, payload, "application/x-ndjson")
-		if readbackErr := s.readbackPublicationTransitionRelease(ctx, topology, prepared, receipts, activation, sourceAuthorityRevision, ackUUID, readerInventorySHA, receiptSetSHA, finalProofSHA); readbackErr == nil {
-			return publicationTransitionRelease{
-				TransitionID: prepared.TransitionID, ACKUUID: ackUUID, ACKRevision: activation.Revision,
-				ACKReaderCount: readerCount, ReaderInventorySHA256: readerInventorySHA,
-				ReaderReceiptsSHA256: receiptSetSHA, FinalProofSHA256: finalProofSHA,
-			}, nil
-		} else if insertErr != nil && !isTemporaryClickHouseWriteError(insertErr) {
-			return publicationTransitionRelease{}, newUpdateReadStateError("public_reader_transition_ack_insert", insertErr)
-		} else if attempt == publicationMutationReconcileAttempts {
-			return publicationTransitionRelease{}, readbackErr
-		}
+	_, insertErr := s.chPost(ctx, sql, payload, "application/x-ndjson")
+	if err := reconcilePublicationWrite("public_reader_transition_ack_insert", insertErr, func() error {
+		return s.readbackPublicationTransitionRelease(ctx, topology, prepared, receipts, activation, sourceAuthorityRevision, ackUUID, readerInventorySHA, receiptSetSHA, finalProofSHA)
+	}); err != nil {
+		return publicationTransitionRelease{}, err
 	}
-	return publicationTransitionRelease{}, insertErr
+	return publicationTransitionRelease{
+		TransitionID: prepared.TransitionID, ACKUUID: ackUUID, ACKRevision: activation.Revision,
+		ACKReaderCount: readerCount, ReaderInventorySHA256: readerInventorySHA,
+		ReaderReceiptsSHA256: receiptSetSHA, FinalProofSHA256: finalProofSHA,
+	}, nil
 }
 
 func (s *Service) readbackPublicationTransitionRelease(ctx context.Context, topology map[string]int, prepared preparedPublicationTransition, receipts []publicationTransitionCommitReceiptValue, activation activationEvidence, sourceAuthorityRevision uint64, ackUUID, inventorySHA, receiptSetSHA, finalProofSHA string) error {
@@ -1071,8 +1066,8 @@ func (s *Service) readbackPublicationTransitionRelease(ctx context.Context, topo
 		toUnixTimestamp64Milli(generation) AS generation_ms,toString(list_count) AS list_count,
 		toString(detail_course_id) AS detail_course_id,toString(homepage_count) AS homepage_count,
 		toString(sitemap_entry_count) AS sitemap_entry_count,toString(sitemap_sha256) AS sitemap_sha256,toString(complete) AS complete
-		FROM clusterAllReplicas(%s,'lecture_publication','inflearn_public_catalog_reader_transition_ack_v2_local')
-		WHERE transition_id=toUUID(%s) AND ack_uuid=toUUID(%s)
+		FROM clusterAllReplicas(%s,'lecture_publication','inflearn_public_catalog_reader_transition_ack_v2_local') AS receipt
+		WHERE receipt.transition_id=toUUID(%s) AND receipt.ack_uuid=toUUID(%s)
 		ORDER BY hostname,app_service,reader_instance
 		SETTINGS skip_unavailable_shards=0,max_threads=1,max_execution_time=30`,
 		QuoteSQLString(s.Cfg.CHCluster), QuoteSQLString(prepared.TransitionID), QuoteSQLString(ackUUID)))
@@ -1142,8 +1137,8 @@ func (s *Service) readPublicationTransitionReleaseRows(ctx context.Context, tran
 		toString(reader_inventory_sha256) AS reader_inventory_sha256,
 		toString(reader_receipts_sha256) AS reader_receipts_sha256,
 		toString(final_proof_sha256) AS final_proof_sha256,toString(complete) AS complete
-		FROM Clickhouse_Statground.publication_transition_release_current
-		WHERE domain='lecture' AND transition_id=toUUID(%s)
+		FROM Clickhouse_Statground.publication_transition_release_current AS release
+		WHERE release.domain='lecture' AND release.transition_id=toUUID(%s)
 		ORDER BY app_service,reader_instance LIMIT %d
 		SETTINGS max_threads=1,max_execution_time=30`, QuoteSQLString(transitionID), expectedReaders+1))
 	if err != nil {
@@ -1199,8 +1194,8 @@ func (s *Service) readPublicationPointerRevision(ctx context.Context, revision u
 		toUnixTimestamp64Milli(generation) AS generation_ms,toString(marker_uuid) AS marker_uuid,
 		toString(run_uuid) AS run_uuid,toString(activation_revision) AS activation_revision,
 		toString(activation_uuid) AS activation_uuid,toString(activation_kind) AS activation_kind
-		FROM lecture_publication.v_inflearn_public_catalog_activation_valid
-		WHERE activation_revision=%d ORDER BY surface SETTINGS max_threads=1,max_execution_time=30`, revision))
+		FROM lecture_publication.v_inflearn_public_catalog_activation_valid AS activation
+		WHERE activation.activation_revision=%d ORDER BY surface SETTINGS max_threads=1,max_execution_time=30`, revision))
 	if err != nil {
 		return nil, newUpdateReadStateError("public_reader_transition_old_pointer", err)
 	}

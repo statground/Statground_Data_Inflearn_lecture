@@ -110,7 +110,7 @@ func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Reque
 		h.lease = publicationLease{FenceEpoch: epoch, LeaseUUID: matches[2], WriterID: matches[3], AcquiredMS: acquired, ExpiresMS: expires}
 		h.leaseSet = true
 		w.WriteHeader(http.StatusOK)
-	case strings.Contains(query, lectureLeaseLocalTable) && strings.Contains(query, "WHERE fence_epoch"):
+	case strings.Contains(query, lectureLeaseLocalTable) && strings.Contains(query, "WHERE lease.fence_epoch"):
 		writeCHRows(w, leaseReplicaRows(h.lease, 4))
 	case strings.Contains(query, "v_inflearn_public_catalog_generation_latest") && strings.Contains(query, "ORDER BY surface") && !strings.Contains(query, "candidate AS"):
 		h.pointerReads++
@@ -190,7 +190,7 @@ func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Reque
 			h.currentMarkerSurface = match[1]
 		}
 		w.WriteHeader(http.StatusOK)
-	case strings.Contains(query, lectureMarkerLocalTable) && strings.Contains(query, "WHERE marker_uuid"):
+	case strings.Contains(query, lectureMarkerLocalTable) && strings.Contains(query, "WHERE marker.marker_uuid"):
 		matches := markerReadbackPattern.FindStringSubmatch(query)
 		if len(matches) != 3 {
 			h.t.Fatalf("cannot parse marker readback: %s", query)
@@ -204,7 +204,7 @@ func (h *publicationHappyHarness) serveHTTP(w http.ResponseWriter, r *http.Reque
 			h.t.Errorf("activation inserted before three marker readbacks")
 		}
 		w.WriteHeader(http.StatusOK)
-	case strings.Contains(query, lectureActivationLocal) && strings.Contains(query, "WHERE activation_uuid"):
+	case strings.Contains(query, lectureActivationLocal) && strings.Contains(query, "WHERE activation.activation_uuid"):
 		matches := activationReadbackPattern.FindStringSubmatch(query)
 		if len(matches) != 3 {
 			h.t.Fatalf("cannot parse activation readback: %s", query)
@@ -351,7 +351,7 @@ func TestValidateAdvancedPublicRefreshStateRejectsPriorSameSecondReceipt(t *test
 	assertUpdateStateError(t, err, "degraded", "public_refresh_webr_receipt", "refresh_timestamp_not_advanced")
 }
 
-func TestAcquirePublicationLeaseRetriesSameOperationAfterAmbiguousTimeout(t *testing.T) {
+func TestAcquirePublicationLeaseRetriesReadbackAfterAmbiguousTimeout(t *testing.T) {
 	var lease publicationLease
 	insertQueries := []string{}
 	readbacks := 0
@@ -376,13 +376,9 @@ func TestAcquirePublicationLeaseRetriesSameOperationAfterAmbiguousTimeout(t *tes
 			acquired, _ := strconv.ParseInt(m[4], 10, 64)
 			expires, _ := strconv.ParseInt(m[5], 10, 64)
 			lease = publicationLease{FenceEpoch: epoch, LeaseUUID: m[2], WriterID: m[3], AcquiredMS: acquired, ExpiresMS: expires}
-			if len(insertQueries) == 1 {
-				w.WriteHeader(http.StatusGatewayTimeout)
-				_, _ = w.Write([]byte("timeout"))
-			} else {
-				w.WriteHeader(http.StatusOK)
-			}
-		case strings.Contains(query, lectureLeaseLocalTable) && strings.Contains(query, "WHERE fence_epoch"):
+			w.WriteHeader(http.StatusGatewayTimeout)
+			_, _ = w.Write([]byte("timeout"))
+		case strings.Contains(query, lectureLeaseLocalTable) && strings.Contains(query, "WHERE lease.fence_epoch"):
 			readbacks++
 			count := 4
 			if readbacks == 1 {
@@ -399,8 +395,8 @@ func TestAcquirePublicationLeaseRetriesSameOperationAfterAmbiguousTimeout(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.FenceEpoch != 9 || len(insertQueries) != 2 || insertQueries[0] != insertQueries[1] {
-		t.Fatalf("lease=%+v inserts=%d same=%v", got, len(insertQueries), len(insertQueries) == 2 && insertQueries[0] == insertQueries[1])
+	if got.FenceEpoch != 9 || len(insertQueries) != 1 || readbacks != 2 {
+		t.Fatalf("lease=%+v inserts=%d readbacks=%d", got, len(insertQueries), readbacks)
 	}
 }
 
