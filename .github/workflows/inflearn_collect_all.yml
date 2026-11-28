@@ -322,7 +322,7 @@ jobs:
           INFLEARN_TRANSLATION_PROVIDER: ${{ vars.INFLEARN_TRANSLATION_PROVIDER }}
           INFLEARN_TRANSLATION_MODEL: ${{ vars.INFLEARN_TRANSLATION_MODEL }}
           INFLEARN_TRANSLATION_TARGET_LANGS_INPUT: ${{ github.event.inputs.languages }}
-          INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT: ${{ inputs.translate_only && '12' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '5' || github.event.inputs.max_per_run) }}
+          INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '5' || github.event.inputs.max_per_run }}
           INFLEARN_TRANSLATION_COURSE_IDS: ${{ github.event.inputs.course_ids }}
           INFLEARN_TRANSLATION_BATCH_SIZE: "12"
         run: |
@@ -340,6 +340,7 @@ jobs:
           export INFLEARN_TRANSLATION_TARGET_LANGS="${INFLEARN_TRANSLATION_TARGET_LANGS_INPUT:-ko,en,ja,zh-Hans,zh-Hant,es,fr,de,pt-BR,ru,id,vi,th,ms,fil,hi,ar,it,nl,pl,sv,tr,uk}"
           export INFLEARN_TRANSLATION_MAX_PER_RUN="${INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT:-80}"
           if [[ "$INFLEARN_TRANSLATION_ONLY" == true ]]; then
+            export INFLEARN_TRANSLATION_MAX_PER_RUN=12
             export CH_DIRECT_REPLICA_FALLBACK=false CH_DIRECT_OUTBOX_FALLBACK=false
           fi
           TRANSLATION_LOG="$(mktemp)"

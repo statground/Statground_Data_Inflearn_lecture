@@ -171,7 +171,7 @@ class ClickHousePressureGateTest(unittest.TestCase):
 
     def test_scheduled_workflow_gates_before_first_writer(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_collect_all.yml").read_text()
-        gate_step = "run: python3 scripts/clickhouse_pressure_gate.py"
+        gate_step = "python3 scripts/clickhouse_pressure_gate.py"
         self.assertEqual(workflow.count(gate_step), 2)
         self.assertLess(workflow.index(gate_step), workflow.index("go run -mod=mod ./cmd/inflearn-collect-new"))
         self.assertLess(workflow.rindex(gate_step), workflow.index("go run -mod=mod ./cmd/inflearn-refresh-public-views"))

@@ -107,7 +107,7 @@ class WorkflowStatusTest(unittest.TestCase):
 
     def test_translation_recovery_is_bounded_and_skips_other_write_paths(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_collect_all.yml").read_text()
-        self.assertIn("inputs.translate_only && '12'", workflow)
+        self.assertIn('if [[ "$INFLEARN_TRANSLATION_ONLY" == true ]]; then\n            export INFLEARN_TRANSLATION_MAX_PER_RUN=12', workflow)
         for name in (
             "Collect new Inflearn courses into ClickHouse", "Update existing Inflearn courses in ClickHouse",
             "Refresh MirType provider practice content", "Refresh exact public lecture views serially",
