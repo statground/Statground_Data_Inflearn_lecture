@@ -76,6 +76,30 @@ func TestResumeFirstPublicationRejectsLeaseAndServingDrift(t *testing.T) {
 	}
 }
 
+func TestResumeFirstPublicationRequiresDistinctCompletionMarkers(t *testing.T) {
+	lease := testPublicationLease()
+	cp := FirstPublicationCheckpoint{
+		LeaseUUID: lease.LeaseUUID, FenceEpoch: lease.FenceEpoch, AcquiredMS: lease.AcquiredMS, ExpiresMS: lease.ExpiresMS,
+		InventoryRevision: 3, InventoryUUID: testInventoryUUID, SourceAuthorityRevision: 1,
+		WebRGenerationMS: 200500, WebRSuccessMS: 200000, WebRRefreshMS: 201000, WebRRows: 12, WebRSnapshot: true,
+		MirType:            &LectureRefreshCheckpoint{GenerationMS: 202500, SuccessMS: 202000, RefreshMS: 203000, Rows: 10},
+		StatgroundSnapshot: &StatgroundSnapshotCheckpoint{GenerationMS: 204000, CompletedMS: 205000},
+		Markers: &LectureMarkerCheckpoint{
+			RunUUID: testInventoryUUID, CompletedMS: 206000,
+			MarkerUUIDs: map[string]string{"webr": lease.LeaseUUID, "mirtype": lease.LeaseUUID, "statground": testInventoryUUID},
+		},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid checkpoint reached ClickHouse")
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+	svc := publicRefreshTestService(t, server)
+	svc.Cfg.PublicationReaderConfig = "unneeded-before-rejection"
+	_, err := svc.CheckFirstPublicationResume(context.Background(), cp)
+	assertUpdateStateError(t, err, "degraded", firstPublicationResumePhase, "invalid_marker_checkpoint")
+}
+
 func TestResumeSkipsWebRRefreshAndKeepsOriginalLease(t *testing.T) {
 	lease := testPublicationLease()
 	h := &publicationHappyHarness{t: t, lease: lease, leaseSet: true}

@@ -320,7 +320,7 @@ func TestPublicationTransitionInventoryDriftAbortsEveryPreparedReader(t *testing
 					}
 					if r.Method == http.MethodGet && r.URL.Path == publicationTransitionRoot {
 						response["format"], response["inventory_nonce"] = publicationTransitionInventoryFormat, r.URL.Query().Get("inventory_nonce")
-						response["phase"], response["admission_open"], response["inflight"], response["observed_at"] = "steady", true, 0, now
+						response["phase"], response["admission_open"], response["inflight"], response["observed_at"] = "steady", true, 1, now
 						response["serving_authority_sha256"] = oldDigest
 						for _, key := range []string{"transition_id", "old_authority_sha256", "candidate_authority_sha256",
 							"prepare_receipt_sha256", "commit_receipt_sha256", "old_state_proof_sha256",
@@ -339,7 +339,7 @@ func TestPublicationTransitionInventoryDriftAbortsEveryPreparedReader(t *testing
 						candidateDigest, _ := canonicalJSONSHA256(request["candidate_authority"])
 						response["format"], response["phase"] = publicationTransitionPrepareReceipt, "prepared"
 						response["prepare_nonce"], response["candidate_authority_sha256"] = request["prepare_nonce"], candidateDigest
-						response["inflight_before"], response["inflight_after"], response["prepared_at"] = 0, 0, now
+						response["inflight_before"], response["inflight_after"], response["prepared_at"] = 1, 0, now
 					case publicationTransitionRoot + "/abort":
 						abortAttempts.Add(1)
 						if interrupted && service == "web-r" {

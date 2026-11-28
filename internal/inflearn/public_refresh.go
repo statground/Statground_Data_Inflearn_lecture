@@ -274,6 +274,10 @@ func (s *Service) refreshPublicLectureViews(ctx context.Context, resume *firstPu
 		"statground": UUIDv7String(identityTime.Add(3 * time.Millisecond)),
 	}
 	activationUUID := UUIDv7String(identityTime.Add(4 * time.Millisecond))
+	if resume != nil && resume.markers != nil {
+		runUUID = resume.markers.RunUUID
+		markerUUIDs = resume.markers.MarkerUUIDs
+	}
 	evidenceBySurface := make(map[string]generationEvidence, 3)
 
 	for _, view := range publicLectureRefreshViews {
@@ -400,6 +404,12 @@ func (s *Service) refreshPublicLectureViews(ctx context.Context, resume *firstPu
 	if completedMS >= lease.ExpiresMS {
 		return PublicRefreshReceipt{}, stateError("deferred", "public_marker_time", "publication_lease_expired")
 	}
+	if resume != nil && resume.markers != nil {
+		if resume.markers.CompletedMS > completedMS {
+			return PublicRefreshReceipt{}, stateError("degraded", "public_marker_time", "marker_checkpoint_in_future")
+		}
+		completedMS = resume.markers.CompletedMS
+	}
 	if err := s.requireCurrentPublicationLease(ctx, lease, "public_marker_lease"); err != nil {
 		return PublicRefreshReceipt{}, err
 	}
@@ -410,8 +420,14 @@ func (s *Service) refreshPublicLectureViews(ctx context.Context, resume *firstPu
 		}
 		evidence.CompletedMS = completedMS
 		evidenceBySurface[surface] = evidence
-		if err := s.insertAndReadbackGeneration(ctx, topology, evidence); err != nil {
-			return PublicRefreshReceipt{}, err
+		if resume != nil && resume.markers != nil {
+			if err := s.readbackGeneration(ctx, topology, evidence); err != nil {
+				return PublicRefreshReceipt{}, err
+			}
+		} else {
+			if err := s.insertAndReadbackGeneration(ctx, topology, evidence); err != nil {
+				return PublicRefreshReceipt{}, err
+			}
 		}
 		printMachineJSON(map[string]any{
 			"schema": "statground.inflearn.public_generation.v2", "status": "marker_verified",

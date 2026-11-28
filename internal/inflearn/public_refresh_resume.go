@@ -28,6 +28,7 @@ type FirstPublicationCheckpoint struct {
 	MirType                 *LectureRefreshCheckpoint     `json:"mirtype,omitempty"`
 	StatgroundSnapshot      *StatgroundSnapshotCheckpoint `json:"statground_snapshot,omitempty"`
 	SupersededSnapshots     map[string]int64              `json:"superseded_snapshots,omitempty"`
+	Markers                 *LectureMarkerCheckpoint      `json:"markers,omitempty"`
 }
 
 type StatgroundSnapshotCheckpoint struct {
@@ -44,6 +45,12 @@ type LectureRefreshCheckpoint struct {
 	FingerprintXOR uint64 `json:"fingerprint_xor"`
 }
 
+type LectureMarkerCheckpoint struct {
+	RunUUID     string            `json:"run_uuid"`
+	CompletedMS int64             `json:"completed_ms"`
+	MarkerUUIDs map[string]string `json:"marker_uuids"`
+}
+
 type firstPublicationResume struct {
 	lease             publicationLease
 	candidates        map[string]generationEvidence
@@ -51,6 +58,7 @@ type firstPublicationResume struct {
 	inventoryRevision uint64
 	inventoryUUID     string
 	authorityRevision uint64
+	markers           *LectureMarkerCheckpoint
 }
 
 func (s *Service) CheckFirstPublicationResume(ctx context.Context, checkpoint FirstPublicationCheckpoint) (FirstPublicationCheckpoint, error) {
@@ -100,6 +108,25 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 			}
 		}
 	}
+	markerFilter := ""
+	if cp.Markers != nil {
+		if cp.StatgroundSnapshot == nil || !isCanonicalUUID(cp.Markers.RunUUID) ||
+			cp.Markers.CompletedMS < cp.StatgroundSnapshot.CompletedMS || cp.Markers.CompletedMS >= cp.ExpiresMS ||
+			len(cp.Markers.MarkerUUIDs) != len(expectedPublicationSurfaces) {
+			return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "invalid_marker_checkpoint")
+		}
+		markers := make([]string, 0, len(expectedPublicationSurfaces))
+		seen := map[string]bool{}
+		for _, surface := range expectedPublicationSurfaces {
+			uuid := cp.Markers.MarkerUUIDs[surface]
+			if !isCanonicalUUID(uuid) || seen[uuid] {
+				return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "invalid_marker_checkpoint")
+			}
+			seen[uuid] = true
+			markers = append(markers, fmt.Sprintf("(surface=%s AND marker_uuid=toUUID(%s))", QuoteSQLString(surface), QuoteSQLString(uuid)))
+		}
+		markerFilter = fmt.Sprintf("WHERE NOT (run_uuid=toUUID(%s) AND (%s))", QuoteSQLString(cp.Markers.RunUUID), strings.Join(markers, " OR "))
+	}
 	if err := s.validatePublicRefreshWriteSafety(ctx); err != nil {
 		return firstPublicationResume{}, err
 	}
@@ -148,7 +175,7 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 		snapshotFilter = "WHERE NOT (" + strings.Join(matches, " OR ") + ")"
 	}
 	for _, source := range []struct{ table, column, filter string }{
-		{lectureMarkerLocalTable, "marker_uuid", ""},
+		{lectureMarkerLocalTable, "marker_uuid", markerFilter},
 		{lectureTransitionReleaseLocalTable, "activation_uuid", ""},
 		{lectureProjectionSnapshotLocalView, "generation", snapshotFilter},
 	} {
@@ -216,7 +243,7 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 		}
 	}
 	return firstPublicationResume{lease: lease, candidates: candidates, snapshots: snapshots, inventoryRevision: cp.InventoryRevision,
-		inventoryUUID: cp.InventoryUUID, authorityRevision: authority}, nil
+		inventoryUUID: cp.InventoryUUID, authorityRevision: authority, markers: cp.Markers}, nil
 }
 
 func (cp LectureRefreshCheckpoint) within(acquiredMS, expiresMS int64) bool {

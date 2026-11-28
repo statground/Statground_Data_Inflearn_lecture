@@ -903,7 +903,8 @@ func (s *Service) preparePublicationTransitionReaders(ctx context.Context, topol
 		if err != nil {
 			return preparedPublicationTransition{}, stateError("degraded", "public_reader_transition_inventory", "reader_inventory_failed")
 		}
-		if discovered.Phase != "steady" || !discovered.AdmissionOpen || discovered.Inflight != 0 {
+		// PREPARE closes admission atomically and proves the existing requests drained.
+		if discovered.Phase != "steady" || !discovered.AdmissionOpen {
 			return preparedPublicationTransition{}, stateError("degraded", "public_reader_transition_inventory", "pending_transition_requires_reconcile")
 		}
 		discoveredReaders = append(discoveredReaders, discovered)
