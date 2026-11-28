@@ -62,21 +62,52 @@ type firstPublicationResume struct {
 }
 
 func (s *Service) CheckFirstPublicationResume(ctx context.Context, checkpoint FirstPublicationCheckpoint) (FirstPublicationCheckpoint, error) {
-	if _, err := s.validateFirstPublicationResume(ctx, checkpoint); err != nil {
+	if _, err := s.validateFirstPublicationResume(ctx, checkpoint, false); err != nil {
 		return FirstPublicationCheckpoint{}, err
 	}
 	return checkpoint, nil
 }
 
 func (s *Service) ResumeFirstPublicLectureViews(ctx context.Context, checkpoint FirstPublicationCheckpoint) (PublicRefreshReceipt, error) {
-	resume, err := s.validateFirstPublicationResume(ctx, checkpoint)
+	resume, err := s.validateFirstPublicationResume(ctx, checkpoint, false)
 	if err != nil {
 		return PublicRefreshReceipt{}, err
 	}
 	return s.refreshPublicLectureViews(ctx, &resume)
 }
 
-func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPublicationCheckpoint) (firstPublicationResume, error) {
+// RecoverFirstPublicationReaders reopens a proven unactivated reader transition
+// under the same lease. It stops after the reader protocol reconciliation.
+func (s *Service) RecoverFirstPublicationReaders(ctx context.Context, checkpoint FirstPublicationCheckpoint) error {
+	if checkpoint.Markers == nil {
+		return stateError("degraded", firstPublicationResumePhase, "missing_marker_checkpoint")
+	}
+	resume, err := s.validateFirstPublicationResume(ctx, checkpoint, true)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadLectureReaderConfig(s.Cfg.PublicationReaderConfig)
+	if err != nil {
+		return err
+	}
+	topology, err := s.readPublicationTopology(ctx)
+	if err != nil {
+		return err
+	}
+	if err := s.requireCurrentPublicationLease(ctx, resume.lease, firstPublicationResumePhase); err != nil {
+		return err
+	}
+	revision, err := s.readRawActivationRevision(ctx, topology)
+	if err != nil {
+		return err
+	}
+	if revision != 0 {
+		return stateError("degraded", firstPublicationResumePhase, "first_activation_already_started")
+	}
+	return s.reconcilePublicationTransitionReaders(ctx, topology, cfg, resume.lease)
+}
+
+func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPublicationCheckpoint, allowUnactivatedReaders bool) (firstPublicationResume, error) {
 	if !s.Cfg.PublicationV2Enabled || s.Cfg.PublicationReaderConfig == "" || s.Cfg.PublicationWriterID == "" ||
 		!isCanonicalUUID(cp.LeaseUUID) || !isCanonicalUUID(cp.InventoryUUID) || cp.FenceEpoch == 0 ||
 		cp.InventoryRevision == 0 || cp.SourceAuthorityRevision == 0 || cp.AcquiredMS <= 0 {
@@ -203,6 +234,9 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 		return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "reader_inventory_changed")
 	}
 	for _, reader := range readers.Readers {
+		if allowUnactivatedReaders && !reader.AdmissionOpen && (reader.Phase == "preparing" || reader.Phase == "prepared") {
+			continue
+		}
 		if reader.Phase != "steady" || !reader.AdmissionOpen {
 			return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "reader_admission_unsettled")
 		}

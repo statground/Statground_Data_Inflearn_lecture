@@ -16,8 +16,10 @@ func main() {
 	checkOnly := flag.Bool("check-only", false, "read publication prerequisites without writing or refreshing")
 	checkReadersOnly := flag.Bool("check-readers-only", false, "read the DB reader inventory and authenticated process states")
 	resumePath := flag.String("resume-first-publication", "", "private checkpoint for an interrupted first publication")
+	recoverReaders := flag.Bool("recover-first-publication-readers", false, "reconcile unactivated readers under the checkpoint lease")
 	flag.Parse()
-	if flag.NArg() != 0 || (*checkReadersOnly && (*checkOnly || *resumePath != "")) {
+	if flag.NArg() != 0 || (*checkReadersOnly && (*checkOnly || *resumePath != "")) ||
+		(*recoverReaders && (*checkOnly || *checkReadersOnly || *resumePath == "")) {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -34,6 +36,14 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	}
+	if *recoverReaders {
+		if err := svc.RecoverFirstPublicationReaders(context.Background(), checkpoint); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(`{"status":"reader_reconciliation_completed"}`)
+		return
 	}
 	if *checkOnly || *checkReadersOnly {
 		var preflight any
