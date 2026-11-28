@@ -79,10 +79,11 @@ source_authority AS
 ),
 replica_inventory AS
 (
-    SELECT hostName() AS endpoint,database,table,zookeeper_path, replica_name,is_readonly,
+    SELECT * FROM clusterAllReplicas('statground_cluster', view(
+        SELECT hostName() AS endpoint,database,table,zookeeper_path, replica_name,is_readonly,
            is_session_expired,queue_size,future_parts,parts_to_check,
            lost_part_count,log_pointer,log_max_index,active_replicas,total_replicas
-    FROM clusterAllReplicas('statground_cluster','system','replicas')
+        FROM system.replicas
     WHERE (database,table) IN
     (
       ('webr_lecture','inflearn_r_lecture_catalog_local'),
@@ -99,6 +100,7 @@ replica_inventory AS
       ('lecture_publication','inflearn_public_catalog_source_authority_fence_local'),
       ('lecture_publication','inflearn_public_catalog_source_authority_local')
     )
+    ))
 ),
 replicas AS
 (
@@ -149,7 +151,9 @@ queue AS
        ('Data_Lecture_Inflearn_Service','inflearn_course_display_translation'),
        ('Data_Lecture_Inflearn_Service','inflearn_course_price_fact'))
       AND (data_files!=0 OR broken_data_files!=0 OR is_blocked!=0)) AS bad_rows
-    FROM clusterAllReplicas('statground_cluster','system','distribution_queue')
+    FROM clusterAllReplicas('statground_cluster', view(
+        SELECT database, table, data_files, broken_data_files, is_blocked FROM system.distribution_queue
+    ))
 ),
 raw_endpoints AS
 (

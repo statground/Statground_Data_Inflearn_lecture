@@ -3,6 +3,7 @@ package inflearn
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 const firstPublicationResumePhase = "public_first_publication_resume"
@@ -26,6 +27,7 @@ type FirstPublicationCheckpoint struct {
 	WebRSnapshot            bool                          `json:"webr_snapshot,omitempty"`
 	MirType                 *LectureRefreshCheckpoint     `json:"mirtype,omitempty"`
 	StatgroundSnapshot      *StatgroundSnapshotCheckpoint `json:"statground_snapshot,omitempty"`
+	SupersededSnapshots     map[string]int64              `json:"superseded_snapshots,omitempty"`
 }
 
 type StatgroundSnapshotCheckpoint struct {
@@ -88,6 +90,16 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 			return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "invalid_snapshot_checkpoint")
 		}
 	}
+	if len(cp.SupersededSnapshots) != 0 {
+		if cp.StatgroundSnapshot == nil || len(cp.SupersededSnapshots) != len(expectedPublicationSurfaces) {
+			return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "invalid_superseded_snapshot_set")
+		}
+		for _, surface := range expectedPublicationSurfaces {
+			if generation := cp.SupersededSnapshots[surface]; generation <= 0 || generation >= cp.AcquiredMS {
+				return firstPublicationResume{}, stateError("degraded", firstPublicationResumePhase, "invalid_superseded_snapshot_set")
+			}
+		}
+	}
 	if err := s.validatePublicRefreshWriteSafety(ctx); err != nil {
 		return firstPublicationResume{}, err
 	}
@@ -122,11 +134,18 @@ func (s *Service) validateFirstPublicationResume(ctx context.Context, cp FirstPu
 		snapshotFilter = fmt.Sprintf("WHERE surface != 'webr' OR generation != fromUnixTimestamp64Milli(%d)", cp.WebRGenerationMS)
 	}
 	if cp.StatgroundSnapshot != nil {
-		snapshotFilter = fmt.Sprintf(`WHERE NOT (
-			(surface = 'webr' AND generation = fromUnixTimestamp64Milli(%d)) OR
-			(surface = 'mirtype' AND generation = fromUnixTimestamp64Milli(%d)) OR
-			(surface = 'statground' AND generation = fromUnixTimestamp64Milli(%d)))`,
-			cp.WebRGenerationMS, cp.MirType.GenerationMS, cp.StatgroundSnapshot.GenerationMS)
+		matches := []string{
+			fmt.Sprintf("(surface = 'webr' AND generation = fromUnixTimestamp64Milli(%d))", cp.WebRGenerationMS),
+			fmt.Sprintf("(surface = 'mirtype' AND generation = fromUnixTimestamp64Milli(%d))", cp.MirType.GenerationMS),
+			fmt.Sprintf("(surface = 'statground' AND generation = fromUnixTimestamp64Milli(%d))", cp.StatgroundSnapshot.GenerationMS),
+		}
+		for _, surface := range expectedPublicationSurfaces {
+			if generation := cp.SupersededSnapshots[surface]; generation != 0 {
+				matches = append(matches, fmt.Sprintf("(surface = %s AND generation = fromUnixTimestamp64Milli(%d))",
+					QuoteSQLString(surface), generation))
+			}
+		}
+		snapshotFilter = "WHERE NOT (" + strings.Join(matches, " OR ") + ")"
 	}
 	for _, source := range []struct{ table, column, filter string }{
 		{lectureMarkerLocalTable, "marker_uuid", ""},
