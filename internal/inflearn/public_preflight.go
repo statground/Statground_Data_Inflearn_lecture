@@ -197,6 +197,30 @@ statground_raw_shards AS
       any(re.component_count) AS component_count
     FROM statground_raw_endpoints AS re GROUP BY shard_name
 ),
+statground_source_versions AS
+(
+    SELECT c.component,c.logical_key,c.source_fetched_at,
+      max(c.row_fingerprint) AS version_fingerprint,
+      uniqExact(c.row_fingerprint)>1 AS conflicting_version
+    FROM clusterAllReplicas('statground_cluster','lecture_publication',
+                            'v_statground_inflearn_workbench_source_candidate_local') AS c
+    GROUP BY c.component,c.logical_key,c.source_fetched_at
+),
+statground_source_latest AS
+(
+    SELECT v.component,v.logical_key,
+      argMax(v.version_fingerprint,v.source_fetched_at) AS latest_fingerprint,
+      max(v.conflicting_version) AS conflicting_key
+    FROM statground_source_versions AS v GROUP BY v.component,v.logical_key
+),
+statground_logical AS
+(
+    SELECT count() AS row_count,uniqExact(k.logical_key) AS logical_key_count,
+      sumWithOverflow(k.latest_fingerprint) AS fingerprint_sum,
+      groupBitXor(k.latest_fingerprint) AS fingerprint_xor,
+      countIf(k.conflicting_key) AS conflicting_keys
+    FROM statground_source_latest AS k
+),
 raw_physical AS
 (
     SELECT surface,count() AS shard_count,sum(rs.endpoint_count) AS endpoint_count,
@@ -206,10 +230,17 @@ raw_physical AS
       groupBitXor(rs.fingerprint_xor) AS fingerprint_xor
     FROM raw_shards AS rs GROUP BY surface
     UNION ALL
-    SELECT toLowCardinality('statground'),count(),sum(endpoint_count),
-      countIf(endpoint_count=2 AND replica_count=2 AND versions=1 AND component_count=3),
-      sum(row_count),sum(logical_key_count),sumWithOverflow(fingerprint_sum),groupBitXor(fingerprint_xor)
-    FROM statground_raw_shards
+    SELECT toLowCardinality('statground'),p.shard_count,p.endpoint_count,p.peer_groups,
+      l.row_count,l.logical_key_count,l.fingerprint_sum,l.fingerprint_xor
+    FROM
+    (
+      SELECT count() AS shard_count,sum(rs.endpoint_count) AS endpoint_count,
+        countIf(rs.endpoint_count=2 AND rs.replica_count=2 AND rs.versions=1
+          AND rs.component_count=3 AND rs.row_count=rs.logical_key_count) AS peer_groups
+      FROM statground_raw_shards AS rs
+    ) AS p
+    CROSS JOIN statground_logical AS l
+    WHERE l.conflicting_keys=0
 ),
 raw_distributed AS
 (
