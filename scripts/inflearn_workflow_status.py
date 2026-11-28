@@ -8,15 +8,20 @@ from pathlib import Path
 
 
 def stage_status(env):
+    translation_only = env.get("INFLEARN_TRANSLATION_ONLY") == "true"
     collected = (
         env.get("INFLEARN_COLLECT_OUTCOME") == "success"
         and env.get("INFLEARN_UPDATE_OUTCOME") == "success"
     )
+    collection = "collected" if collected else "incomplete"
     translation = env.get("INFLEARN_TRANSLATION_STATUS", "")
-    if translation not in {"completed", "blocked_api_key", "blocked_clickhouse_config"}:
+    if translation not in {"completed", "blocked_api_key", "blocked_clickhouse_config", "deferred_clickhouse"}:
         translation = "failed" if translation == "failure" else "not_verified"
 
-    if env.get("INFLEARN_PUBLICATION_ENABLED") != "true":
+    if translation_only:
+        collection = "not_requested"
+        publication = "not_requested"
+    elif env.get("INFLEARN_PUBLICATION_ENABLED") != "true":
         publication = "inactive"
     elif env.get("INFLEARN_PUBLICATION_OUTCOME") == "success" and env.get("INFLEARN_FRESHNESS_OUTCOME") == "success":
         publication = "verified"
@@ -26,7 +31,7 @@ def stage_status(env):
         publication = "not_verified"
     return {
         "schema": "statground.inflearn.workflow_stage_status.v1",
-        "source_collection": "collected" if collected else "incomplete",
+        "source_collection": collection,
         "display_translation": translation,
         "public_serving": publication,
     }
@@ -37,7 +42,7 @@ def main():
     print(json.dumps(status, sort_keys=True, separators=(",", ":")))
     if status["display_translation"] != "completed":
         print("::warning title=Inflearn translation incomplete::Collected rows do not prove translated display content is available.")
-    if status["public_serving"] != "verified":
+    if status["public_serving"] not in {"verified", "not_requested"}:
         print("::warning title=Inflearn public serving unverified::Collection success does not prove the Web-R lecture catalog was refreshed.")
 
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")

@@ -17,6 +17,7 @@ class WorkflowStatusTest(unittest.TestCase):
             summary = Path(temp_dir) / "summary"
             env = {
                 **os.environ,
+                "INFLEARN_TRANSLATION_ONLY": "false",
                 "GITHUB_STEP_SUMMARY": str(summary),
                 "INFLEARN_COLLECT_OUTCOME": "success",
                 "INFLEARN_UPDATE_OUTCOME": "success",
@@ -91,6 +92,29 @@ class WorkflowStatusTest(unittest.TestCase):
         )
         self.assertEqual(status["public_serving"], "verified")
         self.assertEqual(code, 0)
+
+    def test_translation_only_reports_the_other_stages_as_not_requested(self):
+        status, _, _, code = self.run_status(
+            INFLEARN_TRANSLATION_ONLY="true",
+            INFLEARN_COLLECT_OUTCOME="skipped",
+            INFLEARN_UPDATE_OUTCOME="skipped",
+            INFLEARN_TRANSLATION_STATUS="completed",
+            INFLEARN_PUBLICATION_ENABLED="true",
+        )
+        self.assertEqual(status["source_collection"], "not_requested")
+        self.assertEqual(status["public_serving"], "not_requested")
+        self.assertEqual(code, 0)
+
+    def test_translation_recovery_is_bounded_and_skips_other_write_paths(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_collect_all.yml").read_text()
+        self.assertIn("inputs.translate_only && '12'", workflow)
+        for name in (
+            "Collect new Inflearn courses into ClickHouse", "Update existing Inflearn courses in ClickHouse",
+            "Refresh MirType provider practice content", "Refresh exact public lecture views serially",
+        ):
+            with self.subTest(step=name):
+                stage = workflow.split(f"      - name: {name}\n", 1)[1].split("\n      - name:", 1)[0]
+                self.assertIn("!inputs.translate_only", stage.split("        run:", 1)[0])
 
     def test_publisher_credentials_require_tls_and_the_dedicated_identity(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_collect_all.yml").read_text()

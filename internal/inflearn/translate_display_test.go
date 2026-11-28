@@ -87,6 +87,40 @@ func TestTranslationCandidatesRetryIncompleteCurrentSourceOnly(t *testing.T) {
 	}
 }
 
+func TestTranslationFailureConsumesAttemptBudgetAndFailsRun(t *testing.T) {
+	attempts := 0
+	svc := &Service{
+		Cfg: Config{
+			CHHost: "db.invalid", CHPort: 8123, CHUser: "fixture", CHServiceDatabase: "lecture", TranslationTable: "lecture.display",
+			TranslationCurriculumTable: "lecture.curriculum", TranslationEndpoint: "https://provider.invalid",
+			TranslationTargetLanguages: []string{"en", "ko", "ja"}, TranslationBatchSize: 1, TranslationMaxPerRun: 2,
+		},
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			response := func(status int, body string) (*http.Response, error) {
+				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			}
+			if request.URL.Hostname() == "provider.invalid" {
+				attempts++
+				return response(http.StatusUnauthorized, "")
+			}
+			query, _ := io.ReadAll(request.Body)
+			if strings.Contains(string(query), "SELECT 1 AS ok") {
+				return response(http.StatusOK, `{"data":[{"ok":1}]}`)
+			}
+			if strings.Contains(string(query), "INSERT INTO") {
+				t.Fatal("failed translation must not write rows")
+			}
+			return response(http.StatusOK, `{"data":[{"course_id":1,"locale":"en","title":"Source","section_id":1,"unit_id":1,"section_title":"Section","unit_title":"Unit"}]}`)
+		})},
+	}
+	if err := svc.RunTranslateDisplay(context.Background()); err == nil || !strings.Contains(err.Error(), "2 attempted rows") {
+		t.Fatalf("failed translation run must report incomplete progress: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("provider requests = %d, want 2", attempts)
+	}
+}
+
 func TestRotatedTranslationTargets(t *testing.T) {
 	targets := []string{"ko", "en", "ja"}
 	for _, test := range []struct {

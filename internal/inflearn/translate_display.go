@@ -127,6 +127,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 	displayRemaining, curriculumRemaining := splitTranslationBudget(s.Cfg.TranslationMaxPerRun, runAt)
 	totalInserted := 0
 	totalCurriculumInserted := 0
+	failedAttempts := 0
 	for _, target := range targets {
 		if displayRemaining <= 0 {
 			break
@@ -138,8 +139,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 		candidates, err := s.pickDisplayTranslationCandidates(ctx, target, limit)
 		if err != nil {
 			if isTemporaryClickHouseWriteError(err) {
-				fmt.Printf("[warn] translation skipped because ClickHouse candidate read is temporarily unavailable target=%s error=%s\n", target, s.sanitizeClickHouseError(err))
-				return nil
+				return fmt.Errorf("temporary ClickHouse candidate read for display translation %s: %s", target, s.sanitizeClickHouseError(err))
 			}
 			return err
 		}
@@ -149,14 +149,15 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 		}
 		rows := make([]map[string]any, 0, len(candidates))
 		for _, candidate := range candidates {
+			displayRemaining--
 			sourceHash := candidate.SourceHash()
 			if s.Cfg.TranslationDryRun {
 				fmt.Printf("[translate:dry-run] target=%s course_id=%d source_locale=%s source_hash=%d title=%q\n", target, candidate.CourseID, candidate.SourceLocale, sourceHash, candidate.Title)
-				displayRemaining--
 				continue
 			}
 			translated, err := s.translateDisplayCandidate(ctx, target, candidate)
 			if err != nil {
+				failedAttempts++
 				fmt.Printf("[warn] translate failed target=%s course_id=%d error=%s\n", target, candidate.CourseID, sanitizeTranslationError(err))
 				continue
 			}
@@ -179,7 +180,6 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 				"generation_error":    "",
 				"ingested_at":         now,
 			})
-			displayRemaining--
 		}
 		if len(rows) > 0 {
 			if err := s.insertDisplayTranslations(ctx, rows); err != nil {
@@ -203,8 +203,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 		candidates, err := s.pickDisplayCurriculumTranslationCandidates(ctx, target, limit)
 		if err != nil {
 			if isTemporaryClickHouseWriteError(err) {
-				fmt.Printf("[warn] curriculum translation skipped because ClickHouse candidate read is temporarily unavailable target=%s error=%s\n", target, s.sanitizeClickHouseError(err))
-				return nil
+				return fmt.Errorf("temporary ClickHouse candidate read for curriculum translation %s: %s", target, s.sanitizeClickHouseError(err))
 			}
 			return err
 		}
@@ -214,14 +213,15 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 		}
 		rows := make([]map[string]any, 0, len(candidates))
 		for _, candidate := range candidates {
+			curriculumRemaining--
 			sourceHash := candidate.SourceHash()
 			if s.Cfg.TranslationDryRun {
 				fmt.Printf("[translate-curriculum:dry-run] target=%s course_id=%d section_id=%d unit_id=%d source_locale=%s source_hash=%d title=%q\n", target, candidate.CourseID, candidate.SectionID, candidate.UnitID, candidate.SourceLocale, sourceHash, candidate.UnitTitle)
-				curriculumRemaining--
 				continue
 			}
 			translated, err := s.translateCurriculumCandidate(ctx, target, candidate)
 			if err != nil {
+				failedAttempts++
 				fmt.Printf("[warn] translate curriculum failed target=%s course_id=%d unit_id=%d error=%s\n", target, candidate.CourseID, candidate.UnitID, sanitizeTranslationError(err))
 				continue
 			}
@@ -242,7 +242,6 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 				"generation_error":  "",
 				"ingested_at":       now,
 			})
-			curriculumRemaining--
 		}
 		if len(rows) > 0 {
 			if err := s.insertCurriculumTranslations(ctx, rows); err != nil {
@@ -252,7 +251,10 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 		}
 		fmt.Printf("[translate-curriculum] target=%s inserted=%d remaining=%d\n", target, len(rows), curriculumRemaining)
 	}
-	fmt.Printf("[done] display_translations_inserted=%d curriculum_translations_inserted=%d\n", totalInserted, totalCurriculumInserted)
+	fmt.Printf("[translation] display_translations_inserted=%d curriculum_translations_inserted=%d failed_attempts=%d\n", totalInserted, totalCurriculumInserted, failedAttempts)
+	if failedAttempts != 0 {
+		return fmt.Errorf("translation provider failed on %d attempted rows", failedAttempts)
+	}
 	return nil
 }
 

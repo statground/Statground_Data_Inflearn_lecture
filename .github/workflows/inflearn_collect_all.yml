@@ -12,6 +12,10 @@ on:
         description: "Verify protected publication readers without collection or publication"
         type: boolean
         default: false
+      translate_only:
+        description: "Recover up to 12 display or curriculum translation rows on main; leave collection and publication untouched"
+        type: boolean
+        default: false
       languages:
         description: "Comma-separated Statground UI language codes"
         required: false
@@ -70,6 +74,12 @@ jobs:
         replica:mirtype_content.provider_practice_content_serving_local,
         local:Data_Lecture_Inflearn_Log.inflearn_direct_insert_outbox
     steps:
+      - name: Require the default branch for translation recovery
+        if: inputs.translate_only && (github.ref_type != 'branch' || github.ref_name != github.event.repository.default_branch)
+        run: |
+          echo "::error::Run translation recovery from the default branch."
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -110,7 +120,7 @@ jobs:
 
       - name: Validate publication publisher secrets
         id: publisher_admission
-        if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
+        if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && !inputs.translate_only
         env:
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
           PUBLISHER_CH_USER: ${{ secrets.INFLEARN_LECTURE_PUBLISHER_CH_USER }}
@@ -150,15 +160,21 @@ jobs:
 
       - name: Gate ClickHouse writes on storage pressure
         env:
+          INFLEARN_TRANSLATION_ONLY: ${{ inputs.translate_only }}
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
           CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
           CH_USER: ${{ secrets.CH_USER || secrets.CLICKHOUSE_USER }}
           CH_PASSWORD: ${{ secrets.CH_PASSWORD || secrets.CLICKHOUSE_PASSWORD }}
           CH_SECURE: ${{ secrets.CH_SECURE || secrets.CLICKHOUSE_SECURE || 'false' }}
-        run: python3 scripts/clickhouse_pressure_gate.py
+        run: |
+          if [[ "$INFLEARN_TRANSLATION_ONLY" == true ]]; then
+            export CLICKHOUSE_PRESSURE_GATE_TARGETS='replica:Data_Lecture_Inflearn_Service.inflearn_course_display_translation_local,replica:Data_Lecture_Inflearn_Service.inflearn_course_curriculum_display_translation_local,local:Data_Lecture_Inflearn_Log.inflearn_direct_insert_outbox'
+          fi
+          python3 scripts/clickhouse_pressure_gate.py
 
       - name: Collect new Inflearn courses into ClickHouse
         id: collect_new
+        if: ${{ !inputs.translate_only }}
         env:
           STATE_BACKEND: clickhouse
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
@@ -203,6 +219,7 @@ jobs:
 
       - name: Update existing Inflearn courses in ClickHouse
         id: update_existing
+        if: ${{ !inputs.translate_only }}
         env:
           STATE_BACKEND: clickhouse
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
@@ -238,6 +255,7 @@ jobs:
           go run -mod=mod ./cmd/inflearn-update-existing
 
       - name: Refresh MirType provider practice content
+        if: ${{ !inputs.translate_only }}
         env:
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
           CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
@@ -278,6 +296,7 @@ jobs:
       - name: Translate missing display metadata
         id: translate_display
         env:
+          INFLEARN_TRANSLATION_ONLY: ${{ inputs.translate_only }}
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
           CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
           CH_USER: ${{ secrets.CH_USER || secrets.CLICKHOUSE_USER }}
@@ -303,7 +322,7 @@ jobs:
           INFLEARN_TRANSLATION_PROVIDER: ${{ vars.INFLEARN_TRANSLATION_PROVIDER }}
           INFLEARN_TRANSLATION_MODEL: ${{ vars.INFLEARN_TRANSLATION_MODEL }}
           INFLEARN_TRANSLATION_TARGET_LANGS_INPUT: ${{ github.event.inputs.languages }}
-          INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '5' || github.event.inputs.max_per_run }}
+          INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT: ${{ inputs.translate_only && '12' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/inflearn-runtime-check-') && '5' || github.event.inputs.max_per_run) }}
           INFLEARN_TRANSLATION_COURSE_IDS: ${{ github.event.inputs.course_ids }}
           INFLEARN_TRANSLATION_BATCH_SIZE: "12"
         run: |
@@ -320,10 +339,14 @@ jobs:
           fi
           export INFLEARN_TRANSLATION_TARGET_LANGS="${INFLEARN_TRANSLATION_TARGET_LANGS_INPUT:-ko,en,ja,zh-Hans,zh-Hant,es,fr,de,pt-BR,ru,id,vi,th,ms,fil,hi,ar,it,nl,pl,sv,tr,uk}"
           export INFLEARN_TRANSLATION_MAX_PER_RUN="${INFLEARN_TRANSLATION_MAX_PER_RUN_INPUT:-80}"
+          if [[ "$INFLEARN_TRANSLATION_ONLY" == true ]]; then
+            export CH_DIRECT_REPLICA_FALLBACK=false CH_DIRECT_OUTBOX_FALLBACK=false
+          fi
           TRANSLATION_LOG="$(mktemp)"
           if ! go run -mod=mod ./cmd/inflearn-translate-display >"$TRANSLATION_LOG" 2>&1; then
-            if grep -Ei "TABLE_IS_READ_ONLY|NOT_INITIALIZED|not initialized|KEEPER_EXCEPTION|Coordination error|Connection loss|context deadline exceeded|timeout|timed out|Too many simultaneous queries|TOO_MANY_SIMULTANEOUS_QUERIES|Failed to connect|Connection refused|Empty reply from server|http status=(429|500|502|503|504)|returned error: (429|500|502|503|504)" "$TRANSLATION_LOG" >/dev/null; then
+            if grep -Ei "temporary ClickHouse candidate read|TABLE_IS_READ_ONLY|NOT_INITIALIZED|not initialized|KEEPER_EXCEPTION|Coordination error|Connection loss|context deadline exceeded|timeout|timed out|Too many simultaneous queries|TOO_MANY_SIMULTANEOUS_QUERIES|Failed to connect|Connection refused|Empty reply from server|http status=(429|500|502|503|504)|returned error: (429|500|502|503|504)" "$TRANSLATION_LOG" >/dev/null; then
               echo "::warning title=Display translation deferred::ClickHouse is temporarily unavailable; the workflow will fail for retry."
+              echo "translation_status=deferred_clickhouse" >> "$GITHUB_OUTPUT"
               echo '{"schema":"statground.inflearn.workflow_state.v1","status":"deferred","phase":"display_translation","category":"temporary_clickhouse"}'
               exit 1
             fi
@@ -334,7 +357,7 @@ jobs:
           echo "translation_status=completed" >> "$GITHUB_OUTPUT"
 
       - name: Gate public lecture refresh on storage pressure
-        if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
+        if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && !inputs.translate_only
         env:
           CH_HOST: ${{ secrets.CH_HOST || secrets.CLICKHOUSE_HOST }}
           CH_PORT: ${{ secrets.CH_PORT || secrets.CLICKHOUSE_PORT }}
@@ -360,7 +383,7 @@ jobs:
         run: python3 scripts/clickhouse_pressure_gate.py
 
       - name: Refresh exact public lecture views serially
-        if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true'
+        if: vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && !inputs.translate_only
         id: refresh_public_lecture_views
         env:
           STATE_BACKEND: clickhouse
@@ -389,7 +412,7 @@ jobs:
           go run -mod=mod ./cmd/inflearn-refresh-public-views
 
       - name: Verify public lecture freshness and refresh health
-        if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && steps.publisher_admission.outcome == 'success'
+        if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED == 'true' && steps.publisher_admission.outcome == 'success' && !inputs.translate_only
         id: verify_public_freshness
         env:
           STATE_BACKEND: clickhouse
@@ -409,12 +432,13 @@ jobs:
         run: go run -mod=mod ./cmd/inflearn-verify-public-freshness
 
       - name: Report inactive publication v2 without claiming freshness
-        if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED != 'true'
+        if: always() && vars.INFLEARN_LECTURE_GENERATION_PUBLICATION_ENABLED != 'true' && !inputs.translate_only
         run: echo '{"schema":"statground.inflearn.publication_activation.v1","status":"inactive","publication_claim":false}'
 
       - name: Report collection, translation, and public serving separately
         if: always()
         env:
+          INFLEARN_TRANSLATION_ONLY: ${{ inputs.translate_only }}
           INFLEARN_COLLECT_OUTCOME: ${{ steps.collect_new.outcome }}
           INFLEARN_UPDATE_OUTCOME: ${{ steps.update_existing.outcome }}
           INFLEARN_TRANSLATION_STATUS: ${{ steps.translate_display.outputs.translation_status || steps.translate_display.outcome }}
@@ -428,6 +452,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Require a single recovery mode
+        if: inputs.translate_only
+        run: |
+          echo "::error::Select either the reader check or translation recovery."
+          exit 1
+
       - name: Require the default branch for the protected check
         if: github.ref_type != 'branch' || github.ref_name != github.event.repository.default_branch
         run: |
