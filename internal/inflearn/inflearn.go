@@ -119,6 +119,7 @@ type Config struct {
 	TranslationEndpoint        string
 	TranslationAPIKey          string
 	TranslationModel           string
+	translationFallbacks       []translationRoute
 	TranslationDryRun          bool
 }
 

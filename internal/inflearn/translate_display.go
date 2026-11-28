@@ -15,6 +15,13 @@ import (
 const translationPromptContract = "inflearn-course-display-translation-v1:no-links:json-only"
 const curriculumTranslationPromptContract = "inflearn-course-curriculum-translation-v1:no-links:json-only"
 
+var translationProviderOrder = [...]string{"openrouter", "groq", "cerebras"}
+
+type translationRoute struct {
+	provider string
+	key      string
+}
+
 type displayTranslationCandidate struct {
 	CourseID          int
 	SourceLocale      string
@@ -89,7 +96,20 @@ func LoadTranslationConfig() (Config, error) {
 		return Config{}, fmt.Errorf("missing required env: CH_HOST or CLICKHOUSE_HOST")
 	}
 	if cfg.TranslationProvider == "" {
-		cfg.TranslationProvider = inferTranslationProvider()
+		if cfg.TranslationAPIKey != "" {
+			return Config{}, fmt.Errorf("INFLEARN_TRANSLATION_PROVIDER is required with INFLEARN_TRANSLATION_API_KEY")
+		}
+		cfg.TranslationProvider = translationProviderOrder[0]
+		for _, provider := range translationProviderOrder {
+			key, _ := translationProviderKey(provider)
+			if value := envFirst(key); value != "" {
+				if cfg.TranslationAPIKey == "" {
+					cfg.TranslationProvider, cfg.TranslationAPIKey = provider, value
+				} else if cfg.TranslationEndpoint == "" {
+					cfg.translationFallbacks = append(cfg.translationFallbacks, translationRoute{provider: provider, key: value})
+				}
+			}
+		}
 	}
 	providerKey, err := translationProviderKey(cfg.TranslationProvider)
 	if err != nil {
@@ -105,12 +125,40 @@ func LoadTranslationConfig() (Config, error) {
 		cfg.TranslationModel = defaultTranslationModel(cfg.TranslationProvider)
 	}
 	if cfg.TranslationAPIKey == "" && !cfg.TranslationDryRun {
-		return Config{}, fmt.Errorf("missing translation API key for %s; set INFLEARN_TRANSLATION_API_KEY or %s", cfg.TranslationProvider, providerKey)
+		return Config{}, fmt.Errorf("missing translation API key for %s; set %s or configure another supported provider", cfg.TranslationProvider, providerKey)
 	}
 	if len(cfg.TranslationTargetLanguages) == 0 {
 		return Config{}, fmt.Errorf("INFLEARN_TRANSLATION_TARGET_LANGS resolved to empty list")
 	}
 	return cfg, nil
+}
+
+// Each provider request spends one slot, including an unsuccessful fallback.
+func tryTranslation[T any](s *Service, remaining *int, run func(*Service) (T, error)) (T, string, error) {
+	var result T
+	var err error
+	if *remaining <= 0 {
+		return result, "", fmt.Errorf("translation request budget exhausted")
+	}
+	*remaining -= 1
+	if result, err = run(s); err == nil {
+		return result, s.Cfg.TranslationModel, nil
+	}
+	for _, route := range s.Cfg.translationFallbacks {
+		if *remaining <= 0 {
+			break
+		}
+		*remaining -= 1
+		cfg := s.Cfg
+		cfg.TranslationProvider = route.provider
+		cfg.TranslationEndpoint = defaultTranslationEndpoint(route.provider)
+		cfg.TranslationModel = defaultTranslationModel(route.provider)
+		cfg.TranslationAPIKey = route.key
+		if result, err = run(&Service{Cfg: cfg, HTTPClient: s.HTTPClient}); err == nil {
+			return result, cfg.TranslationModel, nil
+		}
+	}
+	return result, "", err
 }
 
 func (s *Service) RunTranslateDisplay(ctx context.Context) error {
@@ -149,13 +197,18 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 		}
 		rows := make([]map[string]any, 0, len(candidates))
 		for _, candidate := range candidates {
-			displayRemaining--
+			if displayRemaining <= 0 {
+				break
+			}
 			sourceHash := candidate.SourceHash()
 			if s.Cfg.TranslationDryRun {
+				displayRemaining--
 				fmt.Printf("[translate:dry-run] target=%s course_id=%d source_locale=%s source_hash=%d title=%q\n", target, candidate.CourseID, candidate.SourceLocale, sourceHash, candidate.Title)
 				continue
 			}
-			translated, err := s.translateDisplayCandidate(ctx, target, candidate)
+			translated, model, err := tryTranslation(s, &displayRemaining, func(provider *Service) (displayTranslationResult, error) {
+				return provider.translateDisplayCandidate(ctx, target, candidate)
+			})
 			if err != nil {
 				failedAttempts++
 				fmt.Printf("[warn] translate failed target=%s course_id=%d error=%s\n", target, candidate.CourseID, sanitizeTranslationError(err))
@@ -174,7 +227,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 				"category_sub_title":  compactTranslationText(translated.CategorySubTitle, 300),
 				"level_code":          compactTranslationText(localizeTranslationLevel(target, translated.LevelCode), 120),
 				"keywords":            compactTranslationText(translated.Keywords, 1200),
-				"model":               s.Cfg.TranslationModel,
+				"model":               model,
 				"prompt_hash":         H64(translationPromptContract),
 				"generation_status":   "success",
 				"generation_error":    "",
@@ -213,13 +266,18 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 		}
 		rows := make([]map[string]any, 0, len(candidates))
 		for _, candidate := range candidates {
-			curriculumRemaining--
+			if curriculumRemaining <= 0 {
+				break
+			}
 			sourceHash := candidate.SourceHash()
 			if s.Cfg.TranslationDryRun {
+				curriculumRemaining--
 				fmt.Printf("[translate-curriculum:dry-run] target=%s course_id=%d section_id=%d unit_id=%d source_locale=%s source_hash=%d title=%q\n", target, candidate.CourseID, candidate.SectionID, candidate.UnitID, candidate.SourceLocale, sourceHash, candidate.UnitTitle)
 				continue
 			}
-			translated, err := s.translateCurriculumCandidate(ctx, target, candidate)
+			translated, model, err := tryTranslation(s, &curriculumRemaining, func(provider *Service) (displayCurriculumTranslationResult, error) {
+				return provider.translateCurriculumCandidate(ctx, target, candidate)
+			})
 			if err != nil {
 				failedAttempts++
 				fmt.Printf("[warn] translate curriculum failed target=%s course_id=%d unit_id=%d error=%s\n", target, candidate.CourseID, candidate.UnitID, sanitizeTranslationError(err))
@@ -236,7 +294,7 @@ func (s *Service) RunTranslateDisplay(ctx context.Context) error {
 				"translated_at":     now,
 				"section_title":     compactTranslationText(translated.SectionTitle, 500),
 				"unit_title":        compactTranslationText(translated.UnitTitle, 500),
-				"model":             s.Cfg.TranslationModel,
+				"model":             model,
 				"prompt_hash":       H64(curriculumTranslationPromptContract),
 				"generation_status": "success",
 				"generation_error":  "",
@@ -942,21 +1000,6 @@ func localizeTranslationLevel(target, raw string) string {
 	return value
 }
 
-func inferTranslationProvider() string {
-	switch {
-	case strings.TrimSpace(osEnv("OPENAI_API_KEY")) != "":
-		return "openai"
-	case strings.TrimSpace(osEnv("OPENROUTER_API_KEY")) != "":
-		return "openrouter"
-	case strings.TrimSpace(osEnv("GROQ_API_KEY")) != "":
-		return "groq"
-	case strings.TrimSpace(osEnv("CEREBRAS_API_KEY")) != "":
-		return "cerebras"
-	default:
-		return "openai"
-	}
-}
-
 func translationProviderKey(provider string) (string, error) {
 	switch provider {
 	case "openai":
@@ -990,11 +1033,11 @@ func defaultTranslationEndpoint(provider string) string {
 func defaultTranslationModel(provider string) string {
 	switch provider {
 	case "openrouter":
-		return "openai/gpt-4.1-mini"
+		return "google/gemini-2.5-flash-lite"
 	case "groq":
-		return "llama-3.1-8b-instant"
+		return "openai/gpt-oss-20b"
 	case "cerebras":
-		return "llama3.1-8b"
+		return "gpt-oss-120b"
 	default:
 		return "gpt-4.1-mini"
 	}
@@ -1055,8 +1098,4 @@ func sanitizeTranslationError(err error) string {
 		msg = msg[:160]
 	}
 	return strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(msg)
-}
-
-func osEnv(name string) string {
-	return strings.TrimSpace(envDefault(name, ""))
 }

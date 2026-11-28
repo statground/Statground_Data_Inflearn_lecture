@@ -166,22 +166,64 @@ func TestSplitTranslationBudget(t *testing.T) {
 	}
 }
 
-func TestInferTranslationProviderMatchesKeyPriority(t *testing.T) {
-	for _, key := range []string{"OPENAI_API_KEY", "GH_MODELS_API_KEY", "GITHUB_MODELS_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY"} {
-		t.Setenv(key, "")
+func TestTranslationConfigMatchesRProjectProviderOrder(t *testing.T) {
+	t.Setenv("CH_HOST", "localhost")
+	t.Setenv("INFLEARN_TRANSLATION_PROVIDER", "")
+	t.Setenv("INFLEARN_TRANSLATION_API_KEY", "")
+	t.Setenv("INFLEARN_TRANSLATION_ENDPOINT", "")
+	t.Setenv("INFLEARN_TRANSLATION_MODEL", "")
+	t.Setenv("INFLEARN_TRANSLATION_DRY_RUN", "0")
+	t.Setenv("OPENAI_API_KEY", "unused-provider")
+	t.Setenv("OPENROUTER_API_KEY", "openrouter-fixture")
+	t.Setenv("GROQ_API_KEY", "groq-fixture")
+	t.Setenv("CEREBRAS_API_KEY", "cerebras-fixture")
+	cfg, err := LoadTranslationConfig()
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Setenv("OPENROUTER_API_KEY", "test-openrouter")
-	t.Setenv("GH_MODELS_API_KEY", "test-gh")
-	t.Setenv("OPENAI_API_KEY", "test-openai")
-	if got := inferTranslationProvider(); got != "openai" {
-		t.Fatalf("provider with OPENAI key selected first = %q", got)
+	if cfg.TranslationProvider != "openrouter" || cfg.TranslationModel != "google/gemini-2.5-flash-lite" ||
+		!reflect.DeepEqual(cfg.translationFallbacks, []translationRoute{{"groq", "groq-fixture"}, {"cerebras", "cerebras-fixture"}}) {
+		t.Fatal("provider order or model differs from the R-project translation convention")
 	}
-	t.Setenv("OPENAI_API_KEY", "")
-	if got := inferTranslationProvider(); got != "openrouter" {
-		t.Fatalf("provider with OpenRouter key = %q", got)
+	t.Setenv("OPENROUTER_API_KEY", "")
+	cfg, err = LoadTranslationConfig()
+	if err != nil || cfg.TranslationProvider != "groq" || len(cfg.translationFallbacks) != 1 {
+		t.Fatal("unset provider should be skipped")
 	}
-	if got := defaultTranslationModel("openrouter"); got != "openai/gpt-4.1-mini" {
-		t.Fatalf("OpenRouter model = %q", got)
+	t.Setenv("GROQ_API_KEY", "")
+	t.Setenv("CEREBRAS_API_KEY", "")
+	if _, err := LoadTranslationConfig(); err == nil {
+		t.Fatal("direct OpenAI must not be inferred")
+	}
+}
+
+func TestTranslationFallbackSpendsBudgetAndRecordsActualModel(t *testing.T) {
+	svc := &Service{Cfg: Config{
+		TranslationProvider: "openrouter", TranslationModel: "primary-model", TranslationAPIKey: "first-fixture",
+		translationFallbacks: []translationRoute{{"groq", "second-fixture"}, {"cerebras", "third-fixture"}},
+	}}
+	var providers []string
+	translate := func(provider *Service) (string, error) {
+		providers = append(providers, provider.Cfg.TranslationProvider)
+		if provider.Cfg.TranslationProvider == "openrouter" {
+			return "", io.ErrUnexpectedEOF
+		}
+		if provider.Cfg.TranslationProvider != "groq" || provider.Cfg.TranslationAPIKey != "second-fixture" ||
+			provider.Cfg.TranslationEndpoint != "https://api.groq.com/openai/v1/chat/completions" {
+			t.Fatal("fallback used the wrong endpoint or credential")
+		}
+		return "translation", nil
+	}
+	remaining := 2
+	result, model, err := tryTranslation(svc, &remaining, translate)
+	if err != nil || result != "translation" || model != "openai/gpt-oss-20b" || remaining != 0 ||
+		!reflect.DeepEqual(providers, []string{"openrouter", "groq"}) {
+		t.Fatal("fallback must use one remaining request and report the actual model")
+	}
+	providers = nil
+	remaining = 1
+	if _, _, err := tryTranslation(svc, &remaining, translate); err == nil || remaining != 0 || len(providers) != 1 {
+		t.Fatal("translation fallback exceeded the remaining request budget")
 	}
 }
 

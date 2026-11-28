@@ -116,6 +116,14 @@ class WorkflowStatusTest(unittest.TestCase):
                 stage = workflow.split(f"      - name: {name}\n", 1)[1].split("\n      - name:", 1)[0]
                 self.assertIn("!inputs.translate_only", stage.split("        run:", 1)[0])
 
+    def test_actions_use_only_r_project_provider_secrets(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_collect_all.yml").read_text()
+        stage = workflow.split("      - name: Translate missing display metadata\n", 1)[1].split("\n      - name:", 1)[0]
+        for key in ("OPENROUTER_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY"):
+            self.assertIn(f"secrets.{key}", stage)
+        for key in ("OPENAI_API_KEY", "INFLEARN_TRANSLATION_API_KEY", "GH_MODELS_API_KEY"):
+            self.assertNotIn(f"secrets.{key}", stage)
+
     def test_publisher_credentials_require_tls_and_the_dedicated_identity(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/inflearn_collect_all.yml").read_text()
         admission = workflow.split("      - name: Validate publication publisher secrets\n", 1)[1].split(
