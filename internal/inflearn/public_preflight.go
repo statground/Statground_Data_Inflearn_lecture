@@ -79,7 +79,7 @@ source_authority AS
 ),
 replica_inventory AS
 (
-    SELECT hostName() AS endpoint,database,table,zookeeper_path,is_readonly,
+    SELECT hostName() AS endpoint,database,table,zookeeper_path, replica_name,is_readonly,
            is_session_expired,queue_size,future_parts,parts_to_check,
            lost_part_count,log_pointer,log_max_index,active_replicas,total_replicas
     FROM clusterAllReplicas('statground_cluster','system','replicas')
@@ -110,7 +110,21 @@ replicas AS
       uniqExactIf(zookeeper_path,endsWith(table,'_serving_local')) AS snapshot_groups,
       uniqExactIf(zookeeper_path,database='lecture_publication') AS authority_groups,
       countIf(is_readonly!=0 OR is_session_expired!=0 OR queue_size!=0 OR future_parts!=0
-        OR parts_to_check!=0 OR lost_part_count!=0 OR log_pointer<log_max_index
+        OR parts_to_check!=0 OR /* Accepted July 2026 parts: S1 202607_115_115_1; S2 202607_110_110_1. */
+             (lost_part_count != 0 AND NOT
+                (
+                    database = 'mirtype_lecture'
+                    AND table = 'inflearn_language_lecture_catalog_local'
+                    AND lost_part_count = 1
+                    AND (endpoint, replica_name, zookeeper_path) IN
+                    (
+                        ('clickhouse-s1-r1', 'replica_1', '/clickhouse/tables/01/mirtype_lecture/inflearn_language_lecture_catalog_local'),
+                        ('clickhouse-s1-r2', 'replica_2', '/clickhouse/tables/01/mirtype_lecture/inflearn_language_lecture_catalog_local'),
+                        ('clickhouse-s2-r1', 'replica_1', '/clickhouse/tables/02/mirtype_lecture/inflearn_language_lecture_catalog_local'),
+                        ('clickhouse-s2-r2', 'replica_2', '/clickhouse/tables/02/mirtype_lecture/inflearn_language_lecture_catalog_local')
+                    )
+                    AND log_max_index >= if(endpoint IN ('clickhouse-s1-r1', 'clickhouse-s1-r2'), 1120, 1115)
+                )) OR log_pointer<log_max_index
         OR (table IN ('inflearn_r_lecture_catalog_local','inflearn_language_lecture_catalog_local',
                       'inflearn_course_dim_local','inflearn_course_display_translation_local',
                       'inflearn_course_price_fact_local')
